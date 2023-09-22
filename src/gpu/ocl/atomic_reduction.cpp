@@ -14,9 +14,11 @@
 * limitations under the License.
 *******************************************************************************/
 
-#include "gpu/ocl/atomic_reduction.hpp"
+#include "common/compiler_workarounds.hpp"
+
 #include "common/eltwise_pd.hpp"
 #include "common/scratchpad.hpp"
+#include "gpu/ocl/atomic_reduction.hpp"
 #include "gpu/ocl/ocl_utils.hpp"
 
 namespace dnnl {
@@ -208,14 +210,15 @@ status_t atomic_reduction_t::pd_t::init_conf(engine_t *engine) {
 
     for (atomic_reduction_conf_t &phase : phases) {
         if (phase.global_acc > 1) {
+            bool ok = compute_engine->mayiuse(
+                    compute::device_ext_t::ext_float_atomics);
 
             // Due to hardware support and initialization logic, only
             // f32 sum/mean (initialized to 0) and f32 min (initialized to inf)
             // are supported. Better filling logic could enable f16 atomic operations.
-            bool ok = phase.dst_type == data_type::f32
+            ok = ok && phase.dst_type == data_type::f32
                     && utils::one_of(desc()->alg_kind, reduction_mean,
                             reduction_sum, reduction_min);
-
             if (!ok) return status::unimplemented;
         }
     }

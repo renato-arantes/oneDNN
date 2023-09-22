@@ -386,6 +386,19 @@ void binary_elementwise_op_impl_t::infer_slice_ranges(
     slice_range_map known_ranges_map
             = search_known_slice_ranges(this, fsmap, stat_map);
     if (known_ranges_map.empty()) return;
+    // double-check all known case
+    if (known_ranges_map.size() == get_inputs().size()) {
+        // check whether slice size is matched
+        if (known_ranges_map[0].size() != known_ranges_map[1].size()) {
+            // try to align with smaller one and erase bigger one
+            int erase_input_id
+                    = known_ranges_map[0].size() < known_ranges_map[1].size()
+                    ? 1
+                    : 0;
+            known_ranges_map.erase(erase_input_id);
+            fsmap.datamap_.erase(get_inputs()[erase_input_id].get());
+        }
+    }
     auto &outslice = fsmap.get(get_outputs()[0]);
     // if unkown slice ranges exist.
     if (known_ranges_map.size() < get_inputs().size()) {
@@ -876,9 +889,12 @@ void compute_block_broadcast(const context_ptr &ctx, sc_graph_t &graph,
                 cur->attr()[op_traits::workload_computable_t::workload_number]
                         = wkld;
                 bld->emit(cur);
-                cur = make_stmt<for_loop_node_t>(iter_vars.at(i), expr(0),
-                        floor, expr(int(vx_info.lanes)), bld->pop_scope(), true,
-                        for_type::NORMAL);
+                cur = bld->pop_scope();
+                if (iter_vars.at(i).isa<var>()) {
+                    cur = make_stmt<for_loop_node_t>(iter_vars.at(i), expr(0),
+                            floor, expr(int(vx_info.lanes)), cur, true,
+                            for_type::NORMAL);
+                }
                 tcur.emplace_back(cur);
             }
             if ((!tail.isa<constant>() && !is_blocking_shape) || tail_int) {

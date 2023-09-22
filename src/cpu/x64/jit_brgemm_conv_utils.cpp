@@ -103,7 +103,8 @@ struct brg_blocking_t : public jit_brgemm_conv_conf_t {
         sp_block = 0;
         nb_sp = 0;
         eff = 0;
-        max_regs = isa_num_vregs(isa);
+        // TODO: remove workaround once constructor is fixed
+        max_regs = isa == isa_undef ? 0 : isa_num_vregs(isa);
     }
 
     int ur, ur_block, ur_block_tail;
@@ -2209,7 +2210,7 @@ status_t init_1x1_conf(jit_brgemm_conv_conf_t &jcp, cpu_isa_t isa,
         // TODO: incorporate loop order into smart blocking selection
         auto wei_size = (size_t)jcp.oc * jcp.ic * jcp.wei_dsz;
         auto max_size = 0.75f * brg_blocking_t::L2;
-        const dim_t os = jcp.od * jcp.oh * jcp.ow;
+        const dim_t os = static_cast<dim_t>(jcp.od) * jcp.oh * jcp.ow;
         const dim_t os_cutoff = 400; // approximate and empiric
         const bool use_loop_ngcdhw
                 = max_size < wei_size || (jcp.mb == 1 && os < os_cutoff);
@@ -2562,8 +2563,10 @@ void balance_bwd_w(jit_brgemm_conv_conf_t &jcp) {
         }
         nthr_ic_b = jcp.nthr / (nthr_mb * nthr_oc_b);
         nthr = nthr_mb * nthr_g * nthr_oc_b * nthr_ic_b;
-    } else if (is_amx(jcp.isa) && jcp.nthr < 16 && jcp.mb <= jcp.nthr / 2
-            && jcp.oc >= 64 && jcp.ic >= 64 && jcp.ngroups == 1) {
+    } else if (is_amx(jcp.isa)
+            && jcp.nthr <= static_cast<int>(platform::get_num_cores())
+            && jcp.mb <= jcp.nthr / 2 && jcp.oc >= 64 && jcp.ic >= 64
+            && jcp.ngroups == 1) {
         // This heuristic is intended for usual convolutions if the minibatch
         // is much less than the number of threads: it tries to divide the
         // total amount of work into more-less 4-dimensional (by mb, g, oc, ic)

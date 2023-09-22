@@ -187,10 +187,10 @@ inline void brgemm_convolution_fwd_t<isa, use_inversion>::pd_t::get_A_B(int icc,
 
 template <cpu_isa_t isa, bool use_inversion>
 status_t brgemm_convolution_fwd_t<isa, use_inversion>::pd_t::add_brg_descriptor(
-        int vM, int i_N, int i_K, int i_init, int kd_b, int kd_e, int kh_b,
-        int kh_e) {
+        int vM, bool is_N_tail, bool is_K_tail, bool do_init, int kd_b,
+        int kd_e, int kh_b, int kh_e) {
 
-    if (i_init && i_K && jcp_.K > 0) return status::success;
+    if (do_init && is_K_tail && jcp_.K > 0) return status::success;
 
     const auto src_type = src_md(0)->data_type;
     const auto wei_type = weights_md(0)->data_type;
@@ -199,14 +199,15 @@ status_t brgemm_convolution_fwd_t<isa, use_inversion>::pd_t::add_brg_descriptor(
     const float alpha = 1.0;
     const float beta = 1.0;
 
-    auto vbeta = (i_init) ? 0 : beta;
-    auto vN = (i_N) ? jcp_.N_tail : jcp_.N;
-    auto vK = (i_K) ? jcp_.K_tail : jcp_.K;
+    auto vbeta = do_init ? 0 : beta;
+    auto vN = is_N_tail ? jcp_.N_tail : jcp_.N;
+    auto vK = is_K_tail ? jcp_.K_tail : jcp_.K;
     auto vbrgM = jcp_.use_M_mask ? (vM == jcp_.M ? jcp_.brgM : jcp_.brgM_tail)
                                  : vM;
     if (vN == 0 || vK == 0) return status::success;
 
-    auto brg_idx = get_brg_idx(vM, i_init, i_N, i_K, kd_b, kd_e, kh_b, kh_e);
+    auto brg_idx = get_brg_idx(
+            vM, do_init, is_N_tail, is_K_tail, kd_b, kd_e, kh_b, kh_e);
     // if brgemm_t already created then skip this iteration
     if (brg_idx != -1) return status::success;
 
@@ -338,7 +339,7 @@ status_t brgemm_convolution_fwd_t<isa, use_inversion>::pd_t::add_brg_descriptor(
     brg_idx = brgemm_descriptors_->insert(brg, bd_mask, stoffs);
 
     const std::array<int, 8> key
-            = {vM, i_N, i_K, i_init, kd_b, kd_e, kh_b, kh_e};
+            = {vM, is_N_tail, is_K_tail, do_init, kd_b, kd_e, kh_b, kh_e};
     if (brg_indices.find(key) == brg_indices.end()) {
         brg_indices.insert({key, brg_idx});
         brg_indices_c++;
@@ -623,20 +624,27 @@ status_t brgemm_convolution_fwd_t<isa, use_inversion>::pd_t::init(
             || (jcp_.dst_dt != jcp_.acc_dt) || jcp_.with_sum || jcp_.use_M_mask
             || jcp_.src_zero_point || jcp_.dst_zero_point;
 
-    const int M_begin = 0;
-    const int M_end = nstl::max(jcp_.M, jcp_.M_tail);
-    const int N_begin = 0;
-    const int N_end = (jcp_.N_tail == jcp_.N) ? 1 : 2;
-    const int K_begin = 0;
-    const int K_end = (jcp_.K_tail == 0) ? 1 : 2;
-    const int i_init_begin
-            = (IMPLICATION(jcp_.K_tail != 0, jcp_.K_tail == jcp_.K)
-                      && jcp_.exec_type == exec_trans
-                      && div_up(jcp_.nb_ic, jcp_.nb_ic_blocking) == 1
-                      && KD_BLOCK == KD && KH_BLOCK == KH)
-            ? 1
-            : 0;
-    int i_init_end = 2;
+    const auto Mv = (jcp_.M_tail > 0 && jcp_.M_tail != jcp_.M)
+            ? std::vector<int> {jcp_.M, jcp_.M_tail}
+            : std::vector<int> {jcp_.M};
+
+    std::vector<bool> bv_true {true};
+    std::vector<bool> bv_false {false};
+    std::vector<bool> bv_both {false, true};
+
+    const auto has_N_tail = jcp_.N_tail > 0 && jcp_.N_tail != jcp_.N;
+    std::vector<bool> Nv;
+    if (jcp_.N > 0) Nv.push_back(false);
+    if (has_N_tail) Nv.push_back(true);
+
+    const auto has_K_tail = jcp_.K_tail > 0 && jcp_.K_tail != jcp_.K;
+    std::vector<bool> Kv;
+    if (jcp_.K > 0) Kv.push_back(false);
+    if (has_K_tail) Kv.push_back(true);
+
+    const auto first_K_init_only = jcp_.exec_type == exec_trans
+            && (jcp_.ic / jcp_.ic_block <= 1)
+            && (KD_BLOCK == KD && KH_BLOCK == KH);
 
     for (const auto &key_value_pair : batchsizes) {
         const int kd_b = key_value_pair.first[0];
@@ -644,14 +652,16 @@ status_t brgemm_convolution_fwd_t<isa, use_inversion>::pd_t::init(
         const int kh_b = key_value_pair.first[2];
         const int kh_e = key_value_pair.first[3];
 
-        for_(int i_N = N_begin; i_N < N_end; i_N++)
-        for_(int i_M = M_begin; i_M < M_end; i_M++)
-        for_(int i_init = i_init_begin; i_init < i_init_end; i_init++)
-        for (int i_K = K_begin; i_K < K_end; i_K++) {
-            auto M = (i_M) ? jcp_.M_tail : jcp_.M;
-            if (M <= 0) continue;
-            CHECK(add_brg_descriptor(
-                    M, i_N, i_K, i_init, kd_b, kd_e, kh_b, kh_e));
+        for_(const auto &i_N : Nv)
+        for_(const auto &M : Mv)
+        for (const auto &i_K : Kv) {
+            const std::vector<bool> &init_v = (i_K == Kv.front())
+                    ? (first_K_init_only ? bv_true : bv_both)
+                    : bv_false;
+            for (const auto &i_init : init_v) {
+                CHECK(add_brg_descriptor(
+                        M, i_N, i_K, i_init, kd_b, kd_e, kh_b, kh_e));
+            }
         }
     }
 
@@ -674,11 +684,15 @@ status_t brgemm_convolution_fwd_t<isa, use_inversion>::pd_t::init(
                     const int kh_b = key_value_pair.first[2];
                     const int kh_e = key_value_pair.first[3];
 
-                    for_(int i_init = 0; i_init < 2; i_init++)
-                    for_(int i_N = 0; i_N < 2; i_N++)
-                    for (int i_K = 0; i_K < 2; i_K++) {
-                        CHECK(add_brg_descriptor(
-                                M, i_N, i_K, i_init, kd_b, kd_e, kh_b, kh_e));
+                    for_(const auto &i_N : Nv)
+                    for (const auto &i_K : Kv) {
+                        const std::vector<bool> &init_v = (i_K == Kv.front())
+                                ? (first_K_init_only ? bv_true : bv_both)
+                                : bv_false;
+                        for (const auto &i_init : init_v) {
+                            CHECK(add_brg_descriptor(M, i_N, i_K, i_init, kd_b,
+                                    kd_e, kh_b, kh_e));
+                        }
                     }
                 }
             }
@@ -700,11 +714,15 @@ status_t brgemm_convolution_fwd_t<isa, use_inversion>::pd_t::init(
                     const int kd_e = key_value_pair.first[1];
                     const int kh_b = key_value_pair.first[2];
                     const int kh_e = key_value_pair.first[3];
-                    for_(int i_init = 0; i_init < 2; i_init++)
-                    for_(int i_N = 0; i_N < 2; i_N++)
-                    for (int i_K = 0; i_K < 2; i_K++) {
-                        CHECK(add_brg_descriptor(
-                                M, i_N, i_K, i_init, kd_b, kd_e, kh_b, kh_e));
+                    for_(const auto &i_N : Nv)
+                    for (const auto &i_K : Kv) {
+                        const std::vector<bool> &init_v = (i_K == Kv.front())
+                                ? (first_K_init_only ? bv_true : bv_both)
+                                : bv_false;
+                        for (const auto &i_init : init_v) {
+                            CHECK(add_brg_descriptor(M, i_N, i_K, i_init, kd_b,
+                                    kd_e, kh_b, kh_e));
+                        }
                     }
                 }
             }
@@ -976,26 +994,22 @@ status_t brgemm_convolution_fwd_t<isa, use_inversion>::init(engine_t *engine) {
     }
 
     if (jcp.is_relo && jcp.relo_conv_weights) {
-        jit_brgemm_conv_conf_t wjcp;
-        wjcp.amx_w = jcp.amx_w;
+        jit_brgemm_relo_copy_to_wbuffer_t::cfg_t wjcp;
         wjcp.wei_dt = jcp.wei_dt;
-        wjcp.wei_dsz = jcp.wei_dsz;
-        wjcp.oc_block = 16;
-        wjcp.kw = jcp.vnni_block;
-        wjcp.ic_block = 1;
-        wjcp.ic_without_padding = 1;
-        wjcp.kh = 1;
-        wjcp.nb_oc = 1;
-        wjcp.ngroups = 1;
+        wjcp.out_oc_block = jcp.oc_block;
+        wjcp.inp_oc_block = 16;
+        wjcp.rd = jcp.kw * jcp.ic;
+        wjcp.is_rd_padded_to_block = jcp.is_rd_padded_to_block;
+        wjcp.inp_ocb_offs
+                = jcp.kh * jcp.kw * jcp.ic * wjcp.inp_oc_block * jcp.wei_dsz;
+
+        const auto oc_chunks = jcp.oc_block / wjcp.inp_oc_block;
+        const auto inp_nb_oc = div_up(jcp.oc, wjcp.inp_oc_block);
+        wjcp.last_occ_to_copy = inp_nb_oc - (jcp.nb_oc - 1) * oc_chunks;
+
         CHECK(safe_ptr_assign(copy_to_relo_wbuffer_,
                 new jit_brgemm_relo_copy_to_wbuffer_t(wjcp)));
         CHECK(copy_to_relo_wbuffer_->create_kernel());
-        if ((jcp.kw * jcp.ic) % jcp.vnni_block != 0) {
-            wjcp.kw = (jcp.kw * jcp.ic) % jcp.vnni_block;
-            CHECK(safe_ptr_assign(copy_to_relo_wbuffer_tail_,
-                    new jit_brgemm_relo_copy_to_wbuffer_t(wjcp)));
-            CHECK(copy_to_relo_wbuffer_tail_->create_kernel());
-        }
     }
 
     if (jcp.req_cal_comp_pad) {
@@ -1513,10 +1527,10 @@ status_t brgemm_convolution_fwd_t<isa, use_inversion>::cal_compensation(
             const auto wei_offs = g * _pd->wei_g_stride
                     + ocb * _pd->wei_ocb_stride + kd_b * _pd->wei_kd_stride
                     + kh_b * _pd->wei_kh_stride + kw_b * _pd->wei_kw_stride;
-            if (jcp.src_zero_point)
+            if (jcp.src_zero_point && src_zp_buffer)
                 std::memset(&src_zp_buffer[buffer_offs], 0,
                         sizeof(int32_t) * k_l * comp_kw_sz);
-            if (jcp.s8s8_compensation_required)
+            if (jcp.s8s8_compensation_required && s8s8_comp_buffer)
                 std::memset(&s8s8_comp_buffer[buffer_offs], 0,
                         sizeof(int32_t) * k_l * comp_kw_sz);
 
@@ -1705,49 +1719,27 @@ void brgemm_convolution_fwd_t<isa, use_inversion>::maybe_conv_weights(
         auto nb_rd = div_up(rd, jcp.vnni_block);
         if (jcp.is_rd_padded_to_block) nb_rd = rnd_up(nb_rd, 16);
 
-        assert(jcp.oc_block % 16 == 0);
-        const auto oc_chunks = jcp.oc_block / 16;
-
         const auto inp_oc_block = 16; // this is oc block of inp weights layout
+
+        assert(jcp.oc_block % inp_oc_block == 0);
+        const auto oc_chunks = jcp.oc_block / inp_oc_block;
+
         const auto inp_nb_oc = div_up(jcp.oc, inp_oc_block);
-        const auto ikw_offs = jcp.ic * inp_oc_block;
-        const auto iocb_offs = jcp.kh * jcp.kw * ikw_offs;
+        const auto inp_kh_offs = jcp.kw * jcp.ic * inp_oc_block * jcp.wei_dsz;
+        const auto out_kh_offs
+                = nb_rd * jcp.oc_block * jcp.wei_dsz * jcp.vnni_block;
 
         parallel_nd(jcp.ngroups, jcp.nb_oc, jcp.kh,
                 [&](dim_t g, dim_t ocb, dim_t kh) {
-                    const auto odx_g = g * jcp.nb_oc;
-                    const auto idx_g = g * inp_nb_oc;
-                    const auto odx_ocb = (odx_g + ocb) * jcp.kh;
-                    const auto odx_kh = (odx_ocb + kh) * nb_rd;
-                    const auto idx_kh = kh * jcp.kw * jcp.ic * inp_oc_block;
-                    for (int rdb = 0; rdb < nb_rd; rdb++) {
-                        const auto odx_rdb = (odx_kh + rdb) * jcp.oc_block;
-                        for (int occ = 0; occ < oc_chunks; occ++) {
-                            const auto inp_ocb = ocb * oc_chunks + occ;
-                            auto p = jit_brgemm_relo_copy_to_wbuffer_t::ctx_t();
-
-                            p.src = input_weights
-                                    + jcp.wei_dsz
-                                            * ((idx_g + inp_ocb) * iocb_offs
-                                                    + idx_kh
-                                                    + rdb * inp_oc_block
-                                                            * jcp.vnni_block);
-                            p.dst = wei_buffer
-                                    + jcp.wei_dsz
-                                            * (odx_rdb * jcp.vnni_block
-                                                    + occ * inp_oc_block
-                                                            * jcp.vnni_block);
-                            if (rdb * jcp.vnni_block >= rd
-                                    || inp_ocb >= inp_nb_oc)
-                                std::memset(p.dst, 0,
-                                        jcp.wei_dsz * inp_oc_block
-                                                * jcp.vnni_block);
-                            else if ((rdb + 1) * jcp.vnni_block > rd)
-                                (*copy_to_relo_wbuffer_tail_)(&p);
-                            else
-                                (*copy_to_relo_wbuffer_)(&p);
-                        }
-                    }
+                    auto p = jit_brgemm_relo_copy_to_wbuffer_t::ctx_t();
+                    p.src = input_weights
+                            + ((g * inp_nb_oc + ocb * oc_chunks) * jcp.kh + kh)
+                                    * inp_kh_offs;
+                    p.dst = wei_buffer
+                            + ((g * jcp.nb_oc + ocb) * jcp.kh + kh)
+                                    * out_kh_offs;
+                    p.last_ocb = (ocb == jcp.nb_oc - 1);
+                    (*copy_to_relo_wbuffer_)(&p);
                 });
         wei = wei_buffer;
     }
@@ -1978,6 +1970,10 @@ void brgemm_convolution_fwd_t<isa, use_inversion>::ker_base(
     const auto call_brgemm = [&](int brg_idx, int ic_block_s, int n_ic_blocks,
                                      size_t comp_ker_offs, bool do_postops,
                                      bool do_only_comp) {
+        if (brg_idx == -1) {
+            assert(!"Requested brgemm kernel was not created.");
+            return;
+        }
         const auto brg_ker = brgemm_kernels_[brg_idx];
         brgemm_palettes_.maybe_tile_configure(is_amx, btc.cur_brg_idx, brg_idx);
 
@@ -2151,6 +2147,10 @@ void brgemm_convolution_fwd_t<isa, use_inversion>::ker_trans(
 
     const auto call_brgemm = [&](int brg_idx, int ic_block_s, int n_ic_blocks,
                                      size_t comp_ker_offs, bool do_postops) {
+        if (brg_idx == -1) {
+            assert(!"Requested brgemm kernel was not created.");
+            return;
+        }
         const auto brg_ker = brgemm_kernels_[brg_idx];
         brgemm_palettes_.maybe_tile_configure(is_amx, btc.cur_brg_idx, brg_idx);
 
@@ -2262,6 +2262,10 @@ void brgemm_convolution_fwd_t<isa, use_inversion>::ker_vpad(
 
     const auto call_brgemm = [&](int brg_idx, int ic_block_s, int n_ic_blocks,
                                      size_t comp_ker_offs, bool do_postops) {
+        if (brg_idx < 0) {
+            assert(!"Requested brgemm kernel was not created.");
+            return;
+        }
         const auto brg_ker = brgemm_kernels_[brg_idx];
 
         brgemm_palettes_.maybe_tile_configure(is_amx, btc.cur_brg_idx, brg_idx);

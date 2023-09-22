@@ -121,8 +121,8 @@ struct brgemm_convolution_fwd_t : public primitive_t {
                 int ic_block_s, int iid_b, int iih_b, int iiw_b, int kd_b,
                 int kh_b, const void *&ptrA, const void *&ptrB) const;
 
-        status_t add_brg_descriptor(int M, int i_N, int i_K, int i_init,
-                int kd_b, int kd_e, int kh_b, int kh_e);
+        status_t add_brg_descriptor(int M, bool is_N_tail, bool is_K_tail,
+                bool do_init, int kd_b, int kd_e, int kh_b, int kh_e);
 
         int ndims = 0;
 
@@ -243,8 +243,6 @@ private:
     std::unique_ptr<jit_avx512_core_amx_copy_to_pbuffer_t>
             copy_to_relo_pbuffer_;
     std::unique_ptr<jit_brgemm_relo_copy_to_wbuffer_t> copy_to_relo_wbuffer_;
-    std::unique_ptr<jit_brgemm_relo_copy_to_wbuffer_t>
-            copy_to_relo_wbuffer_tail_;
 
     std::unique_ptr<jit_generator> comp_vpad_pbuffer_;
 

@@ -14,10 +14,12 @@
 # limitations under the License.
 #===============================================================================
 
-set(TEST_EXE test_unit_interface_sycl)
-
 file(GLOB SOURCES
-    ${CMAKE_CURRENT_SOURCE_DIR}/test_allocator.cpp
-)
+    ${CMAKE_CURRENT_SOURCE_DIR}/*.[ch]pp
+    )
 
-register_graph_unit_exe(${TEST_EXE} "${SOURCES}" "")
+set(OBJ_LIB graph_unit_test_interface_sycl)
+add_library(${OBJ_LIB} OBJECT ${SOURCES})
+
+set_property(GLOBAL APPEND PROPERTY GRAPH_UNIT_TEST_DEPS
+    $<TARGET_OBJECTS:${OBJ_LIB}>)

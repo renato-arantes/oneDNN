@@ -83,7 +83,9 @@ namespace brgemm_utils {
 bool can_dispatch_uker(const brgemm_t *brg) {
     return brg->is_tmm
             && one_of(brg->type, brgemm_addr, brgemm_offs, brgemm_static_offs)
-            && brg->brgattr.use_uker;
+            && brg->brgattr.use_uker
+            && everyone_is(false, brg->is_runtime_lda, brg->is_runtime_ldb,
+                    brg->is_runtime_ldc, brg->is_runtime_ldd);
 }
 
 void maybe_try_bf32(brgemm_t *brg) {
@@ -488,7 +490,7 @@ status_t brgemm_blocking(brgemm_t *brg) {
         recalc_ld_block(brg->ld_block);
         recalc_ld_block2(brg->ld_block2);
 
-        if (brg->brgattr.use_uker) {
+        if (can_dispatch_uker(brg)) {
             // Blocking heuristics for some shapes
             // TODO: Review these criterias
             size_t eff_K
@@ -814,10 +816,15 @@ void init_brgemm_conf(brgemm_t *brg, cpu_isa_t isa, brgemm_batch_kind_t type,
 
     brg->LDA = (brg->is_row_major()) ? static_cast<int>(LDA)
                                      : static_cast<int>(LDB);
+    brg->is_runtime_lda = (brg->is_row_major()) ? is_runtime_value(LDA)
+                                                : is_runtime_value(LDB);
     brg->LDB = (brg->is_row_major()) ? static_cast<int>(LDB)
                                      : static_cast<int>(LDA);
+    brg->is_runtime_ldb = (brg->is_row_major()) ? is_runtime_value(LDB)
+                                                : is_runtime_value(LDA);
     brg->LDC = static_cast<int>(LDC);
     brg->LDD = static_cast<int>(LDC);
+    brg->is_runtime_ldc = brg->is_runtime_ldd = is_runtime_value(LDC);
 
     brg->bcast_dim
             = (brg->is_row_major()) ? static_cast<int>(M) : static_cast<int>(N);

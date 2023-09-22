@@ -192,6 +192,10 @@ static status_t init_ocl_conf(rnn_utils::ocl_conf_t &ocl_conf,
     ocl_conf.need_bias_atomic_reduce
             = !ocl_conf.is_fwd && ocl_conf.elemwise_bwd_batch_block < rnn.mb;
 
+    if (ocl_conf.need_bias_atomic_reduce
+            && !device_info.has(compute::device_ext_t::ext_float_atomics))
+        return status::unimplemented;
+
     return status::success;
 }
 
@@ -721,13 +725,6 @@ status_t _ref_rnn_common_t<aprop>::pd_t::init(engine_t *engine) {
 template <prop_kind_t aprop>
 status_t _ref_rnn_common_t<aprop>::init(engine_t *engine) {
     using namespace rnn_utils;
-    auto assign_funcs = [](gemm_t &g, weights_assign_t &p) {
-        g = &class_name::gemm_primitive;
-        p = &class_name::assign_weights;
-    };
-
-    assign_funcs(gemm_iter_func, weights_iter_assign_func);
-    assign_funcs(gemm_layer_func, weights_layer_assign_func);
 
     switch (pd()->cell_kind()) {
         case dnnl_vanilla_lstm:
@@ -754,17 +751,23 @@ status_t _ref_rnn_common_t<aprop>::init(engine_t *engine) {
 
     grid_computation = &class_name::linear_execution;
 
-    rnn_utils::set_workspace_offsets(pd()->rnn_conf, ws_gates_offset_,
-            ws_states_offset_, ws_c_states_offset_, ws_grid_comp_offset_,
-            ws_bias_offset_);
+    const conf_t &rnn = pd()->rnn_conf;
+    rnn_utils::set_workspace_offsets(rnn, ws_gates_offset_, ws_states_offset_,
+            ws_c_states_offset_, ws_grid_comp_offset_, ws_bias_offset_);
     int max_nparts = (pd()->cell_kind() == alg_kind::vanilla_gru) ? 2 : 1;
-    dim_t wei_offsets_iter_sz = pd()->L() * pd()->D() * max_nparts;
-    dim_t wei_offsets_layer_sz = pd()->L() * pd()->D();
+    size_t wei_offsets_iter_sz
+            = static_cast<size_t>(pd()->L() * pd()->D() * max_nparts);
+    size_t wei_offsets_layer_sz = static_cast<size_t>(pd()->L() * pd()->D());
 
-    wei_layer_offset_ptr
-            = (dim_t *)malloc(sizeof(dim_t) * wei_offsets_layer_sz, 64);
-    wei_iter_offset_ptr
-            = (dim_t *)malloc(sizeof(dim_t) * wei_offsets_iter_sz, 64);
+    wei_layer_offsets = std::vector<dim_t>(wei_offsets_layer_sz);
+    wei_iter_offsets = std::vector<dim_t>(wei_offsets_iter_sz);
+
+    assign_weight_offsets(rnn, pd()->weights_md(1), wei_iter_offsets,
+            rnn.n_parts_weights_iter, rnn.parts_weights_iter,
+            rnn.weights_iter_ld, rnn.weights_iter_nld, pd()->weights_type);
+    assign_weight_offsets(rnn, pd()->weights_md(0), wei_layer_offsets,
+            rnn.n_parts_weights_layer, rnn.parts_weights_layer,
+            rnn.weights_layer_ld, rnn.weights_layer_nld, pd()->weights_type);
 
     std::vector<compute::kernel_t> kernels;
     auto kernel_names = pd()->ocl_conf.get_kernel_names();
@@ -790,7 +793,7 @@ status_t _ref_rnn_common_t<aprop>::init(engine_t *engine) {
                                     pd()->gemm_layer_fwd_pd_, engine),
                             create_nested_primitive(gemm_iter_fwd_,
                                     pd()->gemm_iter_fwd_pd_, engine),
-                            pd()->rnn_conf.is_vanilla_gru
+                            rnn.is_vanilla_gru
                                     ? create_nested_primitive(gemm_iter_fwd_2_,
                                             pd()->gemm_iter_fwd_2_pd_, engine)
                                     : status::success);
@@ -806,16 +809,14 @@ status_t _ref_rnn_common_t<aprop>::init(engine_t *engine) {
                                     pd()->gemm_diff_wei_layer_pd_, engine),
                             create_nested_primitive(gemm_diff_wei_iter_,
                                     pd()->gemm_diff_wei_iter_pd_, engine),
-                            pd()->rnn_conf.is_vanilla_gru
+                            rnn.is_vanilla_gru
                                     ? create_nested_primitive(gemm_iter_bwd_2_,
                                             pd()->gemm_iter_bwd_2_pd_, engine)
                                     : status::success,
-                            pd()->rnn_conf.is_vanilla_gru
-                                    ? create_nested_primitive(
-                                            gemm_diff_wei_iter_2_,
-                                            pd()->gemm_diff_wei_iter_2_pd_,
-                                            engine)
-                                    : status::success);
+                            rnn.is_vanilla_gru ? create_nested_primitive(
+                                    gemm_diff_wei_iter_2_,
+                                    pd()->gemm_diff_wei_iter_2_pd_, engine)
+                                               : status::success);
             break;
         default: assert(!"unknown prop_kind"); return status::invalid_arguments;
     }
@@ -1073,7 +1074,7 @@ grid_execution_sig((_ref_rnn_common_t<aprop>::linear_execution)) {
             dim_t offset_diff_wei_iter, offset_diff_wei_lay,
                     offset_scratch_diff_lay;
 
-            set_offsets_fwd_gemm(rnn, dir, lay, src_t, wei_layer_offset_ptr,
+            set_offsets_fwd_gemm(rnn, dir, lay, src_t, wei_layer_offsets,
                     ws_states_offset_, offset_ws_layer, offset_wei_layer,
                     offset_ws_iter);
             if (aprop == prop_kind::backward) {
@@ -1092,7 +1093,7 @@ grid_execution_sig((_ref_rnn_common_t<aprop>::linear_execution)) {
             for (dim_t i = 0; i < n_iter; i++) {
                 dim_t iter = (aprop == prop_kind::forward) ? i : n_iter - i - 1;
                 CHECK((this->*cell_func)(engine, ctx, dir, lay, iter,
-                        &offset_wei_layer, wei_iter_offset_ptr, bias, workspace,
+                        offset_wei_layer, wei_iter_offsets, bias, workspace,
                         scratch_gates, scratch_cell, scratch_diff_states,
                         scratch_dhG1, wei_layer, wei_iter, diff_weights_layer,
                         diff_weights_iter, diff_bias, scales, tm_scales));
@@ -1453,9 +1454,9 @@ status_t _ref_rnn_common_t<aprop>::ws_print(const exec_ctx_t &ctx,
 }
 
 template <prop_kind_t aprop>
-weights_assign_sig((_ref_rnn_common_t<aprop>::assign_weights)) {
+weights_assign_sig((_ref_rnn_common_t<aprop>::assign_weight_offsets)) {
     assert(md->format_kind == format_kind::blocked);
-    AOC<dim_t, 3> weights(weights_, rnn.n_layer, rnn.n_dir, n_parts);
+    AOC<dim_t, 3> weights(weights_.data(), rnn.n_layer, rnn.n_dir, n_parts);
     const auto &blk = md->format_desc.blocking;
 
     for (dim_t i = 0; i < rnn.n_layer; i++) {
@@ -1495,8 +1496,6 @@ status_t _ref_rnn_common_t<aprop>::execute_(const exec_ctx_t &ctx) const {
     dim_t sic = rnn.sic;
     dim_t dhc = rnn.dhc;
     dim_t dlc = rnn.dlc;
-    dim_t n_parts_weights_iter = rnn.n_parts_weights_iter;
-    dim_t n_parts_weights_layer = rnn.n_parts_weights_layer;
 
     bool is_fwd = rnn.is_fwd;
     bool is_vanilla_gru = rnn.is_vanilla_gru;
@@ -1618,16 +1617,6 @@ status_t _ref_rnn_common_t<aprop>::execute_(const exec_ctx_t &ctx) const {
     // TODO: implement without copies
     bool is_lr = !one_of(rnn.exec_dir, r2l, r2l);
     bool is_rl = !one_of(rnn.exec_dir, l2r, l2r);
-
-    // XXX: this function is used for calculating offsets for buffers
-    (this->*weights_iter_assign_func)(rnn, rnn_pd->weights_md(1),
-            wei_iter_offset_ptr, n_parts_weights_iter, rnn.parts_weights_iter,
-            wei_iter_native_, rnn.weights_iter_ld, rnn.weights_iter_nld,
-            pd()->weights_type);
-    (this->*weights_layer_assign_func)(rnn, rnn_pd->weights_md(0),
-            wei_layer_offset_ptr, n_parts_weights_layer,
-            rnn.parts_weights_layer, wei_layer_native_, rnn.weights_layer_ld,
-            rnn.weights_layer_nld, pd()->weights_type);
 
     const memory_storage_t *scales_buf = nullptr;
     if (pd()->rnn_conf.is_int8 && pd()->rnn_conf.copy_bias) {

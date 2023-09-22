@@ -68,10 +68,12 @@ SC_CLASS_END();
 
 namespace ops {
 
-static inline int get_oc_split_factor(
+static inline int get_oc_split_factor(const int data_size,
   const int weight_size, const int L2_cache_size, const int K_num_block) {
   int oc_split = 1;
-  if (weight_size >= L2_cache_size) {
+  // data_size == -1 for dynamic case
+  if (weight_size >= L2_cache_size
+    && (weight_size > data_size || data_size == -1)) {
     int expected_split_num = utils::divide_and_ceil(weight_size, L2_cache_size);
     for (auto &factor : utils::get_factors(K_num_block)) {
       if (factor >= expected_split_num) {
@@ -202,8 +204,9 @@ config_ptr gen_nested_conv_fwd_t::get_default_config(context_ptr ctx) const {
       = get_blocks_if_not_satisfy(oc_, 1, default_block, [](int x) {
           return x % 32 != 0;
         }).back();
-    cfg.im_ic_block
-      = get_blocks_if_not_satisfy(ic_, 1, default_block, [](int x) {
+    cfg.im_ic_block = ic_ <= 512
+      ? ic_
+      : get_blocks_if_not_satisfy(ic_, 1, default_block, [](int x) {
           return x % 32 != 0;
         }).back();
 
@@ -279,6 +282,10 @@ config_ptr gen_nested_conv_fwd_t::get_default_config(context_ptr ctx) const {
                 cfg.im_w_block = os_blocks[i];
                 break;
               }
+            }
+            if (cfg.im_w_block <= ow_) {
+              cfg.w_threads = 1;
+              cfg.h_threads = num_threads;
             }
           } else {
             // don't use os blocking, directly split threads on h
@@ -412,7 +419,7 @@ config_ptr gen_nested_conv_fwd_t::get_default_config(context_ptr ctx) const {
     if (!is_1x1_conv_ && ic_ > 32 && cfg.im_ic_block % 32 != 0) {
       // The performance is bad when ic_block % 32 != 0. The performance of ic =
       // 56 is worse than ic = 64(in total execution time).
-      cfg.im_ic_block = utils::rnd_up(cfg.im_ic_block, 32);
+      cfg.im_ic_block = utils::rnd_up(ic_ <= 512 ? ic_ : cfg.im_ic_block, 32);
     }
 
     cfg.C_block = utils::divide_and_ceil(
@@ -592,7 +599,7 @@ gen_nested_conv_fwd_t::gen_nested_conv_fwd_t(sc_op *owner,
     if (ic_ * oc_ < 512 * 512) { default_im_block_ /= 2; }
     if (mb_ == 1 && num_threads == 4) { default_im_block_ = 64; }
     bool is_small_oc_with_enough_parallel
-      = oc_ <= 512 && is_parallel_space_enough(mb_ * ow_ / 32, num_threads);
+      = oc_ < 256 && is_parallel_space_enough(mb_ * ow_ / 32, num_threads);
     im_oc_block_ = utils::get_blocks(
       oc_, 1, is_small_oc_with_enough_parallel ? oc_ : default_im_block_)
                      .back();
@@ -638,7 +645,7 @@ gen_nested_conv_fwd_t::gen_nested_conv_fwd_t(sc_op *owner,
   bool has_pad = (pd_b_ > 0) || (ph_b_ > 0) || (pw_b_ > 0) || (pd_e_ > 0)
     || (ph_e_ > 0) || (pw_e_ > 0);
   try_os_blocking_ = (!is_1x1_conv_) && (!has_pad) && (!is_3d_)
-    && (is_int8 || is_bf16) && !is_dynamic();
+    && (is_int8 || is_bf16) && !is_dynamic() && sh_ == 1;
   use_nested_2d_ = (!is_1d_ && !is_3d_);
   if (is_1d_) {
     use_conv1d = true;
@@ -768,11 +775,11 @@ void gen_nested_conv_fwd_t::compute_conv1d(CONV_ARG_LIST) const {
     output_tmp = out_tmp;
   }
 
+  auto origin_ow = dim2unsigned(attrs_.get_or_else("origin_ow", sc_dim(ow_)));
+  auto origin_oh = dim2unsigned(attrs_.get_or_else("origin_oh", sc_dim(oh_)));
   auto infer_input_idx = [&](std::vector<expr> output_idx) {
     std::vector<expr> input_idx = output_idx;
-    auto origin_ow = dim2unsigned(attrs_.get_or_else("origin_ow", sc_dim(ow_)));
     auto origin_iw = dim2unsigned(attrs_.get_or_else("origin_iw", sc_dim(iw_)));
-    auto origin_oh = dim2unsigned(attrs_.get_or_else("origin_oh", sc_dim(oh_)));
     auto origin_ih = dim2unsigned(attrs_.get_or_else("origin_ih", sc_dim(ih_)));
     if (sh_ > 1 || sw_ > 1) {
       expr os = output_idx[1];
@@ -960,7 +967,8 @@ void gen_nested_conv_fwd_t::compute_conv1d(CONV_ARG_LIST) const {
                   }
                   if (fusion && ic_used_threads == 1 && ic_num_block_pt == 1
                     && oc_block * oc_used_threads == oc_
-                    && s_block * os_used_threads == os_) {
+                    && s_block * os_used_threads == os_
+                    && s_block % (origin_oh * origin_ow) == 0) {
                     _if_(o_ic == (ic_num_block - 1)) {
                       fusion->create_output_fusion_anchor({tensor_slice(output,
                         std::vector<std::pair<expr, expr>> {{n, 1UL},
@@ -1693,12 +1701,11 @@ void gen_nested_conv_fwd_t::dynamic_compute_1x1_pack_input_nested(
         }
       } // pw
     } // ph
-    if (fusion) {
-      _if_(mb_expr_ > 1) {
-        fusion->create_output_fusion_anchor({tensor_slice(
-          output, {{pbs, 1UL}, {0, oh_expr_}, {0, ow_expr_}, {0, oc_}})});
-      }
-    }
+    // TODO(xurui) disable the anchor fow now for dynamic bottleneck.
+    // if (fusion && mb_ > 1) {
+    //   fusion->create_output_fusion_anchor({tensor_slice(
+    //     output, {{pbs, 1UL}, {0, oh_expr_}, {0, ow_expr_}, {0, oc_}})});
+    // }
   } // pbs
   loops = {lpbs, lph, lpw, lpoc, lpic};
 }
@@ -2469,13 +2476,13 @@ void gen_nested_conv_fwd_t::dynamic_compute_conv_no_padding_nested(
 
   expr cond_tail_w = w_block % im_w_block != 0 || ow_expr_ % im_w_block != 0;
   expr cond_tail_h = h_block % im_h_block != 0 || oh_expr_ % im_h_block != 0;
-
   auto weight_size
     = math_utils::get_dims_product(in_tensors_[1].get_blocking_dims())
     * utils::get_sizeof_type(get_weight_dtype());
   auto L2_cache_size = ctx->machine_.cpu_flags_.getDCacheSize(2);
   int oc_split = (oc_threads == 1 && oc_num_block_pt == 1)
-    ? get_oc_split_factor(weight_size, L2_cache_size, oc_block / im_oc_block)
+    ? get_oc_split_factor(
+      -1, weight_size, L2_cache_size, oc_block / im_oc_block)
     : 1;
 
   auto LDA = blocking_input_ ? sw_ * im_ic_block : sw_ * ic_;
@@ -3744,217 +3751,6 @@ void gen_nested_conv_fwd_t::single_thread_conv_padding_call(expr &output,
   }
 }
 
-void gen_nested_conv_fwd_t::compute_conv_padding_nested(CONV_ARG_LIST) const {
-  int bs_threads = config.bs_threads;
-  int h_threads = config.h_threads;
-  int w_threads = config.w_threads;
-  int oc_threads = config.oc_threads;
-  int ic_threads = 1;
-
-  int oc_block = config.K_block;
-  int h_block = config.h_block;
-  int w_block = config.w_block;
-  int ic_block = config.C_block;
-  int im_oc_block = config.im_oc_block;
-  int im_ic_block = config.im_ic_block;
-  int im_h_block = config.im_h_block;
-  int im_w_block = config.im_w_block;
-
-  COMPILE_ASSERT(oc_block % im_oc_block == 0,
-    "oc_block % im_oc_block != 0, config is invalid")
-  COMPILE_ASSERT(ic_block % im_ic_block == 0,
-    "ic_block % im_ic_block != 0, config is invalid")
-  COMPILE_ASSERT(
-    h_block % im_h_block == 0, "h_block % im_h_block != 0, config is invalid")
-  COMPILE_ASSERT(
-    w_block % im_w_block == 0, "w_block % im_w_block != 0, config is invalid")
-
-  // param
-  expr output_tmp = output;
-  auto tinput = in_tensors_[0];
-  auto tweight = in_tensors_[1];
-  auto toutput = out_tensors_[0];
-  const auto &input_blocking_dims = tinput.get_blocking_dims();
-  const auto &weight_blocking_dims = tweight.get_blocking_dims();
-  const auto &output_blocking_dims = toutput.get_blocking_dims();
-
-  for_loop lpbs, lph, lpw, lpoc, lpic, loh, low, looc, loic, lioc, lih, liw,
-    lok;
-
-  int oc_num_block_pt, oc_tail_num_block_pt, h_num_block_pt,
-    h_tail_num_block_pt, w_num_block_pt, w_tail_num_block_pt, ic_num_block_pt,
-    ic_tail_num_block_pt;
-
-  int oc_used_threads = block_split(utils::divide_and_ceil(oc_, oc_block),
-    oc_threads, oc_num_block_pt, oc_tail_num_block_pt);
-  int oh_used_threads = block_split(utils::divide_and_ceil(oh_, h_block),
-    h_threads, h_num_block_pt, h_tail_num_block_pt);
-
-  int ow_used_threads = block_split(utils::divide_and_ceil(ow_, w_block),
-    w_threads, w_num_block_pt, w_tail_num_block_pt);
-
-  int ic_used_threads = block_split(utils::divide_and_ceil(ic_, ic_block),
-    ic_threads, ic_num_block_pt, ic_tail_num_block_pt);
-
-  if (ic_used_threads > 1) {
-    // barrier
-    // output temp buffer
-    auto out_dims = output_blocking_dims;
-    out_dims[0] *= ic_used_threads;
-    _tensor_(out_tmp, toutput.dtype_, dims_to_expr(out_dims));
-    output_tmp = out_tmp;
-  }
-  auto input_expr_dims = input.checked_as<tensor>()->dims_;
-  auto mb_expr_ = input_expr_dims[0];
-  int ih_padded = ih_ + (ph_b_ + ph_e_), iw_padded = iw_ + 2 * (pw_b_ + pw_e_);
-  auto dtypeInput = get_input_dtype();
-  uint32_t lanes = get_lanes(ctx, im_ic_block, dtypeInput);
-  const int src_row_tile_size = (im_w_block - 1) * sw_ + kw_;
-
-  /** calculate the unpadded point of spatial space in output tensor
-   *   +-----------------------+
-   *   |p p p p ...    p p p p |
-   *   |p a x x ...    x x b p |
-   *   |p x x x ...    x x x p |
-   *   |p x x x ...    x x x p |
-   *   |p x x x ...    x x x p |
-   *   |p c x x ...    x x d p |
-   *   |p p p p ...    p p p p |
-   *   +-----------------------+
-   *  where:
-   *    p: pad area
-   *    x: valid area
-   *    a: (y_unpad_top, y_unpad_left)
-   *    b: (y_unpad_top, y_unpad_right)
-   *    c: (y_unpad_bottom, y_unpad_left)
-   *    d: (y_unpad_bottom, y_unpad_right)
-   */
-
-  // some shapes might not have bottom or right pad at all
-  auto get_num_pad_end = [](int ip, int k, int s, int p) {
-    int remaining = (ip - k) % s;
-    int num_pad_end = (remaining == 0)
-      ? utils::divide_and_ceil(p, s)
-      : ((p > remaining) ? utils::divide_and_ceil(p - remaining, s) : 0);
-    return num_pad_end;
-  };
-  const int dst_num_pad_top = utils::divide_and_ceil(ph_b_, sh_);
-  const int dst_num_pad_left = utils::divide_and_ceil(pw_b_, sw_);
-  const int dst_num_pad_bottom = get_num_pad_end(ih_padded, kh_, sh_, ph_e_);
-  const int dst_num_pad_right = get_num_pad_end(iw_padded, kw_, sw_, pw_e_);
-
-  int y_unpad_top = dst_num_pad_top;
-  int y_unpad_bottom = oh_ - dst_num_pad_bottom - 1;
-  int y_unpad_left = dst_num_pad_left;
-  int y_unpad_right = ow_ - dst_num_pad_right - 1;
-
-  auto weight_size
-    = math_utils::get_dims_product(in_tensors_[1].get_blocking_dims())
-    * utils::get_sizeof_type(get_weight_dtype());
-  auto L2_cache_size = ctx->machine_.cpu_flags_.getDCacheSize(2);
-  int oc_split = (oc_threads == 1 && oc_num_block_pt == 1)
-    ? get_oc_split_factor(weight_size, L2_cache_size, oc_block / im_oc_block)
-    : 1;
-
-  // create a global shared zero-buffer referenced by padding
-  auto LDA = blocking_input_ ? im_ic_block : ic_;
-  _tensor_(pbuffer, dtypeInput, {src_row_tile_size, LDA});
-  builtin::mem_zero(pbuffer, src_row_tile_size * LDA, dtypeInput);
-
-  _named_for_(lok, outer_k, 0, oc_split, 1, for_type::PARALLEL) {
-    _named_for_(lpbs, pbs, 0, mb_expr_, 1, for_type::PARALLEL) {
-      _named_for_(lph, ph, 0, oh_used_threads, 1) {
-        _named_for_(lpw, pw, 0, ow_used_threads, 1) {
-          _named_for_(lpoc, poc, 0, oc_used_threads, 1) {
-            _named_for_(lpic, pic, 0, ic_used_threads, 1) {
-              expr h_num_block
-                = builder::make_select(ph < (oh_used_threads - 1),
-                  h_num_block_pt, h_tail_num_block_pt),
-                w_num_block = builder::make_select(pw < (ow_used_threads - 1),
-                  w_num_block_pt, w_tail_num_block_pt),
-                oc_num_block = builder::make_select(poc < (oc_used_threads - 1),
-                  oc_num_block_pt, oc_tail_num_block_pt);
-
-              // single core
-              expr ic_num_block
-                = builder::make_select(pic < (ic_used_threads - 1),
-                  ic_num_block_pt, ic_tail_num_block_pt);
-              // single core
-              single_thread_conv_padding_call(output, input, weight, pbs, poc,
-                ph, pw, pic, outer_k, h_num_block, h_num_block_pt, w_num_block,
-                w_num_block_pt, oc_num_block, oc_num_block_pt, ic_num_block,
-                ic_num_block_pt, pbuffer, loh, low, looc, loic, lioc, lih, liw,
-                oc_split, src_row_tile_size, lanes, config, fusion,
-                ic_used_threads, oh_used_threads, ow_used_threads, y_unpad_top,
-                y_unpad_bottom, y_unpad_left, y_unpad_right, iw_padded, kpack);
-
-              if (fusion && oc_threads == 1 && ic_threads == 1 && h_threads == 1
-                && w_threads == 1) {
-                fusion->create_output_fusion_anchor({blocking_output_
-                    ? tensor_slice(output,
-                      {{pbs, 1UL},
-                        {outer_k * oc_ / im_oc_block / oc_split,
-                          oc_ / im_oc_block / oc_split},
-                        {0, oh_}, {0, ow_}, {0, im_oc_block}})
-                    : tensor_slice(output,
-                      {{pbs, 1UL}, {0, oh_}, {0, ow_},
-                        {outer_k * oc_ / oc_split, oc_ / oc_split}})});
-              }
-            }
-
-            if (fusion && oc_threads == 1 && h_threads == 1 && w_threads == 1) {
-              fusion->create_output_fusion_anchor({blocking_output_
-                  ? tensor_slice(output,
-                    {{pbs, 1UL},
-                      {outer_k * oc_ / im_oc_block / oc_split,
-                        oc_ / im_oc_block / oc_split},
-                      {0, oh_}, {0, ow_}, {0, im_oc_block}})
-                  : tensor_slice(output,
-                    {{pbs, 1UL}, {0, oh_}, {0, ow_},
-                      {outer_k * oc_ / oc_split, oc_ / oc_split}})});
-            }
-          }
-          if (fusion && h_threads == 1 && w_threads == 1) {
-            fusion->create_output_fusion_anchor({blocking_output_
-                ? tensor_slice(output,
-                  {{pbs, 1UL},
-                    {outer_k * oc_ / im_oc_block / oc_split,
-                      oc_ / im_oc_block / oc_split},
-                    {0, oh_}, {0, ow_}, {0, im_oc_block}})
-                : tensor_slice(output,
-                  {{pbs, 1UL}, {0, oh_}, {0, ow_},
-                    {outer_k * oc_ / oc_split, oc_ / oc_split}})});
-          }
-        }
-
-        if (fusion && h_threads == 1) {
-          fusion->create_output_fusion_anchor({blocking_output_
-              ? tensor_slice(output,
-                {{pbs, 1UL},
-                  {outer_k * oc_ / im_oc_block / oc_split,
-                    oc_ / im_oc_block / oc_split},
-                  {0, oh_}, {0, ow_}, {0, im_oc_block}})
-              : tensor_slice(output,
-                {{pbs, 1UL}, {0, oh_}, {0, ow_},
-                  {outer_k * oc_ / oc_split, oc_ / oc_split}})});
-        }
-      }
-      if (fusion && mb_ > 1) {
-        fusion->create_output_fusion_anchor(
-          {blocking_output_ ? tensor_slice(output,
-             {{pbs, 1UL},
-               {outer_k * oc_ / im_oc_block / oc_split,
-                 oc_ / im_oc_block / oc_split},
-               {0, oh_}, {0, ow_}, {0, im_oc_block}})
-                            : tensor_slice(output,
-                              {{pbs, 1UL}, {0, oh_}, {0, ow_},
-                                {outer_k * oc_ / oc_split, oc_ / oc_split}})});
-      }
-    }
-  }
-  loops = {lpbs, lph, lpw, lpoc, lpic, lok};
-}
-
 void gen_nested_conv_fwd_t::single_thread_dynamic_conv_padding_call(
   expr &output, const expr &input, const expr &weight, const expr &pbs,
   const expr &poc, const expr &ph, const expr &pw, const expr &pic,
@@ -4594,7 +4390,8 @@ void gen_nested_conv_fwd_t::dynamic_compute_conv_padding_nested(
     * utils::get_sizeof_type(get_weight_dtype());
   auto L2_cache_size = ctx->machine_.cpu_flags_.getDCacheSize(2);
   int oc_split = (oc_threads == 1 && oc_num_block_pt == 1)
-    ? get_oc_split_factor(weight_size, L2_cache_size, oc_block / im_oc_block)
+    ? get_oc_split_factor(
+      -1, weight_size, L2_cache_size, oc_block / im_oc_block)
     : 1;
 
   // create a global shared zero-buffer referenced by padding
@@ -4818,7 +4615,7 @@ bool gen_nested_conv_fwd_t::generate(context_ptr ctx,
       "data, the mixed datatypes is not supported yet!");
     COMPILE_ASSERT((dtypeOutput == datatypes::f32),
       "Output should be f32 when data and weights are in f16.");
-    kpack = ctx->machine_.cpu_flags_.fAVX512AMXFP16 ? 2 : 1;
+    kpack = 1;
   }
   if (utils::is_one_of(dtypeInput, datatypes::s8, datatypes::u8)) {
     COMPILE_ASSERT((dtypeWeight == datatypes::s8),
@@ -4929,9 +4726,6 @@ bool gen_nested_conv_fwd_t::generate(context_ptr ctx,
         dynamic_compute_conv_padding_nested(ctx, config, fusion, output, input,
           weight, loops, os, kpack, use_os_blocking, pack_rows, os_acc_size,
           os_mask);
-      } else {
-        compute_conv_padding_nested(ctx, config, fusion, output, input, weight,
-          loops, os, kpack, use_os_blocking, pack_rows, os_acc_size, os_mask);
       }
     }
   }

@@ -138,19 +138,28 @@ cold_cache_t::cold_cache_t(const std::vector<dnnl_exec_arg_t> &dnnl_args)
             SAFE_V(FAIL);
         }
 
+        const auto &orig_mem = dnnl_args[idx].memory;
         // Empty memories don't get their cold cache entry.
-        if (!dnnl_args[idx].memory) continue;
+        if (!orig_mem) continue;
 
         auto &cc_entry = cache_[arg];
         cc_entry.resize(n_buffers_);
-        auto orig_cc_mem_md = query_md(dnnl_args[idx].memory);
+        auto orig_cc_mem_md = query_md(orig_mem);
 
         for (size_t i = 0; i < n_buffers_; i++) {
             cc_entry[i] = dnn_mem_t(orig_cc_mem_md, get_test_engine());
             if (has_bench_mode_modifier(mode_modifier_t::no_host_memory))
                 continue;
 
-            fill_random_real(cc_entry[i]);
+            auto st = fill_random_real(orig_mem, cc_entry[i]);
+            if (st != OK) {
+                BENCHDNN_PRINT(0,
+                        "Error: filling for cold cache tensor %zu failed "
+                        "(%s:%d)!\n",
+                        i, __FILE__, __LINE__);
+                return;
+            }
+
             if (cc_entry[i].is_mapped()) cc_entry[i].unmap();
         }
     }
@@ -204,6 +213,8 @@ bool cold_cache_t::update_dnnl_args(std::vector<dnnl_exec_arg_t> &dnnl_args) {
     for (const auto &cc_entry : cache_) {
         const int arg = cc_entry.first;
         const int dnnl_args_idx = cold_cache_utils::get_arg_idx(dnnl_args, arg);
+        if (dnnl_args_idx < 0) return false;
+
         const auto &e = cc_entry.second;
         // Assumption that cache entries of the same size.
         if (cc_counter_ >= e.size()) cc_counter_ = 0;

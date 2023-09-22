@@ -888,6 +888,13 @@ TEST(GCCore_CPU_qconv2d_nested_u8s8s32_1x1, rn50_stage4_NXC) {
             512, 512, 56, 56, 1, 1, {1, 1}, {0, 0}, false, true, false, true);
 }
 
+TEST(GCCore_CPU_qconv2d_nested_u8s8s32_3x3, oob_rn50_conv_NXC) {
+    SET_THREADS_OR_SKIP(4);
+    REQUIRE_AMX();
+    check_nested_qconv<int8_t, int8_t, int32_t>(nested_conv_fwd_config_t(), 1,
+            512, 512, 21, 21, 3, 3, {2, 2}, {0, 0}, false, true, false, true);
+}
+
 TEST(GCCore_CPU_dynamic_qconv2d_nested_u8s8s32_1x1, ut1) {
     REQUIRE_AMX();
     check_dynamic_netsed_qconv<uint8_t, int8_t, int32_t>(
@@ -1139,6 +1146,11 @@ TEST(GCCore_CPU_qconv2d_u8s8s32_rl_bias, padding_1) {
 /* rl conv without padding */
 TEST(GCCore_CPU_qconv2d_u8s8s32_rl, no_padding_1) {
     REQUIRE_AMX();
+    check_rl_qconv<uint8_t, int8_t, int32_t>(conv_fwd_rl_config_t(), 1, 1, 64,
+            3, 230, 230, 7, 7, {2, 2}, {1, 1}, {0, 0}, {0, 0}, false, true);
+
+    // specify odd num_threads to cover different parallelism at width axis
+    SET_THREADS_OR_SKIP(7);
     check_rl_qconv<uint8_t, int8_t, int32_t>(conv_fwd_rl_config_t(), 1, 1, 64,
             3, 230, 230, 7, 7, {2, 2}, {1, 1}, {0, 0}, {0, 0}, false, true);
 }

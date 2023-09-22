@@ -76,7 +76,7 @@ void conv_fwd_core_op_t::infer_slice_ranges(
                     "constant", const_kind::not_const);
     if (attrs_.has_key("inverse_filter")
             || !attrs_.get_or_else("image_affinity", true)
-            || !is_weight_constant) {
+            || !is_weight_constant || is_dynamic()) {
         stat_map.append_ops_by_status(this, infer_status_code::FAIL);
         return;
     }
@@ -591,6 +591,7 @@ bool conv_fwd_core_op_t::use_nested_conv_fwd_generator() {
     auto use_nested_conv = (ndims_ == 4 && !has_pad && !has_dilation && is_int8
                                    && !(data_shape.back() > 56 && !is_1x1)
                                    && !(output_shape.back() <= 7 && !is_1x1)
+                                   && !(data_shape[1] % 32 != 0 && is_1x1)
                                    && num_threads / data_shape[0] <= 4
                                    && !os_blocking_with_oc_threads
                                    && !attrs_.get_or_else("use_rl", false))

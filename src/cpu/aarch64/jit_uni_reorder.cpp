@@ -2634,6 +2634,8 @@ status_t jit_uni_reorder_t::pd_t::create(reorder_pd_t **reorder_pd,
         engine_t *engine, const primitive_attr_t *attr, engine_t *src_engine,
         const memory_desc_t *src_md, engine_t *dst_engine,
         const memory_desc_t *dst_md) {
+    if (!impl::is_dense_format_kind({src_md, dst_md}))
+        return status::unimplemented;
     auto prb = tr::prb_t();
 
     status_t prb_init_status = prb_init(prb, *src_md, *dst_md, attr);
@@ -2665,7 +2667,7 @@ status_t jit_uni_reorder_t::pd_t::create(reorder_pd_t **reorder_pd,
         prb_dump(ker_desc.prb);
     });
 
-    auto _pd = new pd_t(
+    auto _pd = make_unique_pd<pd_t>(
             attr, src_engine->kind(), src_md, dst_engine->kind(), dst_md);
     if (_pd == nullptr) return status::out_of_memory;
 
@@ -2673,14 +2675,11 @@ status_t jit_uni_reorder_t::pd_t::create(reorder_pd_t **reorder_pd,
     _pd->prb_ = prb;
     _pd->with_groups_
             = prb.compensation_mask == tr::prb_t::comp_mask_with_groups;
-    if (_pd->init(engine, src_engine, dst_engine) != status::success) {
-        delete _pd;
-        return status::unimplemented;
-    }
+    CHECK(_pd->init(engine, src_engine, dst_engine));
     _pd->ker_desc_ = ker_desc;
     CHECK(_pd->init_scratchpad_md());
 
-    return safe_ptr_assign(*reorder_pd, _pd);
+    return safe_ptr_assign(*reorder_pd, _pd.release());
 }
 
 void jit_uni_reorder_t::omp_driver_0d(int off, const char *in, char *out,
@@ -3062,6 +3061,8 @@ status_t jit_blk_reorder_t::pd_t::create(reorder_pd_t **reorder_pd,
         engine_t *engine, const primitive_attr_t *attr, engine_t *src_engine,
         const memory_desc_t *src_md, engine_t *dst_engine,
         const memory_desc_t *dst_md) {
+    if (!impl::is_dense_format_kind({src_md, dst_md}))
+        return status::unimplemented;
     auto prb = tr::prb_t();
 
     status_t prb_init_status = prb_init(prb, *src_md, *dst_md, attr);
@@ -3080,17 +3081,14 @@ status_t jit_blk_reorder_t::pd_t::create(reorder_pd_t **reorder_pd,
         return status::unimplemented;
     }
 
-    auto _pd = new pd_t(
+    auto _pd = make_unique_pd<pd_t>(
             attr, src_engine->kind(), src_md, dst_engine->kind(), dst_md);
     if (_pd == nullptr) return status::out_of_memory;
     _pd->prb_ = prb;
-    if (_pd->init(engine, src_engine, dst_engine) != status::success) {
-        delete _pd;
-        return status::unimplemented;
-    }
+    CHECK(_pd->init(engine, src_engine, dst_engine));
     CHECK(_pd->init_scratchpad_md());
 
-    return safe_ptr_assign(*reorder_pd, _pd);
+    return safe_ptr_assign(*reorder_pd, _pd.release());
 }
 
 void jit_blk_reorder_t::pd_t::prb_tile_normalize(tr::prb_t &p) {

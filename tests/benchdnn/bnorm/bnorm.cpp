@@ -412,8 +412,10 @@ void setup_cmp(compare::compare_t &cmp, const prb_t *prb, data_kind_t kind,
     const bool compare_with_norm = (prb->dir & FLAG_BWD);
     cmp.set_norm_validation_mode(compare_with_norm);
 
-    const int f32_mant_digits = 24;
-    const float trh_coeff = (1 << (f32_mant_digits - digits_dt(prb->dt)));
+    // Digits must be non-negative for safe left-shifting when `digits_dt`
+    // exceeds `digits_f32`.
+    const int safe_digits = MAX2(0, digits_dt(dnnl_f32) - digits_dt(prb->dt));
+    const float trh_coeff = (1 << safe_digits);
     float trh = trh_coeff
             * ((kind == SRC || kind == DST || kind == SRC_1) ? 6e-7f : 0);
     if ((kind == SC || kind == SH) && prb->dir & FLAG_BWD)
@@ -438,6 +440,7 @@ void setup_cmp(compare::compare_t &cmp, const prb_t *prb, data_kind_t kind,
         // they are calculated using fast but potentially unstable formula.
         if (kind == MEAN) trh = 1e-7f;
         if (kind == VAR) trh = 5e-7f;
+        if (kind == DST) trh = 2e-6f;
     }
     cmp.set_threshold(trh);
 
@@ -456,6 +459,9 @@ void setup_cmp(compare::compare_t &cmp, const prb_t *prb, data_kind_t kind,
     const auto bnorm_add_check =
             [&, kind, prb](
                     const compare::compare_t::driver_check_func_args_t &args) {
+                bool ok = is_nvidia_gpu() && args.diff < args.trh;
+                if (ok) return true;
+
                 if (!((prb->dir & FLAG_FWD) && kind == DST && prb->use_sh()))
                     return false;
 

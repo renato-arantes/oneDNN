@@ -63,11 +63,6 @@ graph::status_t compiler_partition_impl_t::infer_shape(
                         return alt->id == lt.id;
                     });
             if (in_pos != inputs.end()) { return **in_pos; }
-            auto out_pos = std::find_if(outputs.begin(), outputs.end(),
-                    [&](const graph::logical_tensor_t *alt) -> bool {
-                        return alt->id == lt.id;
-                    });
-            if (out_pos != outputs.end()) { return **out_pos; }
             return lt;
         };
         graph::op_t temp_node = graph::op_t(cur_op->get_kind());
@@ -95,6 +90,16 @@ graph::status_t compiler_partition_impl_t::infer_shape(
             auto output_lt = *ordered_outputs[i];
             auto cur_val = cur_op->get_output_values()[i];
             cur_val->set_logical_tensor(output_lt);
+            // if layout is any; let's respect it
+            // if layout is strided; shape_infer will fill the stride
+            // if layout is undef; convert it to strided and fill the stride
+            if (output_lt.layout_type == graph::layout_type::undef) {
+                // force set strided dense layout
+                graph::dims shape(
+                        output_lt.dims, output_lt.dims + output_lt.ndims);
+                graph::dims strides = utils::get_dense_strides(shape);
+                cur_val->set_strides(strides);
+            }
             // only write back inferred info to outputs
             // shall not modify the layout type
             auto out_pos = std::find_if(outputs.begin(), outputs.end(),
@@ -104,7 +109,8 @@ graph::status_t compiler_partition_impl_t::infer_shape(
             if (out_pos != outputs.end()) {
                 auto cur_lt = cur_val->get_logical_tensor();
                 // ensure layout type not modified
-                cur_lt.layout_type = (**out_pos).layout_type;
+                if ((**out_pos).layout_type == graph::layout_type::any)
+                    cur_lt.layout_type = (**out_pos).layout_type;
                 **out_pos = cur_lt;
             }
         }
@@ -197,7 +203,7 @@ graph::status_t compiler_partition_impl_t::compile(
                     auto lt = out_value->get_logical_tensor();
                     // check in outputs
                     auto out_pos = std::find_if(outputs.begin(), outputs.end(),
-                            [lt](const graph::logical_tensor_t &alt) -> bool {
+                            [&lt](const graph::logical_tensor_t &alt) -> bool {
                                 return alt.id == lt.id;
                             });
                     if (out_pos != outputs.end()) {
@@ -220,7 +226,7 @@ graph::status_t compiler_partition_impl_t::compile(
                 auto &out_value = cur_op->get_output_values()[i];
                 auto lt = out_value->get_logical_tensor();
                 auto out_pos = std::find_if(outputs.begin(), outputs.end(),
-                        [lt](const graph::logical_tensor_t &alt) -> bool {
+                        [&lt](const graph::logical_tensor_t &alt) -> bool {
                             return alt.id == lt.id;
                         });
                 if (out_pos != outputs.end()) {
@@ -328,6 +334,7 @@ graph::status_t compiler_partition_impl_t::compile(
 
         // validate and set outputs strides
         for (size_t i = 0; i < output_format_any.size(); ++i) {
+            if (!output_format_any[i]) { continue; }
             for (const auto &op : backend_graph_obj.get_output_ops()) {
                 if (op->attrs_.get<size_t>("unique_id")
                         == outputs_map[outputs[i].id]->attrs_.get<size_t>(
@@ -336,6 +343,8 @@ graph::status_t compiler_partition_impl_t::compile(
                             = op->get_inputs()[0]->details_.get_strides();
                     auto out_lt = const_cast<graph::logical_tensor_t *>(
                             &outputs[i]);
+                    assertm(out_lt->ndims > -1,
+                            "Partition output shape shall be specified.");
                     graph::dims out_shape(
                             out_lt->dims, out_lt->dims + out_lt->ndims);
                     graph::dims strides = utils::get_dense_strides(out_shape);

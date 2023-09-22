@@ -142,8 +142,12 @@ static void compute_block_concat(const context_ptr &ctx,
                         dst.tptr_, dst_idx[j], vec_lanes, mask);
                 indexed_src = builder::make_indexing(
                         src[j]->tptr_, src_idx[j], vec_lanes, mask);
-                tail_part.static_as<stmts>()->seq_.emplace_back(
-                        make_stmt<assign_node_t>(indexed_dst, indexed_src));
+                auto assign
+                        = make_stmt<assign_node_t>(indexed_dst, indexed_src);
+                assign->attr()
+                        [op_traits::workload_computable_t::workload_number]
+                        = wkld;
+                tail_part.static_as<stmts>()->seq_.emplace_back(assign);
                 tail_part = make_stmt<for_loop_node_t>(
                         inner_iter[last_axis - axis][j], floor,
                         src[j]->get_shape()[last_axis], vec_lanes,
@@ -157,16 +161,18 @@ static void compute_block_concat(const context_ptr &ctx,
                         dst.tptr_, dst_idx[j], vec_lanes);
                 indexed_src = builder::make_indexing(
                         src[j]->tptr_, src_idx[j], vec_lanes);
-                divisible_part.static_as<stmts>()->seq_.emplace_back(
-                        make_stmt<assign_node_t>(indexed_dst, indexed_src));
+                auto assign
+                        = make_stmt<assign_node_t>(indexed_dst, indexed_src);
+                assign->attr()
+                        [op_traits::workload_computable_t::workload_number]
+                        = wkld;
+                divisible_part.static_as<stmts>()->seq_.emplace_back(assign);
                 divisible_part = make_stmt<for_loop_node_t>(
                         inner_iter[last_axis - axis][j], expr(0), floor,
                         vec_lanes, std::move(divisible_part), true,
                         for_type::NORMAL);
                 cur.static_as<stmts>()->seq_.emplace_back(divisible_part);
             }
-            cur->attr()[op_traits::workload_computable_t::workload_number]
-                    = wkld;
 
             // for other inner axes
             for (int64_t i = static_cast<int64_t>(dst.nslice_dims()) - 2;
@@ -455,10 +461,10 @@ shape_rl_vec transpose_op_t::get_dynamic_shape_relations() const {
 void transpose_op_t::query_format(context_ptr ctx,
         std::vector<std::vector<format_stride_pair>> &supported_ins,
         std::vector<std::vector<format_stride_pair>> &supported_outs) {
-    std::vector<std::vector<sc_data_format_t>> in_formats, out_formats;
     COMPILE_ASSERT(!info_.inputs_[0]->details_.get_format().is_any(),
             "cannot infer output format with any input format");
     auto in_format = info_.inputs_[0]->details_.get_format();
+    auto in_strides = info_.inputs_[0]->details_.get_strides();
     auto in_format_code = in_format.format_code_;
     int batch_dims = info_.inputs_[0]->details_.get_plain_dims().size()
             - in_format_code.norig_dims();
@@ -479,10 +485,10 @@ void transpose_op_t::query_format(context_ptr ctx,
     }
     auto out_format = sc_data_format_t(storage_args, in_format.blocks_);
 
-    in_formats.push_back(std::vector<sc_data_format_t> {in_format});
-    out_formats.push_back(std::vector<sc_data_format_t> {out_format});
-    format_to_dense_format_stride_pair(
-            in_formats, out_formats, supported_ins, supported_outs);
+    supported_ins.resize(1);
+    supported_outs.resize(1);
+    supported_ins[0].emplace_back(std::make_pair(in_format, in_strides));
+    supported_outs[0].emplace_back(std::make_pair(out_format, in_strides));
 }
 
 void transpose_op_t::prepare_fusion_data(fdata_map &fdmap) {
@@ -1193,6 +1199,7 @@ void reshape_op_t::query_format(context_ptr ctx,
         std::vector<std::vector<format_stride_pair>> &supported_ins,
         std::vector<std::vector<format_stride_pair>> &supported_outs) {
     std::vector<std::vector<sc_data_format_t>> in_formats, out_formats;
+    in_formats.push_back({info_.inputs_[0]->details_.get_format()});
     out_formats.push_back({sc_data_format_kind_t::get_plain_by_dims(
             info_.outputs_[0]->details_.get_plain_dims().size())});
     format_to_dense_format_stride_pair(
