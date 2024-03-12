@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2019-2023 Intel Corporation
+* Copyright 2019-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -18,8 +18,9 @@
 #define GPU_OCL_GEMM_XE_SYSTOLIC_GEMM_COPY_KERNEL_HPP
 
 #include "common/c_types_map.hpp"
-#include "gpu/compute/compute.hpp"
-#include "gpu/primitive_conf.hpp"
+#include "gpu/compute/compute_engine.hpp"
+#include "gpu/compute/device_info.hpp"
+#include "gpu/compute/kernel.hpp"
 
 namespace dnnl {
 namespace impl {
@@ -119,11 +120,7 @@ struct xe_systolic_gemm_copy_kernel_t {
     bool operator==(const xe_systolic_gemm_copy_kernel_t &) const = default;
 #endif
 
-    serialized_t serialize() const {
-        serialized_t s;
-        s.append(*this);
-        return s;
-    }
+    serialized_t serialize() const { return serialized_t(*this); }
 
     static xe_systolic_gemm_copy_kernel_t deserialize(const serialized_t &s) {
         xe_systolic_gemm_copy_kernel_t t {};

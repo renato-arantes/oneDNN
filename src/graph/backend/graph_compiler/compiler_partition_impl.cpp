@@ -1,5 +1,5 @@
 /*******************************************************************************
- * Copyright 2021-2023 Intel Corporation
+ * Copyright 2021-2024 Intel Corporation
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,6 +15,7 @@
  *******************************************************************************/
 #include <algorithm>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -24,10 +25,12 @@
 #include "compiler/ir/graph/driver.hpp"
 #include "compiler/ir/graph/dynamic_utils.hpp"
 #include "compiler/ir/graph/pass/pass.hpp"
+#include "compiler/ir/transform/tensor_inplace_info.hpp"
 #include "compiler/jit/compiler_driver.hpp"
 #include "compiler_partition_impl.hpp"
 
 #include "common/rw_mutex.hpp"
+#include "common/verbose.hpp"
 #include "graph/interface/graph.hpp"
 #include "graph/utils/debug.hpp"
 #include "graph/utils/utils.hpp"
@@ -219,8 +222,14 @@ graph::status_t compiler_partition_impl_t::compile(
             }
             // translate op
             gc::sc_op_ptr ret;
-            ret = sub_graph.make_backend_op(cur_op, producer_lt, consumer_lt);
-            if (!ret) { return impl::status::unimplemented; }
+            try {
+                ret = sub_graph.make_backend_op(
+                        cur_op, producer_lt, consumer_lt);
+            } catch (const std::exception &e) {
+                VERROR(graph, graph_compiler, "%s", e.what());
+                ret = nullptr;
+            }
+            if (!ret) { return graph::status::invalid_graph_op; }
             // translate output value
             for (size_t i = 0; i < cur_op->get_output_values().size(); i++) {
                 auto &out_value = cur_op->get_output_values()[i];
@@ -332,6 +341,26 @@ graph::status_t compiler_partition_impl_t::compile(
         std::shared_ptr<gc::jit_function_t> fptr
                 = gc::compiler_driver(ctx, backend_graph_obj, args);
 
+        // pairs of {input_tensor_id, output_tensor_id}
+        std::vector<graph::inplace_pair_t> inplace_pairs;
+        for (auto &in_out : fptr->inplace_pairs_) {
+            // in graph compiler, the function's output args are at the front,
+            // so the input idx needs to shift by outputs.size().
+            if (in_out.first >= outputs.size()
+                    && in_out.first - outputs.size() < inputs.size()
+                    && in_out.second >= 0 && in_out.second < outputs.size()) {
+                const auto &input = inputs[in_out.first - outputs.size()];
+                const auto &output = outputs[in_out.second];
+                logical_tensor_wrapper_t in_ltw(input), out_ltw(output);
+                if (in_ltw.layout_type() != out_ltw.layout_type()
+                        || in_ltw.property_type() == property_type::constant) {
+                    continue;
+                }
+                // Temporarily disable this feature.
+                // inplace_pairs.push_back({input.id, output.id});
+            }
+        }
+
         // validate and set outputs strides
         for (size_t i = 0; i < output_format_any.size(); ++i) {
             if (!output_format_any[i]) { continue; }
@@ -345,6 +374,7 @@ graph::status_t compiler_partition_impl_t::compile(
                             &outputs[i]);
                     assertm(out_lt->ndims > -1,
                             "Partition output shape shall be specified.");
+                    if (out_lt->ndims == 0) continue;
                     graph::dims out_shape(
                             out_lt->dims, out_lt->dims + out_lt->ndims);
                     graph::dims strides = utils::get_dense_strides(out_shape);
@@ -371,11 +401,14 @@ graph::status_t compiler_partition_impl_t::compile(
         }
 
         auto pimpl = std::make_shared<compiler_compiled_partition_impl_t>(
-                *aengine, inputs, outputs, fptr, graph_engine,
+                *aengine, inputs, outputs, inplace_pairs, fptr, graph_engine,
                 std::move(dyn_inputs), std::move(dyn_outputs));
         compiled_partition->init(pimpl);
         return res;
-    } catch (...) { return graph::status::unimplemented; }
+    } catch (const std::exception &e) {
+        VERROR(graph, graph_compiler, "%s", e.what());
+        return graph::status::unimplemented;
+    }
 }
 
 std::shared_ptr<graph::partition_impl_t>
@@ -398,12 +431,13 @@ compiler_compiled_partition_impl_t::compiler_compiled_partition_impl_t(
         const graph::engine_t &engine,
         const std::vector<graph::logical_tensor_t> &inputs,
         const std::vector<graph::logical_tensor_t> &outputs,
+        const std::vector<graph::inplace_pair_t> &inplace_pairs,
         const std::shared_ptr<gc::jit_function_t> &jit_func,
         const std::shared_ptr<graph::compiler_impl::compiler_graph_engine_t>
                 &graph_engine,
         std::vector<gc::runtime::dynamic_tensor_t> &&dyn_inputs,
         std::vector<gc::runtime::dynamic_tensor_t> &&dyn_outputs)
-    : graph::compiled_partition_impl_t(engine, inputs, outputs, {})
+    : graph::compiled_partition_impl_t(engine, inputs, outputs, inplace_pairs)
     , graph_engine_(graph_engine)
     , jit_func_(jit_func)
     , dyn_inputs_(std::move(dyn_inputs))

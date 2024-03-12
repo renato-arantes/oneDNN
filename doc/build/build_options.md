@@ -33,6 +33,7 @@ oneDNN supports the following build-time options.
 | ONEDNN_GPU_VENDOR               | **INTEL**, NVIDIA, AMD                     | Defines GPU vendor for GPU engines                                                              |
 | ONEDNN_DPCPP_HOST_COMPILER      | **DEFAULT**, *GNU C++ compiler executable* | Specifies host compiler executable for SYCL runtime                                             |
 | ONEDNN_LIBRARY_NAME             | **dnnl**, *library name*                   | Specifies name of the library                                                                   |
+| ONEDNN_TEST_SET                 | SMOKE, **CI**, NIGHTLY, MODIFIER_NAME      | Specifies the testing coverage enabled through the generated testing targets                    |
 
 All building options listed support their counterparts with `DNNL` prefix
 instead of `ONEDNN`. `DNNL` options would take precedence over `ONEDNN`
@@ -122,6 +123,36 @@ AVX2 sets, but removes AVX512 and AMX kernels:
 -DONEDNN_ENABLE_GEMM_KERNELS_ISA=AVX2
 ```
 
+### Configuring testing
+
+#### ONEDNN_TEST_SET
+This option specifies testing coverage enabled through testing targets generated
+by the build system. The variable consists of two parts: the set value which
+defines the number of test cases, and the modifiers for testing commands. The
+final string must contain a single value for a set and as many compatible values
+for modifiers.
+
+The set value is defined by one of: `SMOKE`, `CI`, or `NIGHTLY`.
+The modifier values (referred as `MODIFIER_NAME`) are one of: `NO_CORR`,
+`ADD_BITWISE`.
+The input is expected in the CMake list style - a semicolon separated string -
+e.g., `ONEDNN_TEST_SET=CI;NO_CORR`.
+
+When `SMOKE` value is specified, it enables a short set of test cases which
+verifies that basic library functionality works as expected.
+When `CI` value is specified, it enables a regular set of test cases which
+verifies that all library supported functionality works as expected.
+When `NIGHTLY` value is specified, it enables the largest set of test cases
+which verifies that all library supported functionality and all kernel
+optimizations work as expected.
+
+When `NO_CORR` modifier value is specified, it removes correctness validation,
+which is set by default, from benchdnn testing targets. It helps to save time
+when correctness validation is not necessary.
+When `ADD_BITWISE` modifier value is specified, the build system will add an
+additional set of tests with a bitwise validation mode for benchdnn. The
+correctness set remains unmodified.
+
 ## CPU Options
 Intel Architecture Processors and compatible devices are supported by
 oneDNN CPU engine. The CPU engine is built by default but can be disabled
@@ -148,20 +179,6 @@ resulting library can be run only on systems that have instruction set
 compatible with the target instruction set. Therefore, `ARCH_OPT_FLAGS`
 should be set to an empty string (`""`) if the resulting library needs to be
 portable.
-
-### Runtime CPU dispatcher control
-oneDNN JIT relies on ISA features obtained from the processor it is being run
-on.  There are situations when it is necessary to control this behavior at
-run-time to, for example, test SSE4.1 code on an AVX2-capable processor. The
-`ONEDNN_ENABLE_MAX_CPU_ISA` build option controls the availability of this
-feature. See @ref dev_guide_cpu_dispatcher_control for more information.
-
-### Runtime CPU ISA hints
-For performance reasons, sometimes oneDNN JIT needs to be provided with extra
-hints so as to prefer or avoid particular CPU ISA feature. For example, one
-might want to disable Zmm registers usage in order to take advantage of higher
-clock speed. The `ONEDNN_ENABLE_CPU_ISA_HINTS` build option makes this feature
-available at runtime. See @ref dev_guide_cpu_isa_hints for more information.
 
 ### Runtimes
 CPU engine can use OpenMP, Threading Building Blocks (TBB) or sequential
@@ -258,7 +275,7 @@ For a debug build of oneDNN it is advisable to specify a Compute Library build
 which has also been built with debug enabled.
 
 @warning
-oneDNN only supports builds with Compute Library v23.02.1 or later.
+oneDNN only supports builds with Compute Library v23.11 or later.
 
 #### Vendor BLAS libraries
 oneDNN can use a standard BLAS library for GEMM operations.

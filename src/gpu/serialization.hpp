@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2023 Intel Corporation
+* Copyright 2023-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -20,7 +20,7 @@
 #include <iomanip>
 #include <sstream>
 
-#include "common/serialization.hpp"
+#include "gpu/utils.hpp"
 
 namespace dnnl {
 namespace impl {
@@ -31,13 +31,16 @@ namespace gpu {
             #cls " must be trivially serializable.")
 
 struct serialized_data_t {
+    serialized_data_t() = default;
+
 #if defined(__cpp_lib_has_unique_object_representations) \
         && __cpp_lib_has_unique_object_representations >= 201606L
     template <typename T>
     struct is_trivially_serialized {
         static const bool value
-                = std::has_unique_object_representations<T>::value
-                || std::is_floating_point<T>::value;
+                = (std::has_unique_object_representations<T>::value
+                          || std::is_floating_point<T>::value)
+                && !(std::is_pointer<T>::value);
     };
 
 #else
@@ -46,30 +49,61 @@ struct serialized_data_t {
     // structures are valid for this use case.
     template <typename T>
     struct is_trivially_serialized {
-        static const bool value = std::is_trivially_copyable<T>::value;
+        static const bool value = std::is_trivially_copyable<T>::value
+                && !(std::is_pointer<T>::value);
     };
 #endif
 
+    const std::vector<uint8_t> &get_data() const { return data; }
+    void set_data(std::vector<uint8_t> d) { this->data = std::move(d); }
+
+    template <typename T>
+    struct has_serialize {
+        using yes_t = uint8_t;
+        using no_t = uint16_t;
+
+        template <typename U>
+        static yes_t test(gpu_utils::enable_if_t<
+                std::is_same<decltype(&U::serialize),
+                        void (U::*)(serialized_data_t &) const>::value,
+                bool>);
+        template <typename U>
+        static no_t test(...);
+
+        static const bool value = (sizeof(test<T>(0)) == sizeof(yes_t));
+    };
+
+    // Append helper function for structures with the member function
+    // void serialize(serialized_data_t &) const
     template <typename T,
-            typename
-            = typename std::enable_if<is_trivially_serialized<T>::value>::type>
+            gpu_utils::enable_if_t<has_serialize<T>::value, bool> = true>
+    void append(const T &t) {
+        t.serialize(*this);
+    }
+
+    // Append helper function for trivially serialized objects
+    template <typename T,
+            gpu_utils::enable_if_t<is_trivially_serialized<T>::value
+                            && !has_serialize<T>::value,
+                    bool> = true>
     void append(const T &t) {
         std::array<uint8_t, sizeof(T)> type_data;
         std::memcpy(type_data.data(), &t, sizeof(T));
         data.insert(data.end(), type_data.begin(), type_data.end());
     }
-    void append(const post_ops_t &post_ops) {
-        append(post_ops.len());
-        serialization_stream_t sstream {};
-        serialization::serialize_post_ops(sstream, post_ops);
-        auto post_op_data = sstream.get_data();
-        data.insert(data.end(), post_op_data.begin(), post_op_data.end());
-    }
 
-    template <typename Arg1, typename... Args>
-    void append(const Arg1 &a1, const Args &...args) {
+    template <typename T,
+            gpu_utils::enable_if_t<gpu_utils::is_vector<T>::value, bool> = true>
+    void append(const T &v) {
+        append(v.size());
+        for (const typename T::value_type &d : v)
+            append<typename T::value_type>(d);
+    };
+
+    template <typename Arg1, typename Arg2, typename... Args>
+    void append(const Arg1 &a1, const Arg2 &a2, const Args &...args) {
         append(a1);
-        append(args...);
+        append(a2, args...);
     }
 
     template <typename T>
@@ -79,20 +113,9 @@ struct serialized_data_t {
             append(d);
     }
 
-    template <typename T>
-    void append_complex(const T &t) {
-        t.serialize(*this);
-    }
-
-    template <typename Arg1, typename... Args>
-    void append_complex(const Arg1 &a1, const Args &...args) {
-        append_complex(a1);
-        append_complex(args...);
-    }
-
     template <typename T,
-            typename
-            = typename std::enable_if<is_trivially_serialized<T>::value>::type>
+            gpu_utils::enable_if_t<is_trivially_serialized<T>::value,
+                    bool> = true>
     T get(size_t idx) const {
         T t {};
         if (data.size() < idx + sizeof(T)) {
@@ -103,7 +126,7 @@ struct serialized_data_t {
         return t;
     }
 
-    size_t hash() { return hash_range(data.data(), data.size()); };
+    size_t hash() const { return hash_range(data.data(), data.size()); };
     std::string str() {
         std::ostringstream oss;
         oss << std::hex << std::setfill('0') << std::setw(2);
@@ -130,33 +153,114 @@ protected:
 };
 
 struct serialized_t : public serialized_data_t {
+    template <typename Arg1, typename... Args>
+    serialized_t(const Arg1 &a1, const Args &...args) {
+        append(a1, args...);
+    }
+
+    static serialized_t from_data(std::vector<uint8_t> data) {
+        serialized_t s;
+        s.set_data(std::move(data));
+        return s;
+    };
+
     bool operator==(const serialized_t &other) const {
         return data == other.data;
     }
+
+    size_t get_hash() const { return hash(); }
+    template <typename T>
+    static size_t get_hash(const T &t) {
+        return serialized_t(t).get_hash();
+    }
+
+private:
+    serialized_t() = default;
 };
 
 struct deserializer_t {
     deserializer_t(const serialized_data_t &s) : idx(0), s(s) {}
+
+    template <typename T>
+    struct has_deserialize {
+        using yes_t = uint8_t;
+        using no_t = uint16_t;
+
+        template <typename U>
+        static yes_t test(
+                gpu_utils::enable_if_t<std::is_same<decltype(&U::deserialize),
+                                               U (*)(deserializer_t &)>::value,
+                        bool>);
+        template <typename U>
+        static no_t test(...);
+
+        static const bool value = (sizeof(test<T>(0)) == sizeof(yes_t));
+    };
+
+    // Helper function for structures with the static member function
+    // void deserialize(deserializer_t&)
     template <typename T,
-            typename = typename std::enable_if<
-                    serialized_data_t::is_trivially_serialized<T>::value>::type>
+            gpu_utils::enable_if_t<has_deserialize<T>::value, bool> = true>
+    void pop(T &t) {
+        t = T::deserialize(*this);
+    }
+    template <typename T,
+            gpu_utils::enable_if_t<has_deserialize<T>::value, bool> = true>
+    T pop() {
+        return T::deserialize(*this);
+    }
+
+    template <typename T,
+            gpu_utils::enable_if_t<
+                    serialized_data_t::is_trivially_serialized<T>::value
+                            && !has_deserialize<T>::value,
+                    bool> = true>
     void pop(T &t) {
         t = s.get<T>(idx);
         idx += sizeof(T);
     };
+    template <typename T,
+            gpu_utils::enable_if_t<
+                    serialized_data_t::is_trivially_serialized<T>::value
+                            && !has_deserialize<T>::value,
+                    bool> = true>
+    T pop() {
+        auto idx_start = idx;
+        idx += sizeof(T);
+        return s.get<T>(idx_start);
+    };
+
+    // Helper for vector types
+    template <typename T,
+            gpu_utils::enable_if_t<gpu_utils::is_vector<T>::value, bool> = true>
+    void pop(T &v) {
+        size_t size;
+        pop(size);
+        v.clear();
+        v.reserve(size);
+        for (size_t i = 0; i < size; i++) {
+            typename T::value_type t = {};
+            pop(t);
+            v.emplace_back(t);
+        }
+    }
 
     size_t idx;
     const serialized_data_t &s;
 };
 
-template <typename T,
-        typename = typename std::enable_if<
-                serialized_data_t::is_trivially_serialized<T>::value>::type>
-size_t get_hash(const T *t) {
-    serialized_t s {};
-    s.append(t);
-    return s.hash();
-}
+template <typename T>
+struct trivially_serializable_t {
+    bool operator==(const trivially_serializable_t &) const { return true; }
+    serialized_t serialize() const {
+        assert_trivially_serializable(T);
+        return serialized_t(*static_cast<const T *>(this));
+    }
+
+    static T deserialize(const serialized_t &s) {
+        return deserializer_t(s).pop<T>();
+    }
+};
 
 } // namespace gpu
 } // namespace impl

@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2021-2023 Intel Corporation
+* Copyright 2021-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -57,6 +57,8 @@ status_t brgemm_matmul_t<isa>::pd_t::init(engine_t *engine) {
             = everyone_is(bf16, src_dt, wei_dt) && one_of(dst_dt, bf16, f32);
     const bool is_f16
             = everyone_is(f16, src_dt, wei_dt) && one_of(dst_dt, f16, f32);
+    const bool is_bf16_with_int_wei = src_dt == bf16 && one_of(wei_dt, s8, u8)
+            && one_of(dst_dt, bf16, f32);
 
     auto check_bias = [&]() -> bool {
         const auto bia_dt = weights_md(1)->data_type;
@@ -84,7 +86,8 @@ status_t brgemm_matmul_t<isa>::pd_t::init(engine_t *engine) {
 
     auto check_attr_zero_points
             = [&]() -> bool { return attr()->zero_points_.common(); };
-    const bool problem_dt_correct = is_int8 || is_bf16 || is_f32 || is_f16;
+    const bool problem_dt_correct = one_of(
+            true, is_int8, is_bf16, is_f32, is_f16, is_bf16_with_int_wei);
 
     auto src_d = memory_desc_wrapper(src_md_);
     auto weights_d = memory_desc_wrapper(weights_md_);
@@ -103,7 +106,8 @@ status_t brgemm_matmul_t<isa>::pd_t::init(engine_t *engine) {
                     primitive_attr_t::skip_mask_t::scales_runtime
                             | primitive_attr_t::skip_mask_t::zero_points_runtime
                             | primitive_attr_t::skip_mask_t::post_ops
-                            | primitive_attr_t::skip_mask_t::sum_dt,
+                            | primitive_attr_t::skip_mask_t::sum_dt
+                            | primitive_attr_t::skip_mask_t::fpmath_mode,
                     dst_dt),
             VERBOSE_UNSUPPORTED_ATTR);
     VDISPATCH_MATMUL(attr()->post_ops_.check_sum_consistency(dst_dt, is_int8),
@@ -237,6 +241,19 @@ status_t brgemm_matmul_t<isa>::init(engine_t *engine) {
         CHECK(sparse_decompress_kernel_->create_kernel());
     }
 
+    // JIT to precompute scales
+    const bool is_jit_supported = mayiuse(avx512_core);
+    const auto attr = pd()->attr();
+    if (is_jit_supported && req_copy_scales(attr)) {
+        const auto &attr_scales = attr->scales_;
+        int wei_scale_mask = attr_scales.get(DNNL_ARG_WEIGHTS).mask_;
+        if (wei_scale_mask != 0) {
+            CHECK(safe_ptr_assign(jit_scale_precompute_,
+                    new jit_avx512_core_scale_precompute_t()));
+            CHECK(jit_scale_precompute_->create_kernel());
+        }
+    }
+
     return status::success;
 }
 
@@ -254,9 +271,9 @@ status_t brgemm_matmul_t<isa>::execute_body(const exec_ctx_t &ctx) const {
     const auto dst_d = ctx.memory_mdw(DNNL_ARG_DST, pd()->dst_md());
     matmul_helper_t helper(src_d, weights_d, dst_d);
 
-    auto &scratchpad = ctx.get_scratchpad_grantor();
-    const float *oscales = precompute_scales(
-            scratchpad, src_scales, wei_scales, pd()->N(), pd()->attr());
+    const float *oscales = scale_utils::precompute_scales(
+            ctx.get_scratchpad_grantor(), src_scales, wei_scales, pd()->N(),
+            pd()->attr(), jit_scale_precompute_.get());
 
     brg_matmul_exec_ctx_t brgmm_ctx(ctx, pd(), oscales, src_zero_point,
             wei_zero_point, dst_zero_point, dst_scales, helper);
@@ -767,11 +784,10 @@ struct brgemm_matmul_t<isa>::brg_matmul_exec_ctx_t {
     brg_matmul_exec_ctx_t(const exec_ctx_t &ctx, const pd_t *pd,
             const float *oscales, int32_t src_zp, int32_t wei_zp,
             int32_t dst_zp, const float *dst_scales, matmul_helper_t &helper)
-        : bgmmc_(pd->get_brgemm_matmul_conf()) {
-
-        data_A_ptr_ = CTX_IN_MEM(const char *, DNNL_ARG_SRC);
-        data_B_ptr_ = CTX_IN_MEM(const char *, DNNL_ARG_WEIGHTS);
-        data_C_ptr_ = CTX_OUT_MEM(char *, DNNL_ARG_DST);
+        : bgmmc_(pd->get_brgemm_matmul_conf())
+        , data_A_ptr_(CTX_IN_MEM(const char *, DNNL_ARG_SRC))
+        , data_B_ptr_(CTX_IN_MEM(const char *, DNNL_ARG_WEIGHTS))
+        , data_C_ptr_(CTX_OUT_MEM(char *, DNNL_ARG_DST)) {
 
         const memory_desc_wrapper weights_d(pd->weights_md(0));
         if (bgmmc_.packed_sparse_weights) {
@@ -1010,7 +1026,6 @@ struct brgemm_matmul_t<isa>::brg_matmul_exec_ctx_t {
 
         nthr_k_ = bgmmc.nthr_k > 0 && bgmmc.nthr_k <= nthr_ ? bgmmc.nthr_k : 1;
         nthr_bmn_ = nthr_ / nthr_k_;
-        num_threads_used_ = nthr_k_ * nthr_bmn_;
 
         // If parallel_work_amount_ == 1 and parallel reduction is not used, we
         // limit num threads to 1 as parallel(1, ...) does not create parallel
@@ -1020,6 +1035,14 @@ struct brgemm_matmul_t<isa>::brg_matmul_exec_ctx_t {
         // layer.
         if (parallel_work_amount_ == 1 && !parallel_reduction_is_used())
             nthr_ = nthr_bmn_ = nthr_k_ = 1;
+
+        // For Eigen threadpool there is significant advantage to not spawn
+        // useless threads.
+        if (!dnnl_thr_syncable()) {
+            nthr_bmn_ = nstl::min(nthr_bmn_, parallel_work_amount_);
+        }
+
+        num_threads_used_ = nthr_k_ * nthr_bmn_;
 
         const bool need_to_calculate_compensation_for_a
                 = bgmmc.has_zero_point_b;
@@ -1157,9 +1180,7 @@ struct brgemm_matmul_t<isa>::brg_matmul_exec_ctx_t {
         if (!bgmmc_.use_buffer_c) return nullptr;
 
         if (bgmmc_.nthr_k > 1) {
-            const int nthr_k = bgmmc_.nthr_k <= nthr_ ? bgmmc_.nthr_k : 1;
-            const int nthr_bmn = nthr_ / nthr_k;
-            const int ithr_k = ithr / nthr_bmn;
+            const int ithr_k = get_thread_idx_for_k(ithr);
             return get_buf_C_par_reduction_ptr(ithr_k, m_blk_idx, n_blk_idx);
         }
         char *buf_C_ptr_local
@@ -1422,7 +1443,9 @@ struct brgemm_matmul_t<isa>::brg_matmul_exec_ctx_t {
         const int ithr_bmn = ithr % nthr_bmn_;
         return ithr_bmn < parallel_work_amount_ ? ithr_bmn : -1;
     }
-    int get_num_threads_for_parallelization() const { return nthr_; }
+    int get_num_threads_for_parallelization() const {
+        return num_threads_used_;
+    }
     dim_t get_M() const { return M_; }
     int get_M_chunks() const { return M_chunks_; }
     int get_M_chunk_size() const { return bgmmc_.M_chunk_size; }
@@ -1673,7 +1696,13 @@ private:
     int get_M_tail_block_idx(int m_block_idx) const {
         const int tail_idx = m_block_idx - M_tail_block_start_;
         if (!bgmmc_.is_runtime_M) return tail_idx;
-        return tail_idx < (int)m_tail_processing_.size() ? tail_idx : -1;
+        const bool is_index_within_range
+                = tail_idx < (int)m_tail_processing_.size();
+        if (!is_index_within_range) {
+            assert(!"Error in M_tail_block index, not within range.");
+            return 0;
+        }
+        return tail_idx;
     }
     bool is_M_tail_processing(int m_block_idx) const {
         return get_M_tail_block_idx(m_block_idx) >= 0;
@@ -1693,7 +1722,13 @@ private:
     int get_N_tail_block_idx(int n_block_idx) const {
         const int tail_idx = n_block_idx - N_tail_block_start_;
         if (!bgmmc_.is_runtime_N) return tail_idx;
-        return tail_idx < (int)n_tail_processing_.size() ? tail_idx : -1;
+        const bool is_index_within_range
+                = tail_idx < (int)n_tail_processing_.size();
+        if (!is_index_within_range) {
+            assert(!"Error in N_tail_block index, not within range.");
+            return 0;
+        }
+        return tail_idx;
     }
     bool is_N_tail_processing(int n_block_idx) const {
         return get_N_tail_block_idx(n_block_idx) >= 0;

@@ -1,5 +1,5 @@
 /*******************************************************************************
- * Copyright 2022-2023 Intel Corporation
+ * Copyright 2022-2024 Intel Corporation
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -25,6 +25,7 @@
 #include "reduce.hpp"
 #include "util/bf16.hpp"
 #include <compiler/ir/graph/fusible_op_utils.hpp>
+#include <compiler/ir/graph/mixed_partition.hpp>
 #include <compiler/ir/transform/tensor2var.hpp>
 #include <runtime/config.hpp>
 #include <unordered_map>
@@ -287,8 +288,6 @@ infer_status_code update_reduce_op_fsmap(sc_op *ths,
     // check the slice range whether meet the least demand of reduce op
     for (auto &src_range : fsmap.get(input)) {
         if (!slice_full_on_axis(src_dim, src_range, required_axis)) {
-            ths->attrs_.set(
-                    op_attr_key::fused_mode_hint, op_attr_key::break_pre_fuse);
             return infer_status_code::RETRY;
         }
     }
@@ -344,12 +343,40 @@ infer_status_code reduce_op_t::pre_infer_slice_ranges(
     return infer_status_code::OK;
 }
 
-void infer_reduce_binding_axis(fusible_op_t *cur, bound_axis_map &bdax_map,
+void infer_reduce_binding_axis(fusible_op_t *cur, binding_axis_map &bdax_map,
         const std::vector<int> &plain_rd_axis, bool keep_dims) {
+    // query real output which needs to infer
+    auto outgt = cur->get_outputs()[0];
+    // penetrate out gt if necessary
+    if (cur->isa<reduce_impl_op_t>()) {
+        if (cur->isa<reduce_compute_op_t>()
+                && !cur->get_inputs()[0]
+                            ->producer_owner_->isa<reduce_compute_op_t>()) {
+            auto user = cur->get_outputs()[0]->uses_[0].second;
+            if (user->isa<output_op>()) return;
+            if (user->isa<reduce_compute_op_t>()) {
+                user = user->get_outputs()[0]->uses_[0].second;
+            }
+            COMPILE_ASSERT(user->isa<reduce_collect_op_t>()
+                            || user->isa<reduce_op_t>(),
+                    "Only reduce_compute + reduce_collect/reduce pattern is "
+                    "expected")
+            outgt = user->get_outputs()[0];
+        } else {
+            call_output_user_axis_binding(cur, bdax_map);
+            return;
+        }
+    } else {
+        if (cur->get_inputs()[0]->producer_owner_->isa<reduce_compute_op_t>()) {
+            call_output_user_axis_binding(cur, bdax_map);
+            return;
+        }
+    }
+    auto &outaxis = bdax_map.get(outgt);
+    if (!outaxis.empty()) return;
     auto known_axis_map = search_known_input_axis(cur, bdax_map);
-    if (!bdax_map.get(cur->get_outputs()[0]).empty()) return;
     if (keep_dims) {
-        bdax_map.get(cur->get_outputs()[0]) = known_axis_map[0];
+        outaxis = known_axis_map[0];
     } else {
         std::vector<int> non_rd_axis;
         auto plain_dims = cur->get_inputs()[0]->details_.get_plain_dims();
@@ -361,7 +388,6 @@ void infer_reduce_binding_axis(fusible_op_t *cur, bound_axis_map &bdax_map,
             else
                 non_rd_axis.emplace_back(i);
         }
-        bound_axis out_axis;
         for (auto &bd_ax : known_axis_map[0]) {
             std::vector<int> ret;
             for (auto &ax : bd_ax) {
@@ -371,45 +397,64 @@ void infer_reduce_binding_axis(fusible_op_t *cur, bound_axis_map &bdax_map,
                     ret.emplace_back(iter - non_rd_axis.begin());
                 }
             }
-            out_axis.emplace_back(ret);
-        }
-        bdax_map.get(cur->get_outputs()[0]) = out_axis;
-    }
-    // auto expand for partial reduce compute
-    if (auto red_comp = cur->dyn_cast<reduce_compute_op_t>()) {
-        if (red_comp->is_partial_reduce()) {
-            for (auto &bd_ax : bdax_map.get(cur->get_outputs()[0])) {
-                for (auto &ax : bd_ax)
-                    ax++;
-            }
+            outaxis.emplace_back(ret);
         }
     }
     set_unknown_binding_axis(cur, known_axis_map, bdax_map);
 }
 
-void pre_reduce_binding_axis(fusible_op_t *cur, bound_axis_map &bdax_map,
+void pre_reduce_binding_axis(fusible_op_t *cur, binding_axis_map &bdax_map,
         const std::vector<int> &plain_rd_axis, bool keep_dims) {
-    auto outaxis = bdax_map.get(cur->get_outputs()[0]);
-    COMPILE_ASSERT(!outaxis.empty(),
-            "Unknown output axis found, could not pre bind axis")
-    // auto shrink for partial reduce compute
-    if (auto red_comp = cur->dyn_cast<reduce_compute_op_t>()) {
-        if (red_comp->is_partial_reduce()) {
-            for (auto &bd_ax : outaxis) {
-                for (auto &ax : bd_ax)
-                    ax--;
+    auto &output = cur->get_outputs()[0];
+    // query real input which needs to infer
+    auto input = cur->get_inputs()[0];
+    // once `reduce` op is split, its plain dims will be lost and reset to
+    // blocking dims, so we need to penetrate input. However, if its producer
+    // owner is not expected, auto skip it.
+    if (!input->producer_owner_->isa<op_traits::mixed_partition_acceptable>()
+            || is_single_op_graph(cur->get_owner_graph()))
+        return;
+    // penetrate input gt if necessary
+    if (cur->isa<reduce_impl_op_t>()) {
+        if (cur->isa<reduce_collect_op_t>()) {
+            auto producer = cur->get_inputs()[0]->producer_owner_;
+            COMPILE_ASSERT(producer->isa<reduce_compute_op_t>(),
+                    "Only reduce_compute + reduce_collect pattern is expected")
+            if (producer->get_inputs()[0]
+                            ->producer_owner_->isa<reduce_compute_op_t>()) {
+                producer = producer->get_inputs()[0]->producer_owner_;
             }
+            COMPILE_ASSERT(
+                    !producer->get_inputs()[0]
+                             ->producer_owner_->isa<reduce_compute_op_t>(),
+                    "Unexpected reduce_compute op")
+            input = producer->get_inputs()[0];
+        } else {
+            if (auto bd_op = input->producer_owner_->dyn_cast<
+                             op_traits::mixed_partition_acceptable>()) {
+                bd_op->pre_infer_binding_axis(bdax_map);
+            }
+            return;
         }
+    } else {
+        auto producer = cur->get_inputs()[0]->producer_owner_;
+        if (producer->isa<reduce_compute_op_t>()) {
+            input = producer->get_inputs()[0];
+        }
+        // reset `keep_dims`
+        keep_dims = (input->details_.get_plain_dims().size()
+                == output->details_.get_plain_dims().size());
     }
-    auto &input = cur->get_inputs()[0];
+    auto &outaxis = bdax_map.get(output);
+    COMPILE_ASSERT(!outaxis.empty(),
+            "Unknown output axis found, could not pre infer binding axis")
     auto &inpaxis = bdax_map.get(input);
-
     if (inpaxis.empty()) {
         if (keep_dims) {
             inpaxis = outaxis;
         } else {
             std::vector<int> non_rd_axis;
-            auto plain_dims = cur->get_inputs()[0]->details_.get_plain_dims();
+            auto plain_dims = input->details_.get_plain_dims();
             for (size_t i = 0; i < plain_dims.size(); i++) {
                 if (plain_rd_axis.end()
                         != std::find(plain_rd_axis.begin(), plain_rd_axis.end(),
@@ -418,13 +463,19 @@ void pre_reduce_binding_axis(fusible_op_t *cur, bound_axis_map &bdax_map,
                 else
                     non_rd_axis.emplace_back(i);
             }
+            // all-reduce
+            bool all_reduce = non_rd_axis.empty();
             for (auto &bd_ax : outaxis) {
-                std::vector<int> ret;
-                ret.reserve(bd_ax.size());
-                for (auto &ax : bd_ax) {
-                    ret.emplace_back(non_rd_axis[ax]);
+                if (all_reduce) {
+                    inpaxis.emplace_back(std::vector<int> {});
+                } else {
+                    std::vector<int> ret;
+                    ret.reserve(bd_ax.size());
+                    for (auto &ax : bd_ax) {
+                        ret.emplace_back(non_rd_axis[ax]);
+                    }
+                    inpaxis.emplace_back(ret);
                 }
-                inpaxis.emplace_back(ret);
             }
         }
         if (auto bd_op
@@ -435,11 +486,13 @@ void pre_reduce_binding_axis(fusible_op_t *cur, bound_axis_map &bdax_map,
     }
 }
 
-void reduce_op_t::infer_binding_axis(bound_axis_map &bdax_map) {
+void reduce_op_t::infer_binding_axis(binding_axis_map &bdax_map) {
     infer_reduce_binding_axis(this, bdax_map, plain_rd_axis_, keep_dims_);
 }
-void reduce_op_t::pre_infer_binding_axis(bound_axis_map &bdax_map) {
-    pre_reduce_binding_axis(this, bdax_map, plain_rd_axis_, keep_dims_);
+void reduce_op_t::pre_infer_binding_axis(binding_axis_map &bdax_map) {
+    pre_reduce_binding_axis(this, bdax_map,
+            attrs_.get_or_else("orig_plain_rd_axis", plain_rd_axis_),
+            keep_dims_);
 }
 
 shape_rl_vec reduce_op_t::get_dynamic_shape_relations() const {
@@ -510,7 +563,8 @@ static void compute_block_reduce(sc_graph_t &graph, const sc_op_info_t &info,
         const std::vector<const tensor_slice *> &src, const tensor_slice &dst,
         reduce_operator rd_op, std::vector<int> rd_axis, bool keep_dims,
         const vectorized_info_t &vx_info, sc_data_type_t dtype,
-        any_map_t &attrs, size_t wkld = 0UL, bool is_dynamic = false) {
+        any_map_t &attrs, const graph_tensor_ptr &expand_gt, size_t wkld = 0UL,
+        bool is_dynamic = false) {
     // nested loop vars
     std::vector<expr> iter_vars;
     // the indices for multiple inputs. First dim: the input, Second
@@ -632,17 +686,6 @@ static void compute_block_reduce(sc_graph_t &graph, const sc_op_info_t &info,
             new_loop_order.insert(new_loop_order.begin(), i);
     }
     std::reverse(new_loop_order.begin(), new_loop_order.end());
-    bool loop_reorder = false;
-    int pre_ax = -1;
-    for (auto ax : rd_axis) {
-        if (pre_ax != -1) {
-            if (ax != pre_ax + 1) {
-                loop_reorder = true;
-                break;
-            }
-        }
-        pre_ax = ax;
-    }
 
     bool is_padding_ir = false;
     for (auto i : new_loop_order) {
@@ -699,6 +742,7 @@ static void compute_block_reduce(sc_graph_t &graph, const sc_op_info_t &info,
                             ? expr(static_cast<int>(lanes))
                             : expr(1),
                     std::move(body), true, for_type::NORMAL);
+            bind_loop_axis(expand_gt, cur, i, true);
         }
         // the outer-most reduction axis
         if (i == rd_axis.front()) {
@@ -725,7 +769,7 @@ static void compute_block_reduce(sc_graph_t &graph, const sc_op_info_t &info,
         }
     }
     // set merge_loop attr
-    if (!loop_reorder) cur->attr()[stmt_attr_key::merge_loop] = true;
+    if (cur.isa<for_loop>()) cur->attr()[stmt_attr_key::merge_loop] = true;
     bld->emit(cur);
 }
 
@@ -757,7 +801,8 @@ void reduce_op_t::compute_block(context_ptr ctx,
 
     compute_block_reduce(get_owner_graph(), info_, inputs, *dst[0], rd_op_,
             real_rd_axis, keep_dims_, vx_info_,
-            info_.inputs_[0]->details_.dtype_, attrs_, wkld, is_dynamic());
+            info_.inputs_[0]->details_.dtype_, attrs_, get_inputs()[0], wkld,
+            is_dynamic());
 }
 
 size_t reduce_op_t::compute_workload(const std::vector<shape_dtype_pair> &ins,
@@ -774,6 +819,7 @@ size_t reduce_op_t::compute_workload(const std::vector<shape_dtype_pair> &ins,
 // reduce_compute+reduce_collect when reduction axis is not outside of the
 // parallel axis and is not last axis reduction(for performance)
 bool reduce_op_t::can_split_op() const {
+    if (attrs_.get_or_else("temp.no_split_reduce", false)) return false;
     if (runtime_config_t::get().get_num_threads() == 1) { return true; }
     auto ax = get_rd_axis();
     int last_dim = get_inputs()[0]->details_.get_blocking_dims().size() - 1;
@@ -824,6 +870,10 @@ graph_tensor_ptr reduce_op_t::split_op(
 
     auto first = graph.make<reduce_compute_op_t>(get_inputs()[0], first_out,
             rd_ax, rd_op_, keep_dims_, /*local_mode*/ false);
+    if (this->attrs_.has_key(mixed_partition_hint::trial_break)) {
+        first->attrs_[mixed_partition_hint::trial_break]
+                = this->attrs_[mixed_partition_hint::trial_break];
+    }
 
     sc_op_ptr second;
     if (num_threads > 1) {
@@ -833,17 +883,17 @@ graph_tensor_ptr reduce_op_t::split_op(
         }
         // add a standalone reduce op after partial reduce
         second = graph.make("reduce", {first_out}, {second_out},
-                {
-                        {"rd_axis", std::move(rx_ax)},
+                {{"rd_axis", std::move(rx_ax)},
                         {"rd_op", static_cast<int>(rd_op_)},
-                        {"keep_dims", false},
-                });
+                        {"keep_dims", false}});
     } else {
         second = graph.make<reduce_collect_op_t>(first_out, second_out, rd_ax,
                 rd_op_, keep_dims_,
                 last_axis ? reduce_collect_op_t::LAST_AXIS_COLLECT
                           : reduce_collect_op_t::NOOP);
     }
+    // record original plain rd axis
+    second->attrs_.set("orig_plain_rd_axis", plain_rd_axis_);
     if (is_bf16) {
         auto out_tsr = second_out->copy();
         out_tsr->details_.dtype_ = datatypes::bf16;
@@ -871,17 +921,18 @@ infer_status_code reduce_impl_op_t::pre_infer_slice_ranges(
             "Cannot pre_infer_slice_ranges for this internal op");
 }
 
-void reduce_impl_op_t::infer_binding_axis(bound_axis_map &bdax_map) {
+void reduce_impl_op_t::infer_binding_axis(binding_axis_map &bdax_map) {
     infer_reduce_binding_axis(this, bdax_map,
             transform_axis_blocking2plain(
                     get_inputs()[0]->details_, real_rd_axis_),
             keep_dims_);
 }
 
-void reduce_impl_op_t::pre_infer_binding_axis(bound_axis_map &bdax_map) {
+void reduce_impl_op_t::pre_infer_binding_axis(binding_axis_map &bdax_map) {
     pre_reduce_binding_axis(this, bdax_map,
-            transform_axis_blocking2plain(
-                    get_inputs()[0]->details_, real_rd_axis_),
+            attrs_.get_or_else("orig_plain_rd_axis",
+                    transform_axis_blocking2plain(
+                            get_inputs()[0]->details_, real_rd_axis_)),
             keep_dims_);
 }
 
@@ -923,6 +974,10 @@ graph_tensor_ptr reduce_compute_op_t::split_op(
 
     auto first = graph.make<reduce_compute_op_t>(get_inputs()[0], first_out,
             real_rd_axis_, rd_op_, keep_dims_, /*local_mode*/ true);
+    if (this->attrs_.has_key(mixed_partition_hint::trial_break)) {
+        first->attrs_[mixed_partition_hint::trial_break]
+                = this->attrs_[mixed_partition_hint::trial_break];
+    }
     auto second = graph.make<reduce_collect_op_t>(first_out, second_out,
             real_rd_axis_, rd_op_, keep_dims_, reduce_collect_op_t::COPY);
     get_outputs()[0]->replace_with(second_out);
@@ -1027,6 +1082,10 @@ void reduce_compute_op_t::compute_block(context_ptr ctx,
                 // for partial reduce, the first axis should be thread id
                 new_idx.emplace_back(builtin::get_thread_id_func()());
             }
+            if (indexing_nd->idx_.size() == real_rd_axis.size()) {
+                // all-reduce to scalar, we need to keep an dummy axis
+                new_idx.emplace_back(0);
+            }
             for (auto itr = indexing_nd->idx_.begin();
                     itr != indexing_nd->idx_.end(); ++itr) {
                 bool remove = false;
@@ -1053,7 +1112,8 @@ void reduce_compute_op_t::compute_block(context_ptr ctx,
 
     compute_vectorized_op(ctx, get_owner_graph(), inputs, *dst[0], info_,
             vx_info_, mask_compute_func_t(func), mask_compute_func_t(func),
-            attrs_, wkld, false, inputs[0], /*unroll*/ local_mode_);
+            attrs_, get_inputs()[0], wkld, false, inputs[0],
+            /*unroll*/ local_mode_);
 }
 
 void reduce_compute_op_t::set_reduce_buffer(const tensor &buf) {
@@ -1132,12 +1192,15 @@ void reduce_collect_op_t::compute_block(context_ptr ctx,
             //  add the axis to indexing node
             out_nd->idx_.front()
                     = out_nd->idx_.front() + builtin::get_thread_id_func()();
+            auto new_in = in[0]->remake().as<indexing>();
+            // remove the addition thread-id dimension
+            new_in->idx_.erase(new_in->idx_.begin());
             return builder::make_assign_unattached(
-                    out[0], get_binary_by_reduce_op(rd_op_)(out[0], in[0]));
+                    out[0], get_binary_by_reduce_op(rd_op_)(out[0], new_in));
         };
         compute_vectorized_op(ctx, get_owner_graph(), inputs, *dst[0], info_,
                 vx_info_, mask_compute_func_t(func), mask_compute_func_t(func),
-                attrs_, 0, false, dst[0], /*unroll*/ true);
+                attrs_, get_outputs()[0], 0, false, dst[0], /*unroll*/ true);
     } else if (op_ == LAST_AXIS_COLLECT) {
         // set default vectorized information
         auto &real_rd_axis = get_rd_axis();
@@ -1162,7 +1225,7 @@ void reduce_collect_op_t::compute_block(context_ptr ctx,
 
         compute_vectorized_op(ctx, get_owner_graph(), inputs, *dst[0], info_,
                 vx_info_, mask_compute_func_t(func), mask_compute_func_t(func),
-                attrs_, 0, false, dst[0]);
+                attrs_, get_outputs()[0], 0, false, dst[0]);
     } else {
         builder::get_current_builder()->emit(
                 builder::make_stmts_unattached({}));

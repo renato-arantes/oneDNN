@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2020-2023 Intel Corporation
+* Copyright 2020-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -21,6 +21,7 @@
 
 #include "oneapi/dnnl/dnnl.h"
 
+#include "utils/fill.hpp"
 #include "utils/parallel.hpp"
 
 #include "dnnl_common.hpp"
@@ -33,6 +34,11 @@ namespace prelu {
 int fill_data(data_kind_t kind, dnn_mem_t &mem_dt, dnn_mem_t &mem_fp) {
     const auto nelems = mem_fp.nelems();
     if (nelems == 0) return OK;
+
+    // Refer to modes documentation for filling principles.
+    if (has_bench_mode_bit(mode_bit_t::bitwise)) {
+        return fill_random_real(mem_dt, mem_fp, nullptr);
+    }
 
     // Do fixed partitioning to have same filling for any number of threads.
     const int64_t chunk_size = 64;
@@ -89,21 +95,22 @@ int fill_data(data_kind_t kind, dnn_mem_t &mem_dt, dnn_mem_t &mem_fp) {
 dnnl_status_t init_pd(init_pd_args_t<prb_t> &init_pd_args) {
     const prb_t *prb = init_pd_args.prb;
     res_t *res = init_pd_args.res;
+    bool force_f32_dt = init_pd_args.force_f32_dt;
 
     const auto &src_dims = prb->vdims[0];
     const auto &weight_dims = prb->vdims[1];
 
-    auto src_d = dnn_mem_t::init_md(
-            prb->ndims, src_dims.data(), prb->sdt[0], prb->stag[0]);
-    auto weights_d = dnn_mem_t::init_md(
-            prb->ndims, weight_dims.data(), prb->sdt[1], prb->stag[1]);
+    auto src_d = dnn_mem_t::init_md(prb->ndims, src_dims.data(),
+            force_f32_dt ? dnnl_f32 : prb->sdt[0], prb->stag[0]);
+    auto weights_d = dnn_mem_t::init_md(prb->ndims, weight_dims.data(),
+            force_f32_dt ? dnnl_f32 : prb->sdt[1], prb->stag[1]);
 
     auto dnnl_attr = make_benchdnn_dnnl_wrapper(
             create_dnnl_attr(prb->attr, attr_args_t()));
 
     if (prb->dir & FLAG_FWD) {
-        auto dst_d = dnn_mem_t::init_md(
-                prb->ndims, src_dims.data(), prb->sdt[0], tag::any);
+        auto dst_d = dnn_mem_t::init_md(prb->ndims, src_dims.data(),
+                force_f32_dt ? dnnl_f32 : prb->sdt[0], tag::any);
 
         auto prop = prb->dir & FLAG_INF ? dnnl_forward_inference
                                         : dnnl_forward_training;
@@ -112,12 +119,12 @@ dnnl_status_t init_pd(init_pd_args_t<prb_t> &init_pd_args) {
                 init_pd_args.src_md ? init_pd_args.src_md : src_d, weights_d,
                 dst_d, dnnl_attr)));
     } else {
-        auto diff_src_d = dnn_mem_t::init_md(
-                prb->ndims, src_dims.data(), prb->sdt[0], tag::any);
-        auto diff_weights_d = dnn_mem_t::init_md(
-                prb->ndims, weight_dims.data(), prb->sdt[1], tag::any);
-        auto diff_dst_d = dnn_mem_t::init_md(
-                prb->ndims, src_dims.data(), prb->sdt[0], tag::any);
+        auto diff_src_d = dnn_mem_t::init_md(prb->ndims, src_dims.data(),
+                force_f32_dt ? dnnl_f32 : prb->sdt[0], tag::any);
+        auto diff_weights_d = dnn_mem_t::init_md(prb->ndims, weight_dims.data(),
+                force_f32_dt ? dnnl_f32 : prb->sdt[1], tag::any);
+        auto diff_dst_d = dnn_mem_t::init_md(prb->ndims, src_dims.data(),
+                force_f32_dt ? dnnl_f32 : prb->sdt[0], tag::any);
 
         TIME_C_PD(DNN_SAFE_STATUS(dnnl_prelu_backward_primitive_desc_create(
                 &init_pd_args.pd, init_pd_args.engine, src_d, weights_d,
@@ -164,7 +171,7 @@ std::vector<int> supported_exec_args(dir_t dir) {
 };
 
 int init_ref_memory_args(dnn_mem_map_t &ref_mem_map, dnn_mem_map_t &mem_map,
-        dnnl_primitive_t prim, const prb_t *prb, res_t *res, dir_t dir,
+        dnnl_primitive_t prim, const prb_t *prb, res_t *res,
         dnnl_primitive_t prim_ref) {
     if (has_bench_mode_modifier(mode_modifier_t::no_host_memory)) return OK;
 
@@ -172,10 +179,19 @@ int init_ref_memory_args(dnn_mem_map_t &ref_mem_map, dnn_mem_map_t &mem_map,
 
     for (auto &entry : mem_map) {
         const int exec_arg = entry.first;
+        // The function targets regular exec_args that are positive.
+        // Negative args are used by bitwise and are broken in the `default`
+        // branch due to `&` always returns `true`.
+        if (exec_arg <= 0) continue;
+
         auto &mem = entry.second; // `mem` is modified by filler (reorder).
 
-        ref_mem_map.emplace(
-                exec_arg, dnn_mem_t(mem.md_, dnnl_f32, tag::abx, ref_engine));
+        // Scratchpad memory relates to a primitive. If reference needs it,
+        // use switch below to define a memory desc for it.
+        if (exec_arg != DNNL_ARG_SCRATCHPAD) {
+            ref_mem_map.emplace(exec_arg,
+                    dnn_mem_t(mem.md_, dnnl_f32, tag::abx, ref_engine));
+        }
         auto &ref_mem = ref_mem_map[exec_arg];
 
         switch (exec_arg) {
@@ -186,7 +202,6 @@ int init_ref_memory_args(dnn_mem_map_t &ref_mem_map, dnn_mem_map_t &mem_map,
             case DNNL_ARG_DIFF_DST:
                 SAFE(fill_data(DST, mem, ref_mem), WARN);
                 break;
-            case DNNL_ARG_SCRATCHPAD: break;
             default: break;
         }
         // Don't keep reference memory if it is not used further.
@@ -229,18 +244,18 @@ int doit(const std::vector<benchdnn_dnnl_wrapper_t<dnnl_primitive_t>> &v_prim,
 
     dnn_mem_map_t mem_map, ref_mem_map;
     init_memory_args<prb_t>(mem_map, prb, prim, supported_exec_args(prb->dir));
-    TIME_FILL(SAFE(init_ref_memory_args(
-                           ref_mem_map, mem_map, prim, prb, res, prb->dir),
-            WARN));
+    TIME_FILL(SAFE(
+            init_ref_memory_args(ref_mem_map, mem_map, prim, prb, res), WARN));
 
     args_t args(mem_map), ref_args(ref_mem_map);
 
     SAFE(execute_and_wait(prim, args, res), WARN);
 
-    if (has_bench_mode_bit(mode_bit_t::corr)) {
-        check_correctness(
-                prb, get_kinds_to_check(prb), args, ref_args, setup_cmp, res);
-    }
+    check_correctness(
+            prb, get_kinds_to_check(prb), args, ref_args, setup_cmp, res);
+    SAFE(check_bitwise(prim, get_kinds_to_check(prb), args, prb->attr,
+                 prb->inplace, res),
+            WARN);
 
     return measure_perf(prb->ctx_exe, res, prim, args);
 }

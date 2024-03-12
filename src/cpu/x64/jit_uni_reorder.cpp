@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2018-2023 Intel Corporation
+* Copyright 2018-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -89,6 +89,14 @@ static bool prb_has_small_strides(const prb_t &prb) {
         if (!small_strides) return false;
     }
     return true;
+}
+
+bool prb_has_huge_prime_number(const prb_t &prb) {
+    for (int d = 0; d < prb.ndims; ++d) {
+        auto n = prb.nodes[d].n;
+        if (n >= INT_MAX && math::is_prime(n)) return true;
+    }
+    return false;
 }
 
 /** Minimal reasonable/desirable kernel size.
@@ -182,7 +190,7 @@ struct jit_uni_reorder_kernel_f32_t : public kernel_t, public jit_generator {
     static bool applicable(const prb_t &p) {
         using namespace data_type;
 
-        bool ok = true && p.ndims > 0
+        bool ok = p.ndims > 0
                 && utils::one_of(p.itype, f32, bf16, f16, s32, s8, u8)
                 && utils::one_of(p.otype, f32, bf16, f16, s32, s8, u8)
                 && IMPLICATION(utils::one_of(p.itype, bf16, f16),
@@ -196,7 +204,8 @@ struct jit_uni_reorder_kernel_f32_t : public kernel_t, public jit_generator {
                         mayiuse(avx512_core) || mayiuse(avx2_vnni_2))
                 && IMPLICATION(utils::one_of(f16, p.itype, p.otype),
                         mayiuse(avx512_core_fp16) || mayiuse(avx2_vnni_2))
-                && IMPLICATION(!is_direct_copy(p), prb_has_small_strides(p));
+                && IMPLICATION(!is_direct_copy(p), prb_has_small_strides(p))
+                && !prb_has_huge_prime_number(p);
         return ok;
     }
 
@@ -434,17 +443,20 @@ struct jit_uni_reorder_kernel_f32_t : public kernel_t, public jit_generator {
             vperm2f128(Ymm(i), Ymm(i), Ymm(unroll / 2 + i), uquad);
 
         if (need_saturation) {
-            init_saturate_f32(ymm_zero_, ymm_saturation_ubound_, reg_tmp_,
-                    interim_f32 ? f32 : prb_.itype, prb_.otype);
+            init_saturate_f32(ymm_zero_, ymm_saturation_ubound_, reg_tmp_, f32,
+                    prb_.otype);
             for (int i = 0; i < unroll; i++)
-                saturate_f32(
+                saturate_cvt_f32(
                         Ymm(i), ymm_zero_, ymm_saturation_ubound_, prb_.otype);
         }
 
         for (int i = 0; i < unroll; i++) {
             const int node_1_output_stride = prb_.os(1);
             if (prb_.otype != f32)
-                cvt2odt(Ymm(i), prb_.otype, interim_f32 ? f32 : prb_.itype);
+                cvt2odt(Ymm(i), prb_.otype,
+                        need_saturation       ? s32
+                                : interim_f32 ? f32
+                                              : prb_.itype);
             store(o_addr(o_off + i * node_1_output_stride), Ymm(i),
                     unroll * otype_sz_);
         }
@@ -500,7 +512,10 @@ struct jit_uni_reorder_kernel_f32_t : public kernel_t, public jit_generator {
         // TODO: make a standalone jit:direct_copy implementation.
         const bool can_do = is_direct_copy(prb_)
                 // s8u8 with AVX should be used with XMM vreg.
-                && IMPLICATION(is_i8 && isa_ == avx, !is_ymm);
+                && IMPLICATION(is_i8 && isa_ == avx, !is_ymm)
+                // Prime numbers greater than INT_MAX cause input address
+                // overflow and crash.
+                && !prb_has_huge_prime_number(prb_);
         if (!can_do) return false;
 
         const int tail_opmask_idx = 2;
@@ -767,10 +782,12 @@ struct jit_uni_reorder_kernel_f32_t : public kernel_t, public jit_generator {
                             prb_.otype);
                     for (int ur = 0; ur < reg_unroll; ur += load_step) {
                         if (need_saturation)
-                            saturate_f32(Xmm(ur), xmm_zero_,
+                            saturate_cvt_f32(Xmm(ur), xmm_zero_,
                                     xmm_saturation_ubound_, prb_.otype);
                         cvt2odt(Xmm(ur), prb_.otype,
-                                interim_f32 ? f32 : prb_.itype);
+                                need_saturation       ? s32
+                                        : interim_f32 ? f32
+                                                      : prb_.itype);
                     }
                 }
                 for (int ur = 0; ur < reg_unroll; ur += load_step) {
@@ -979,8 +996,12 @@ struct jit_uni_reorder_kernel_f32_t : public kernel_t, public jit_generator {
             init_saturate_f32(xmm_zero_, xmm_saturation_ubound_, reg_tmp_, f32,
                     prb_.otype, compensation_needed_);
             for (int ur = 0; ur < reg_unroll; ur += ur_step) {
-                saturate_f32(Xmm(ur), xmm_zero_, xmm_saturation_ubound_,
-                        prb_.otype, compensation_needed_);
+                if (compensation_needed_)
+                    saturate_f32(Xmm(ur), xmm_zero_, xmm_saturation_ubound_,
+                            prb_.otype, compensation_needed_);
+                else
+                    saturate_cvt_f32(Xmm(ur), xmm_zero_, xmm_saturation_ubound_,
+                            prb_.otype, compensation_needed_);
             }
 
             // reset back xmm_zero_ if needed.
@@ -1088,7 +1109,10 @@ struct jit_uni_reorder_kernel_f32_t : public kernel_t, public jit_generator {
                 }
             }
             if (prb_.otype != f32)
-                cvt2odt(Xmm(ur), prb_.otype, interim_f32 ? f32 : prb_.itype);
+                cvt2odt(Xmm(ur), prb_.otype,
+                        need_saturation && !compensation_needed_ ? s32
+                                : interim_f32                    ? f32
+                                                                 : prb_.itype);
 
             store(o_addr(o_off[ur]), Xmm(ur), ur_step * otype_sz_);
         }
@@ -2108,6 +2132,14 @@ static void prb_thread_kernel_balance(
      * size_drv_cur. */
     const bool want_borrow_drv_from_ker = size_ker_cur > tr::ker_prb_size_min
             && size_drv_cur < size_drv_min;
+
+    VDEBUGINFO(5, primitive, reorder,
+            "size_drv_thr=%zu size_drv_min=%zu size_drv_cur=%zu "
+            "tr::ker_prb_size_min=%zu want_borrow_ker_from_drv=%d "
+            "want_borrow_drv_from_ker=%d",
+            size_drv_thr, size_drv_min, size_drv_cur, tr::ker_prb_size_min,
+            want_borrow_ker_from_drv, want_borrow_drv_from_ker);
+
     if (want_borrow_drv_from_ker) {
         size_t size_want_borrow = utils::div_up(size_drv_min, size_drv_cur);
         for (; prb.nodes[kdims - 1].n % size_want_borrow; ++size_want_borrow)
@@ -2180,8 +2212,8 @@ status_t jit_uni_reorder_t::pd_t::create(reorder_pd_t **reorder_pd,
         engine_t *engine, const primitive_attr_t *attr, engine_t *src_engine,
         const memory_desc_t *src_md, engine_t *dst_engine,
         const memory_desc_t *dst_md) {
-    if (!impl::is_dense_format_kind({src_md, dst_md}))
-        return status::unimplemented;
+    VDISPATCH_REORDER_IC(impl::is_dense_format_kind({src_md, dst_md}),
+            VERBOSE_UNSUPPORTED_SPARSE_CFG);
     auto prb = tr::prb_t();
 
     status_t prb_init_status = prb_init(prb, *src_md, *dst_md, attr);
@@ -2205,8 +2237,8 @@ status_t jit_uni_reorder_t::pd_t::create(reorder_pd_t **reorder_pd,
     if (ker_init_status != status::success) return ker_init_status;
 
     const int ndims_driver = prb.ndims - ker_desc.prb.ndims;
-    if (ndims_driver > jit_uni_reorder_t::ndims_driver_max)
-        return status::unimplemented;
+    VDISPATCH_REORDER_IC(ndims_driver <= jit_uni_reorder_t::ndims_driver_max,
+            VERBOSE_BAD_NDIMS, "driver", ndims_driver);
 
     DEBUG({
         printf("ker  : ");
@@ -2607,15 +2639,16 @@ status_t jit_blk_reorder_t::pd_t::create(reorder_pd_t **reorder_pd,
         engine_t *engine, const primitive_attr_t *attr, engine_t *src_engine,
         const memory_desc_t *src_md, engine_t *dst_engine,
         const memory_desc_t *dst_md) {
-    if (!impl::is_dense_format_kind({src_md, dst_md}))
-        return status::unimplemented;
+    VDISPATCH_REORDER_IC(impl::is_dense_format_kind({src_md, dst_md}),
+            VERBOSE_UNSUPPORTED_SPARSE_CFG);
     auto prb = tr::prb_t();
 
     status_t prb_init_status = prb_init(prb, *src_md, *dst_md, attr);
     if (prb_init_status != status::success) return prb_init_status;
     // only uni_reorder supports tail processing now
     // TODO: Add tail processing support in blk_reorder
-    if (prb.is_tail_present) return status::unimplemented;
+    VDISPATCH_REORDER_IC(
+            !prb.is_tail_present, "tail processing is not supported");
 
     prb_tile_normalize(prb);
     DEBUG({

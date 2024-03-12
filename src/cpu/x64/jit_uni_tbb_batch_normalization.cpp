@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2019-2022 Intel Corporation
+* Copyright 2019-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -374,9 +374,11 @@ struct helper_vmovups_data_t {
     helper_vmovups_data_t(const batch_normalization_pd_t *pd,
             jit_generator *host, Zmm zmm_reserved_1, Zmm zmm_reserved_2,
             Zmm zmm_reserved_3, Zmm zmm_reserved_4, Reg64 reg_tmp)
-        : h_(host), bf16_emu_(nullptr) {
-        is_bf16_ = pd->src_md()->data_type == data_type::bf16;
-        is_f16_ = pd->src_md()->data_type == data_type::f16;
+        : h_(host)
+        , bf16_emu_(nullptr)
+        , is_bf16_(pd->src_md()->data_type == data_type::bf16)
+        , is_f16_(pd->src_md()->data_type == data_type::f16) {
+
         if (is_bf16_ && isa == avx512_core && !mayiuse(avx512_core_bf16)) {
             bf16_emu_ = utils::make_unique<bf16_emulation_t>(h_, zmm_reserved_1,
                     zmm_reserved_2, zmm_reserved_3, reg_tmp, zmm_reserved_4,
@@ -798,15 +800,14 @@ struct jit_bnorm_fwd_statistics_t : public jit_generator {
         , is_avx2_ne_xf16_(is_avx2_ne_xf16<isa>(pd))
         , jit_tail_(pd, this, reg_tmp_, reg_blk_has_tail_, reg_C_, vtail_mask_,
                   ktail_mask_)
-        , helper_vmovups_(pd, this, zmm28, zmm29, zmm30, zmm31, reg_tmp_) {
+        , helper_vmovups_(pd, this, zmm28, zmm29, zmm30, zmm31, reg_tmp_)
+        , data_type_size_(types::data_type_size(pd->src_md()->data_type))
+        , acc_type_size_(sizeof(acc_data_t)) {
         static_assert(utils::one_of(isa, sse41, avx2, avx512_core),
                 "unsupported isa");
 
         std::tie(stride_N_, stride_S_, stride_C_)
                 = get_data_strides<isa>(pd_, tag_kind);
-
-        data_type_size_ = types::data_type_size(pd->src_md()->data_type);
-        acc_type_size_ = sizeof(acc_data_t);
     }
 };
 
@@ -1187,15 +1188,14 @@ struct jit_bnorm_fwd_t : public jit_generator {
                   ktail_mask_)
         , jit_relu_(pd, this, reg_off_dat_, reg_tmp_, reg_ptr_ws_, vzero_,
                   vstore_mask_, kstore_mask_, valpha, vmask, reg_alpha_)
-        , helper_vmovups_(pd, this, zmm28, zmm29, zmm30, zmm31, reg_tmp_) {
+        , helper_vmovups_(pd, this, zmm28, zmm29, zmm30, zmm31, reg_tmp_)
+        , data_type_size_(types::data_type_size(pd->src_md()->data_type))
+        , acc_type_size_(sizeof(acc_data_t)) {
         static_assert(utils::one_of(isa, sse41, avx2, avx512_core),
                 "unsupported isa");
 
         std::tie(stride_N_, stride_S_, stride_C_)
                 = get_data_strides<isa>(pd_, tag_kind);
-
-        data_type_size_ = types::data_type_size(pd->src_md()->data_type);
-        acc_type_size_ = sizeof(acc_data_t);
     }
 
     void generate() override {
@@ -1475,15 +1475,14 @@ struct jit_bnorm_bwd_t : public jit_generator {
                   ktail_mask_)
         , jit_relu_(pd, this, reg_off_dat_, reg_tmp_, reg_ptr_ws_, vzero_,
                   vstore_mask_, kstore_mask_)
-        , helper_vmovups_(pd, this, zmm28, zmm29, zmm30, zmm31, reg_tmp_) {
+        , helper_vmovups_(pd, this, zmm28, zmm29, zmm30, zmm31, reg_tmp_)
+        , data_type_size_(types::data_type_size(pd->src_md()->data_type))
+        , acc_type_size_(sizeof(acc_data_t)) {
         static_assert(utils::one_of(isa, sse41, avx2, avx512_core),
                 "unsupported isa");
 
         std::tie(stride_N_, stride_S_, stride_C_)
                 = get_data_strides<isa>(pd_, tag_kind);
-
-        data_type_size_ = types::data_type_size(pd->src_md()->data_type);
-        acc_type_size_ = sizeof(acc_data_t);
     }
 
     void generate() override {
@@ -1874,15 +1873,14 @@ struct jit_bnorm_bwd_diff_ss_t : public jit_generator {
                   ktail_mask_)
         , jit_relu_(pd, this, reg_off_dat_, reg_tmp_, reg_ptr_ws_, vzero_,
                   vstore_mask_, kstore_mask_)
-        , helper_vmovups_(pd, this, zmm28, zmm29, zmm30, zmm31, reg_tmp_) {
+        , helper_vmovups_(pd, this, zmm28, zmm29, zmm30, zmm31, reg_tmp_)
+        , data_type_size_(types::data_type_size(pd->src_md()->data_type))
+        , acc_type_size_(sizeof(acc_data_t)) {
         static_assert(utils::one_of(isa, sse41, avx2, avx512_core),
                 "unsupported isa");
 
         std::tie(stride_N_, stride_S_, stride_C_)
                 = get_data_strides<isa>(pd_, tag_kind);
-
-        data_type_size_ = types::data_type_size(pd->src_md()->data_type);
-        acc_type_size_ = sizeof(acc_data_t);
     }
 
     void generate() override {
@@ -1911,16 +1909,19 @@ private:
 public:
     driver_t(const batch_normalization_pd_t *pd,
             const jit_memory_tag_kind_t tag_kind)
-        : pd_(pd), tag_kind_(tag_kind), simd_w(get_simd_w<isa>(tag_kind)) {
-        nthr_ = dnnl_get_max_threads();
-        N_ = pd_->MB();
-        S_ = pd_->D() * pd_->H() * pd_->W();
-        C_ = pd_->C();
-        C_blks_ = get_c_padded(pd_) / simd_w;
+        : pd_(pd)
+        , tag_kind_(tag_kind)
+        , simd_w(get_simd_w<isa>(tag_kind))
+        , nthr_(dnnl_get_max_threads())
+        , N_(pd_->MB())
+        , S_(pd_->D() * pd_->H() * pd_->W())
+        , C_(pd_->C())
+        , C_blks_(get_c_padded(pd_) / simd_w)
+        , dt_size_(types::data_type_size(pd_->src_md()->data_type)) {
 
         const size_t l3_size = platform::get_per_core_cache_size(3) * nthr_ / 2;
         int num_tensors = pd_->is_fwd() ? 1 : 2;
-        dt_size_ = types::data_type_size(pd_->src_md()->data_type);
+
         const size_t working_set_size
                 = dt_size_ * N_ * S_ * simd_w * num_tensors;
 
@@ -2447,27 +2448,41 @@ using namespace utils;
 template <cpu_isa_t isa>
 status_t jit_uni_tbb_batch_normalization_fwd_t<isa>::pd_t::init(
         engine_t *engine) {
-    const bool ok = is_fwd() && mayiuse(isa) && !has_zero_dim_memory()
-            && one_of(src_md()->data_type, f32, bf16, f16)
-            && src_md()->data_type == dst_md()->data_type
-            && IMPLICATION(src_md()->data_type == bf16,
-                    is_superset(isa, avx512_core)
-                            || (isa == avx2 && mayiuse(avx2_vnni_2)))
-            // Note: re-using avx512_core/avx2 implementation for f16.
-            // This is okay as currently, we do not support binary post-ops
-            // for this primitive.
-            && IMPLICATION(src_md()->data_type == f16,
+    VDISPATCH_BNORM(is_fwd(), VERBOSE_BAD_PROPKIND);
+
+    // disabling verbose dispatch checks for unsupported isa for better readability
+    if (!mayiuse(isa)) return status::unimplemented;
+
+    VDISPATCH_BNORM(!has_zero_dim_memory(), VERBOSE_EMPTY_TENSOR, "");
+    VDISPATCH_BNORM(one_of(src_md()->data_type, f32, bf16, f16),
+            VERBOSE_UNSUPPORTED_DT);
+    VDISPATCH_BNORM(src_md()->data_type == dst_md()->data_type,
+            VERBOSE_INCONSISTENT_DT, "src", "dst");
+    VDISPATCH_BNORM(IMPLICATION(src_md()->data_type == bf16,
+                            is_superset(isa, avx512_core)
+                                    || (isa == avx2 && mayiuse(avx2_vnni_2))),
+            VERBOSE_ISA_DT_MISMATCH);
+    // Note: re-using avx512_core/avx2 implementation for f16.
+    // This is okay as currently, we do not support binary post-ops
+    // for this primitive.
+    VDISPATCH_BNORM(
+            IMPLICATION(src_md()->data_type == f16,
                     (is_superset(isa, avx512_core) && mayiuse(avx512_core_fp16))
-                            || (isa == avx2 && mayiuse(avx2_vnni_2)))
-            && check_scale_shift_data_type()
-            && (attr()->has_default_values()
-                    || with_relu_post_op(is_training()))
-            && set_default_formats_common()
-            && memory_desc_wrapper(src_md()) == memory_desc_wrapper(dst_md());
-    if (!ok) return status::unimplemented;
+                            || (isa == avx2 && mayiuse(avx2_vnni_2))),
+            VERBOSE_ISA_DT_MISMATCH);
+    VDISPATCH_BNORM(check_scale_shift_data_type(), VERBOSE_UNSUPPORTED_FEATURE,
+            "unsupported scale or shift data type");
+    VDISPATCH_BNORM(
+            (attr()->has_default_values() || with_relu_post_op(is_training())),
+            VERBOSE_UNSUPPORTED_ATTR);
+    VDISPATCH_BNORM(set_default_formats_common(), VERBOSE_UNSUPPORTED_TAG);
+    VDISPATCH_BNORM(
+            memory_desc_wrapper(src_md()) == memory_desc_wrapper(dst_md()),
+            VERBOSE_INCONSISTENT_MDS, "src", "dst");
 
     // BN+Add+Relu fusion is not currently implemented
-    if (fuse_norm_add_relu()) return status::unimplemented;
+    VDISPATCH_BNORM(!(fuse_norm_add_relu()), VERBOSE_UNSUPPORTED_FEATURE,
+            "sum+relu post-ops configuration is not supported");
 
     const format_tag_t blocked_tag = is_superset(isa, avx512_core)
             ? utils::pick(ndims() - 3, nCw16c, nChw16c, nCdhw16c)
@@ -2485,25 +2500,27 @@ status_t jit_uni_tbb_batch_normalization_fwd_t<isa>::pd_t::init(
     else if (memory_desc_matches_tag(*dst_md(), nspc_format)) {
         tag_kind_ = jit_memory_tag_kind_t::nspc;
         const int simd_w = get_simd_w<isa>(tag_kind_);
-        if (C() % simd_w != 0) return status::unimplemented;
+        VDISPATCH_BNORM(C() % simd_w == 0, VERBOSE_BLOCKING_FAIL);
     } else
         return status::unimplemented;
 
     // AVX2 only supports xf16 on plain layout and inference
-    if (utils::one_of(src_md()->data_type, bf16, f16) && isa == avx2
-            && (is_training()
-                    || !memory_desc_matches_tag(*dst_md(), nspc_format)))
-        return status::unimplemented;
+    VDISPATCH_BNORM(
+            !(utils::one_of(src_md()->data_type, bf16, f16) && isa == avx2
+                    && (is_training()
+                            || !memory_desc_matches_tag(
+                                    *dst_md(), nspc_format))),
+            "unsupported dt, isa or format tag configuration");
 
     const bool isa_supports_avx2 = is_superset(isa, avx2);
     if (is_training() && fuse_norm_relu()) {
-        if (!isa_supports_avx2) return status::unimplemented;
+        VDISPATCH_BNORM(isa_supports_avx2, VERBOSE_UNSUPPORTED_ISA);
         init_default_ws(1);
     }
 
-    if (memory_desc_wrapper(src_md()).padded_dims()[1] != C()
-            && !isa_supports_avx2)
-        return status::unimplemented;
+    VDISPATCH_BNORM(!(memory_desc_wrapper(src_md()).padded_dims()[1] != C()
+                            && !isa_supports_avx2),
+            VERBOSE_PADDING_ERROR, "bad padded dimensions for current isa");
 
     auto scratchpad = scratchpad_registry().registrar();
     bnorm_tbb_impl::driver_t<isa>::init_scratchpad(scratchpad, this);
@@ -2562,25 +2579,39 @@ template struct jit_uni_tbb_batch_normalization_fwd_t<avx512_core>;
 template <cpu_isa_t isa>
 status_t jit_uni_tbb_batch_normalization_bwd_t<isa>::pd_t::init(
         engine_t *engine) {
-    bool ok = !is_fwd() && mayiuse(isa) && !has_zero_dim_memory()
-            && one_of(src_md()->data_type, f32, bf16, f16)
-            && src_md()->data_type == diff_src_md()->data_type
-            && diff_src_md()->data_type == diff_dst_md()->data_type
-            && IMPLICATION(
-                    src_md()->data_type == bf16, is_superset(isa, avx512_core))
-            // Note: re-using avx512_core implementation for f16. This is okay
-            // as currently, we do not support binary post-ops for this
-            // primitive.
-            && IMPLICATION(src_md()->data_type == f16,
-                    is_superset(isa, avx512_core) && mayiuse(avx512_core_fp16))
-            && check_scale_shift_data_type() && attr()->has_default_values()
-            && set_default_formats_common()
-            && memory_desc_wrapper(diff_src_md())
-                    == memory_desc_wrapper(diff_dst_md());
-    if (!ok) return status::unimplemented;
+    VDISPATCH_BNORM(!is_fwd(), VERBOSE_BAD_PROPKIND);
+
+    // disabling verbose dispatch checks for unsupported isa for better readability
+    if (!mayiuse(isa)) return status::unimplemented;
+
+    VDISPATCH_BNORM(!has_zero_dim_memory(), VERBOSE_EMPTY_TENSOR, "");
+    VDISPATCH_BNORM(one_of(src_md()->data_type, f32, bf16, f16),
+            VERBOSE_UNSUPPORTED_DT);
+    VDISPATCH_BNORM(src_md()->data_type == diff_src_md()->data_type,
+            VERBOSE_INCONSISTENT_DT, "src", "diff_src");
+    VDISPATCH_BNORM(diff_src_md()->data_type == diff_dst_md()->data_type,
+            VERBOSE_INCONSISTENT_DT, "diff_src", "diff_dst");
+    VDISPATCH_BNORM(IMPLICATION(src_md()->data_type == bf16,
+                            is_superset(isa, avx512_core)),
+            VERBOSE_ISA_DT_MISMATCH);
+    // Note: re-using avx512_core implementation for f16. This is okay
+    // as currently, we do not support binary post-ops for this
+    // primitive.
+    VDISPATCH_BNORM(
+            IMPLICATION(src_md()->data_type == f16,
+                    is_superset(isa, avx512_core) && mayiuse(avx512_core_fp16)),
+            VERBOSE_ISA_DT_MISMATCH);
+    VDISPATCH_BNORM(check_scale_shift_data_type(), VERBOSE_UNSUPPORTED_FEATURE,
+            "unsupported scale or shift data type");
+    VDISPATCH_BNORM(attr()->has_default_values(), VERBOSE_UNSUPPORTED_ATTR);
+    VDISPATCH_BNORM(set_default_formats_common(), VERBOSE_UNSUPPORTED_TAG);
+    VDISPATCH_BNORM(memory_desc_wrapper(diff_src_md())
+                    == memory_desc_wrapper(diff_dst_md()),
+            VERBOSE_INCONSISTENT_MDS, "diff_src", "diff_dst");
 
     // BN+Add+Relu fusion is not currently implemented
-    if (fuse_norm_add_relu()) return status::unimplemented;
+    VDISPATCH_BNORM(!(fuse_norm_add_relu()), VERBOSE_UNSUPPORTED_FEATURE,
+            "sum+relu post-ops configuration is not supported");
 
     const format_tag_t blocked_tag = is_superset(isa, avx512_core)
             ? utils::pick(ndims() - 3, nCw16c, nChw16c, nCdhw16c)
@@ -2598,19 +2629,19 @@ status_t jit_uni_tbb_batch_normalization_bwd_t<isa>::pd_t::init(
     else if (memory_desc_matches_tag(*diff_src_md(), nspc_format)) {
         tag_kind_ = jit_memory_tag_kind_t::nspc;
         const int simd_w = get_simd_w<isa>(tag_kind_);
-        if (C() % simd_w != 0) return status::unimplemented;
+        VDISPATCH_BNORM(C() % simd_w == 0, VERBOSE_BLOCKING_FAIL);
     } else
         return status::unimplemented;
 
     const bool isa_supports_avx2 = is_superset(isa, avx2);
-    if (memory_desc_wrapper(src_md()).padded_dims()[1] != C()
-            && !isa_supports_avx2)
-        return status::unimplemented;
+    VDISPATCH_BNORM(!((memory_desc_wrapper(src_md()).padded_dims()[1] != C()
+                            && !isa_supports_avx2)),
+            VERBOSE_PADDING_ERROR, "bad padded dimensions for current isa");
 
     if (fuse_norm_relu()) {
-        if (!isa_supports_avx2) return status::unimplemented;
+        VDISPATCH_BNORM(isa_supports_avx2, VERBOSE_UNSUPPORTED_ISA);
         init_default_ws(1);
-        if (!compare_ws(hint_fwd_pd_)) return status::unimplemented;
+        VDISPATCH_BNORM(compare_ws(hint_fwd_pd_), VERBOSE_WS_MISMATCH);
     }
 
     auto scratchpad = scratchpad_registry().registrar();

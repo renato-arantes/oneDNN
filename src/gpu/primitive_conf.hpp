@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2019-2023 Intel Corporation
+* Copyright 2019-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -26,7 +26,9 @@
 #include "common/primitive_exec_types.hpp"
 #include "common/utils.hpp"
 #include "gpu/block_structure.hpp"
-#include "gpu/compute/compute.hpp"
+#include "gpu/compute/dispatch.hpp"
+#include "gpu/compute/kernel_arg_list.hpp"
+#include "gpu/compute/utils.hpp"
 #include "gpu/gpu_eltwise_pd.hpp"
 
 namespace dnnl {
@@ -231,7 +233,28 @@ struct attr_info_t {
     bool with_per_oc_dst_zpoints;
 };
 
-using strides_t = std::array<dim_t, MAX_NDIMS>;
+template <size_t ndims>
+using strides_t = std::array<dim_t, ndims>;
+template <>
+struct compute::scalar_type_traits<strides_t<2>> {
+    static const auto type = scalar_type_t::_int64x3_t;
+};
+template <>
+struct compute::scalar_type_traits<strides_t<3>> {
+    static const auto type = scalar_type_t::_int64x3_t;
+};
+template <>
+struct compute::scalar_type_traits<strides_t<4>> {
+    static const auto type = scalar_type_t::_int64x4_t;
+};
+template <>
+struct compute::scalar_type_traits<strides_t<5>> {
+    static const auto type = scalar_type_t::_int64x5_t;
+};
+template <>
+struct compute::scalar_type_traits<strides_t<6>> {
+    static const auto type = scalar_type_t::_int64x5_t;
+};
 
 struct offsets_t {
     dim_t src_off[4][MAX_NDIMS];
@@ -240,27 +263,26 @@ struct offsets_t {
 };
 
 struct rnn_offsets_t {
-    strides_t src_layer;
-    strides_t src_iter;
-    strides_t src_iter_c;
-    strides_t weights_layer;
-    strides_t weights_iter;
+    strides_t<3> src_layer;
+    strides_t<4> src_iter;
+    strides_t<4> src_iter_c;
+    strides_t<5> weights_layer;
+    strides_t<5> weights_iter;
     dim_t weights_layer_comp_off;
     dim_t weights_iter_comp_off;
-    strides_t bias;
-    strides_t dst_layer;
-    strides_t dst_iter;
-    strides_t dst_iter_c;
-    strides_t diff_src_layer;
-    strides_t diff_src_iter;
-    strides_t diff_src_iter_c;
-    strides_t diff_weights_layer;
-    strides_t diff_weights_iter;
-    strides_t diff_bias;
-    strides_t diff_dst_layer;
-    strides_t diff_dst_iter;
-    strides_t diff_dst_iter_c;
-    strides_t ws;
+    strides_t<4> bias;
+    strides_t<3> dst_layer;
+    strides_t<4> dst_iter;
+    strides_t<4> dst_iter_c;
+    strides_t<3> diff_src_layer;
+    strides_t<4> diff_src_iter;
+    strides_t<4> diff_src_iter_c;
+    strides_t<5> diff_weights_layer;
+    strides_t<5> diff_weights_iter;
+    strides_t<4> diff_bias;
+    strides_t<3> diff_dst_layer;
+    strides_t<4> diff_dst_iter;
+    strides_t<4> diff_dst_iter_c;
 };
 
 // Convolution
@@ -309,10 +331,8 @@ struct conv_conf_t {
     size_t wei_slm_size, src_slm_size, dst_slm_size;
     int sub_group_size;
 
-    size_t gws_d[3], lws_d[3];
-    // Original global work sizes, before applying rounding in case when
-    // non-uniform work-groups are not supported.
-    size_t gws_orig_d[3];
+    compute::range_t gws_d = compute::range_t::empty();
+    compute::range_t lws_d = compute::range_t::empty();
     compute::dispatch_t dispatch;
 
     bool with_bias, with_groups;
@@ -339,9 +359,12 @@ struct conv_conf_t {
     int wino_ic_block;
     int wino_oc_block;
     int vect_size;
-    size_t U_gws_d[3], U_lws_d[3];
-    size_t V_gws_d[3], V_lws_d[3];
-    size_t M_gws_d[3], M_lws_d[3];
+    compute::range_t U_gws_d = compute::range_t::empty();
+    compute::range_t U_lws_d = compute::range_t::empty();
+    compute::range_t V_gws_d = compute::range_t::empty();
+    compute::range_t V_lws_d = compute::range_t::empty();
+    compute::range_t M_gws_d = compute::range_t::empty();
+    compute::range_t M_lws_d = compute::range_t::empty();
     bool is_fused;
 
     data_type_t src_data_type;
@@ -430,7 +453,6 @@ struct rnn_reorder_conf_t {
     int ndims;
     size_t nelems;
     compute::dispatch_t dispatch;
-    int block[3];
     int sub_group_size;
     int mask;
     size_t scales_count;
@@ -466,7 +488,8 @@ struct bnorm_conf_t {
 
 // Layer Normalization
 struct lnorm_conf_t {
-    data_type_t data_type;
+    data_type_t src_dt, dst_dt;
+    data_type_t weights_data_type = data_type::f32;
 
     bool is_fwd;
     int ndims;
@@ -518,18 +541,8 @@ struct binary_conf_t {
     data_type_t src0_data_type;
     data_type_t src1_data_type;
     data_type_t dst_data_type;
-    bool is_mul;
-    bool is_add;
-    bool is_max;
-    bool is_min;
-    bool is_div;
-    bool is_sub;
-    bool is_ge;
-    bool is_gt;
-    bool is_le;
-    bool is_lt;
-    bool is_eq;
-    bool is_ne;
+    alg_kind_t alg;
+    // bool is_ne;
     bool is_tensor_op;
     compute::dispatch_t dispatch;
     int mb_block;
@@ -600,7 +613,8 @@ struct resampling_conf_t {
     float FD, FH, FW;
     dim_t vect_size;
     dims_t padded_strides;
-    size_t lws[3], gws[3];
+    compute::range_t gws = compute::range_t::empty();
+    compute::range_t lws = compute::range_t::empty();
     int sub_group_size;
     dim_t padded_c;
     attr_info_t attr_info;
@@ -816,7 +830,8 @@ struct concat_conf_t {
     int n;
     int simd;
     int data_type_size;
-    size_t gws_d[3], lws_d[3];
+    compute::range_t gws_d = compute::range_t::one();
+    compute::range_t lws_d;
 
     data_type_t src_type, dst_type;
     compute::dispatch_t dispatch;
@@ -1004,13 +1019,33 @@ inline void set_offsets(
     }
 }
 
-inline strides_t get_outer_strides(const memory_desc_wrapper &md) {
-    strides_t ret;
-    for (int d = 0; d < MAX_NDIMS; ++d) {
-        ret[d] = (d < md.ndims() && md.padded_dims()[d] > 1) ? md.strides()[d]
-                                                             : 0;
+struct outer_strides_getter_t {
+    template <size_t ndims>
+    operator strides_t<ndims>() const {
+        strides_t<ndims> ret;
+        gpu_assert(gpu_utils::into<dim_t>(ndims) >= md.ndims());
+        for (int d = ndims - 1; d >= 0; d--) {
+            // Assumes size 1 dimensions are dense with respect to the neighboring
+            // dimension so they can be used for size calculations in some layouts
+            ret[d] = [&]() {
+                if (d >= md.ndims())
+                    return static_cast<dim_t>(0);
+                else if (md.padded_dims()[d] > 1)
+                    return md.strides()[d];
+                else if (d == md.ndims() - 1)
+                    return static_cast<dim_t>(1);
+                else
+                    return ret[d + 1] * md.padded_dims()[d + 1];
+            }();
+        }
+        return ret;
     }
-    return ret;
+
+    const memory_desc_wrapper &md;
+};
+
+inline outer_strides_getter_t get_outer_strides(const memory_desc_wrapper &md) {
+    return {md};
 }
 
 inline block_layout_t get_inner_layout(const memory_desc_wrapper &md) {
@@ -1081,6 +1116,22 @@ inline void def_data_type(
         case data_type::u8:
             kernel_ctx.add_option(
                     utils::format("-D%s_DATA_T=uchar -D%s_DT_U8", str, str));
+            break;
+        case data_type::f8_e4m3:
+            kernel_ctx.add_option(
+                    utils::format("-D%s_DATA_T=uchar -D%s_DT_HF8", str, str));
+            break;
+        case data_type::f8_e5m2:
+            kernel_ctx.add_option(
+                    utils::format("-D%s_DATA_T=uchar -D%s_DT_BF8", str, str));
+            break;
+        case data_type::s4:
+            kernel_ctx.add_option(
+                    utils::format("-D%s_DATA_T=char -D%s_DT_S4", str, str));
+            break;
+        case data_type::u4:
+            kernel_ctx.add_option(
+                    utils::format("-D%s_DATA_T=uchar -D%s_DT_U4", str, str));
             break;
         case data_type::s32:
             kernel_ctx.add_option(
@@ -1210,8 +1261,32 @@ inline bool post_ops_with_binary_ok(const primitive_attr_t *attr,
 }
 
 constexpr int prelu_max_ndims = 5;
+inline status_t get_prelu_md(int prelu_mask, const dim_t *dst_dims,
+        memory_desc_t &weight_mem_desc, int weight_ndims) {
+    format_tag_t weights_tag;
+    dims_t weight_dims {};
+    for (int d = 0; d < weight_ndims; ++d) {
+        if (((prelu_mask >> d) & 0x1) == 1) {
+            weight_dims[d] = dst_dims[d];
+        } else {
+            weight_dims[d] = 1;
+        }
+    }
+    switch (weight_ndims) {
+        case 1: weights_tag = format_tag_t::dnnl_a; break;
+        case 2: weights_tag = format_tag_t::dnnl_ab; break;
+        case 3: weights_tag = format_tag_t::dnnl_acb; break;
+        case 4: weights_tag = format_tag_t::dnnl_acdb; break;
+        case 5: weights_tag = format_tag_t::dnnl_acdeb; break;
+        default: weights_tag = format_tag_t::dnnl_format_tag_undef; break;
+    }
+    CHECK(memory_desc_init_by_tag(weight_mem_desc, weight_ndims, weight_dims,
+            data_type_t::dnnl_f32, weights_tag));
+    return status::success;
+}
+
 inline status_t def_post_ops_cfg(compute::kernel_ctx_t &kernel_ctx,
-        const post_ops_t &post_ops, const dim_t *dst_dims) {
+        const post_ops_t &post_ops, const memory_desc_t &dst_md) {
     const int po_nop_id = 0;
     const int po_binary_id = 1;
     const int po_eltwise_id = 2;
@@ -1249,39 +1324,10 @@ inline status_t def_post_ops_cfg(compute::kernel_ctx_t &kernel_ctx,
             kernel_ctx.define_int("PO_" + std::to_string(idx) + "_ALG",
                     alg_kind_t::dnnl_eltwise_relu);
 
-            assert(dst_dims != nullptr);
-
             memory_desc_t weight_mem_desc;
-            dims_t weight_dims {};
-            format_tag_t weights_tag;
-            int weight_ndims = 0;
-            if (e.prelu.mask == 0) {
-                weight_ndims = 1;
-                weight_dims[0] = 1;
-                weights_tag = format_tag_t::dnnl_a;
-            } else {
-                // prelu weights are assumed to be up to prelu_max_ndims dims
-                for (int d = 0; d < prelu_max_ndims; ++d) {
-                    if (((e.prelu.mask >> d) & 0x1) == 1) {
-                        weight_ndims = d + 1;
-                        weight_dims[d] = dst_dims[d];
-                    } else {
-                        weight_dims[d] = 1;
-                    }
-                }
-                switch (weight_ndims) {
-                    case 1: weights_tag = format_tag_t::dnnl_a; break;
-                    case 2: weights_tag = format_tag_t::dnnl_ab; break;
-                    case 3: weights_tag = format_tag_t::dnnl_acb; break;
-                    case 4: weights_tag = format_tag_t::dnnl_acdb; break;
-                    case 5: weights_tag = format_tag_t::dnnl_acdeb; break;
-                    default:
-                        weights_tag = format_tag_t::dnnl_format_tag_undef;
-                        break;
-                }
-            }
-            CHECK(memory_desc_init_by_tag(weight_mem_desc, weight_ndims,
-                    weight_dims, data_type_t::dnnl_f32, weights_tag));
+            int weight_ndims = dst_md.ndims;
+            CHECK(get_prelu_md(
+                    e.prelu.mask, dst_md.dims, weight_mem_desc, weight_ndims));
             const memory_desc_wrapper weight_mdw(weight_mem_desc);
             const auto mdi = memory_desc_info_t::create(weight_mdw);
             def_memory_desc_info(kernel_ctx, mdi, bin_arg_name.c_str());
@@ -1435,7 +1481,7 @@ inline bool post_ops_preserves_zeroes(
 
 inline status_t def_attr_info_impl(compute::kernel_ctx_t &kernel_ctx,
         const attr_info_t &attr_info, const post_ops_t &post_ops,
-        const dim_t *dst_dims) {
+        const memory_desc_t &dst_md) {
     assert(attr_info.initialized);
 
     kernel_ctx.define_int("WITH_POST_OP", post_ops.len() > 0);
@@ -1474,31 +1520,18 @@ inline status_t def_attr_info_impl(compute::kernel_ctx_t &kernel_ctx,
     def_binary_alg_kinds(kernel_ctx);
     def_eltwise_alg_kinds(kernel_ctx);
 
-    return def_post_ops_cfg(kernel_ctx, post_ops, dst_dims);
+    return def_post_ops_cfg(kernel_ctx, post_ops, dst_md);
 }
 
-// Helper to make sure fixed size array is large enough
-template <int size>
 inline status_t def_attr_info(compute::kernel_ctx_t &kernel_ctx,
         const attr_info_t &attr_info, const post_ops_t &post_ops,
-        const dim_t (&dst_dims)[size]) {
-    static_assert(size >= prelu_max_ndims,
-            "Insufficient dims to support prelu post ops");
-    return def_attr_info_impl(kernel_ctx, attr_info, post_ops, dst_dims);
+        const memory_desc_t &dst_md) {
+    return def_attr_info_impl(kernel_ctx, attr_info, post_ops, dst_md);
 }
 
 inline void def_dispatch(compute::kernel_ctx_t &kernel_ctx,
         const compute::dispatch_t &dispatch) {
     dispatch.def_kernel_macros(kernel_ctx);
-}
-
-inline void maybe_fix_non_uniform_work_sizes(
-        bool has_non_uniform_wg, conv_conf_t &conf) {
-    for (int i = 0; i < 3; i++) {
-        conf.gws_orig_d[i] = conf.gws_d[i];
-        if (!has_non_uniform_wg)
-            conf.gws_d[i] = utils::rnd_up(conf.gws_d[i], conf.lws_d[i]);
-    }
 }
 
 } // namespace gpu

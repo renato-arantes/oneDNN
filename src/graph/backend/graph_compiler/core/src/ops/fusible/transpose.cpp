@@ -1,5 +1,5 @@
 /*******************************************************************************
- * Copyright 2023 Intel Corporation
+ * Copyright 2023-2024 Intel Corporation
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -275,6 +275,7 @@ bool can_be_fast_transpose(const sc_graph_t &graph, const context_ptr &ctx,
     // directly in u8s8 and div 3 in bf16.
     int bit16_threshold = trans_lanesx8 * trans_lanes_16bitx8 / 3;
     int s8u8_threshold = trans_lanesx16 * trans_lanesx16 / 6;
+    int f32_threshold = 1;
     auto cur_run_thread = runtime_config_t::get().get_num_threads();
     // Single threashold is 128.
     if (cur_run_thread == 1) {
@@ -291,6 +292,10 @@ bool can_be_fast_transpose(const sc_graph_t &graph, const context_ptr &ctx,
     } else if (is_s8u8
             && (dynamic_no_padding
                     || (!is_dynamic && !meet_kernel_require(s8u8_threshold)))) {
+        trans_kernel_used = sc_trans_kernel::NO_TRANS;
+        return false;
+    } else if (is_float
+            && (!is_dynamic && !meet_kernel_require(f32_threshold))) {
         trans_kernel_used = sc_trans_kernel::NO_TRANS;
         return false;
     }
@@ -473,7 +478,8 @@ void compute_fast_transpose(sc_graph_t &graph, const context_ptr &ctx,
         const std::vector<int> &vec_inp_a_axis,
         const std::vector<int> &vec_inp_b_axis,
         const std::vector<int> &vec_out_a_axis,
-        const std::vector<int> &vec_out_b_axis, size_t wkld, bool is_dynamic,
+        const std::vector<int> &vec_out_b_axis,
+        const graph_tensor_ptr &expand_gt, size_t wkld, bool is_dynamic,
         bool dynamic_no_padding, const sc_trans_kernel trans_kernel_used) {
     auto input = src.get_real_tensor();
     auto output = dst.get_real_tensor();
@@ -504,10 +510,11 @@ void compute_fast_transpose(sc_graph_t &graph, const context_ptr &ctx,
     const int out_a_axis = vec_out_a_axis[vec_out_a_axis.size() - 1];
     const int out_b_axis = vec_out_b_axis[vec_out_b_axis.size() - 1];
     std::vector<expr> rows;
-    std::vector<expr> iter_vars;
-    std::vector<stmt_c> cur_list;
-    stmt cur, body;
-    bool is_padding = false;
+    std::vector<expr> iter_vars, iter_vars_tail;
+    std::vector<stmt_c> cur_list, cur_list_floor, var_define_list,
+            cur_list_lastdim_floor;
+    stmt cur, body, cur_tail, body_tail;
+    bool need_mask = false;
     int inp_a_step = dtype == datatypes::f32
             ? (sc_trans_kernel::F32_16X16_TRANS == trans_kernel_used
                             ? trans_lanesx16
@@ -522,39 +529,69 @@ void compute_fast_transpose(sc_graph_t &graph, const context_ptr &ctx,
             : direct_use_bit16x16 ? lanesx16
                                   : trans_lanesx8;
     const int type_bits = utils::get_sizeof_type(sc_data_type_t::f32(4)) * 8;
-    if ((!is_dynamic
-                && (input_blocking_dims[inp_a_axis] % inp_a_step
-                        || input_blocking_dims[inp_b_axis] % inp_b_step
-                        || output_blocking_dims[out_a_axis] % inp_a_step
-                        || output_blocking_dims[out_b_axis] % inp_b_step
-                        || math_utils::get_dims_product(input_blocking_dims)
-                                != math_utils::get_dims_product(
-                                        output_blocking_dims)))
-            || (is_dynamic && !dynamic_no_padding)) {
+    expr inputloop_otheraxis_condition, outputloop_axis_condition,
+            inputloop_lastdim_condition;
+    bool use_split_loop = true, is_padding = false;
+    auto is_shapesize_need_mask = [&](const int64_t inp_a_size,
+                                          const int64_t inp_b_size,
+                                          const int64_t out_a_size,
+                                          const int64_t out_b_size) {
+        assert(!is_dynamic);
+        if ((!is_dynamic
+                    && (inp_a_size % inp_a_step || inp_b_size % inp_b_step
+                            || out_a_size % inp_a_step
+                            || out_b_size % inp_b_step))) {
+            need_mask = true;
+        }
+    };
+    if (is_dynamic && !dynamic_no_padding) { need_mask = true; }
+    if (!is_dynamic) {
+        is_shapesize_need_mask(input_blocking_dims[inp_a_axis],
+                input_blocking_dims[inp_b_axis],
+                output_blocking_dims[out_a_axis],
+                output_blocking_dims[out_b_axis]);
+        // tensor slice check
+        is_shapesize_need_mask(get_expr_as_int(src.get_shape()[inp_a_axis]),
+                get_expr_as_int(src.get_shape()[inp_b_axis]),
+                get_expr_as_int(dst.get_shape()[out_a_axis]),
+                get_expr_as_int(dst.get_shape()[out_b_axis]));
+    }
+
+    if (!is_dynamic
+            && math_utils::get_dims_product(input_blocking_dims)
+                    != math_utils::get_dims_product(output_blocking_dims)) {
+        need_mask = true;
         is_padding = true;
     }
+
+    auto make_rows_var = [&](std::vector<expr> &rows,
+                                 std::vector<stmt_c> &cur_list,
+                                 const sc_data_type_t &dtype, const int var_len,
+                                 bool skip_promote = true) {
+        rows.resize(var_len); // bf16 uses 16 zmms.
+        for (auto i = 0; i < var_len; i++) {
+            rows[i] = builder::make_var(dtype,
+                    "row" + std::to_string(i + 1) + fusion_create_var_idx());
+            cur_list.emplace_back(
+                    builder::make_var_tensor_def_unattached(rows[i]));
+            if (skip_promote) {
+                // skip bf16 elimination pass on rows. Otherwise it will be
+                // promote to f32.
+                rows[i]->attr()["can_promote_to_f32"] = false;
+            }
+        }
+    };
     if (dtype == datatypes::f32 || is_s8u8 || direct_use_bit16x16) {
         int var_len = is_s8u8 ? step * 2 : step + step / 2;
         var_len = direct_use_bit16x16 ? 32 : var_len;
-        rows.resize(var_len);
-        for (auto i = 0; i < var_len; i++) {
-            rows[i] = builder::make_var(sc_data_type_t(dtype.type_code_, step),
-                    "row" + std::to_string(i + 1) + fusion_create_var_idx());
-            cur_list.emplace_back(
-                    builder::make_var_tensor_def_unattached(rows[i]));
-            // skip bf16 elimination pass on rows. Otherwise it will be promote
-            // to f32.
-            rows[i]->attr()["can_promote_to_f32"] = false;
-        }
+        sc_data_type_t cur_dtype = sc_data_type_t(dtype.type_code_, step);
+        make_rows_var(rows, cur_list, cur_dtype, var_len);
     } else if (is_16bit) {
-        rows.resize(16); // bf16 uses 16 zmms.
-        for (auto i = 0; i < 16; i++) {
-            rows[i] = builder::make_var(sc_data_type_t::bf16(32),
-                    "row" + std::to_string(i + 1) + fusion_create_var_idx());
-            cur_list.emplace_back(
-                    builder::make_var_tensor_def_unattached(rows[i]));
-        }
+        const int var_len = 16;
+        auto cur_dtype = sc_data_type_t::bf16(32);
+        make_rows_var(rows, cur_list, cur_dtype, var_len, false);
     }
+    var_define_list.assign(cur_list.begin(), cur_list.end());
 
     auto determine_cur_step = [&](const std::vector<expr> &blocking_dims_expr,
                                       const std::vector<expr> &tmp_in_indexes,
@@ -562,19 +599,21 @@ void compute_fast_transpose(sc_graph_t &graph, const context_ptr &ctx,
                                       expr &cur_step, expr &sup_condition,
                                       int in_axis, int in_baxis,
                                       bool use_output_loop, int step,
-                                      sc_data_format_kind_t format_code) {
-        if (!use_output_loop) {
+                                      sc_data_format_kind_t &format_code,
+                                      bool dst_condition = false) {
+        auto slice_condition = [&]() {
             cur_step = builder::make_min(
                     builder::make_max(cast_to_s32(blocking_dims_expr[in_baxis])
                                     - cast_to_s32(tmp_in_indexes[in_baxis]),
                             0),
                     step);
             sup_condition
-                    = tmp_in_indexes[in_axis] < blocking_dims_expr[in_axis];
-        } else {
+                    = tmp_in_indexes[in_axis] >= blocking_dims_expr[in_axis];
+        };
+        auto plain_condition = [&]() {
             auto tmp_plain = graph.dims_to_expr(plain_dims);
-            auto input_last_dim = input_format_code.get(inp_b_axis);
-            auto input_other_dim = input_format_code.get(in_axis);
+            auto input_last_dim = format_code.get(in_baxis);
+            auto input_other_dim = format_code.get(in_axis);
             cur_step = builder::make_min(
                     builder::make_max(cast_to_s32(tmp_plain[input_last_dim])
                                     - cast_to_s32(
@@ -582,101 +621,574 @@ void compute_fast_transpose(sc_graph_t &graph, const context_ptr &ctx,
                             0),
                     step);
             sup_condition = plain_indexes[input_other_dim]
-                    < tmp_plain[input_other_dim];
+                    >= tmp_plain[input_other_dim];
+        };
+        if (!use_output_loop || dst_condition) {
+            slice_condition();
+        } else {
+            plain_condition();
         }
     };
 
-    auto compute_transpose_f32_s8u8_bit16direct =
-            [&](const std::vector<expr> &in_indexes,
-                    const std::vector<expr> &out_indexes,
-                    const std::vector<expr> &plain_indexes) {
-                expr mask;
-                for (int i = 0; i < (direct_use_bit16x16 ? lanesx16 : step);
-                        i++) {
-                    auto tmp_in_indexes = in_indexes;
-                    auto in_axis = inp_a_axis;
-                    tmp_in_indexes[in_axis] = tmp_in_indexes[in_axis]
-                            + static_cast<uint64_t>(i);
-                    auto tmp_plain_indexes = plain_indexes;
-                    tmp_plain_indexes[input_format_code.get(in_axis)]
-                            = tmp_plain_indexes[input_format_code.get(in_axis)]
-                            + static_cast<uint64_t>(i);
-                    expr tmp_in = src.tptr_;
-                    if (output_loop) { tmp_in = input; }
-                    if (is_padding) {
-                        expr cur_step, sup_condition;
-                        determine_cur_step(input_blocking_dims_expr,
-                                tmp_in_indexes, tmp_plain_indexes, cur_step,
-                                sup_condition, in_axis, inp_b_axis, output_loop,
-                                step, input_format_code);
-                        stmt mask_def;
-                        mask = generate_mask_var_by_step(
-                                mask_def, cur_step, step, sup_condition);
-                        cur_list.emplace_back(mask_def);
+    auto src_opt_mask = [&](expr &cur_step, expr &sup_condition,
+                                const int step) {
+        auto src_shape
+                = output_loop ? input_blocking_dims_expr : src.get_shape();
+        auto src_mask_can_empty = [&](const int src_mask_axis,
+                                          const int dst_mask_axis,
+                                          const int mask_step) {
+            if (is_dynamic) return false;
+            bool is_srcshape_multiple_step
+                    = (get_expr_as_int(src_shape[src_mask_axis]) % mask_step)
+                    == 0;
+            bool is_dstshape_multiple_step = (output_loop
+                    && (get_expr_as_int(dst.get_shape()[dst_mask_axis])
+                               % mask_step)
+                            == 0
+                    && !is_padding);
+            return !is_dynamic && (is_srcshape_multiple_step)
+                    && (!output_loop || is_dstshape_multiple_step);
+        };
+        if (src_mask_can_empty(inp_a_axis, out_a_axis, inp_a_step)) {
+            sup_condition = expr();
+        } else {
+            inputloop_otheraxis_condition = sup_condition;
+        }
+        if (src_mask_can_empty(inp_b_axis, out_b_axis, inp_b_step)) {
+            cur_step = step;
+            inputloop_lastdim_condition = expr();
+        }
+    };
+    auto dst_opt_mask = [&](expr &cur_step, expr &sup_condition,
+                                const std::vector<expr> &in_indexes,
+                                const int i, const int step) {
+        auto dst_shape
+                = output_loop ? dst.get_shape() : output_blocking_dims_expr;
+        auto dst_mask_can_empty = [&](const int dst_mask_axis,
+                                          const int src_mask_axis,
+                                          const int mask_step) {
+            if (is_dynamic) return false;
+            bool is_dstshape_multiple_step
+                    = (get_expr_as_int(dst_shape[dst_mask_axis]) % mask_step)
+                    == 0;
+            bool is_srcshape_multiple_step = (!output_loop
+                    && (get_expr_as_int(src.get_shape()[src_mask_axis])
+                               % mask_step)
+                            == 0
+                    && !is_padding);
+            return !is_dynamic && (is_dstshape_multiple_step)
+                    && (output_loop || is_srcshape_multiple_step);
+        };
+        if (dst_mask_can_empty(out_b_axis, inp_b_axis, inp_b_step)) {
+            sup_condition = expr();
+        } else {
+            outputloop_axis_condition = sup_condition;
+        }
+        // ABba(4, 4, 16, 4) => AB(16,64)
+        if (input_format.is_blocking() || !output_loop) {
+            auto src_condition_shape = output_loop
+                    ? input_blocking_dims_expr[inp_b_axis]
+                    : src.get_shape()[inp_b_axis];
+            expr outof_srcshape_bound
+                    = in_indexes[inp_b_axis] + i >= src_condition_shape;
+            if (is_dynamic) {
+                sup_condition = sup_condition || (outof_srcshape_bound);
+            } else {
+                if ((get_expr_as_int(src_condition_shape) % inp_b_step) != 0) {
+                    if (sup_condition.defined()) {
+                        sup_condition = sup_condition || (outof_srcshape_bound);
+                    } else {
+                        sup_condition = (outof_srcshape_bound);
                     }
-                    auto assign = builder::make_assign_unattached(rows[i],
-                            // here, use src.tptr instead of input is aimed to
-                            // avoid input is tensor_view_op. Otherwise, it will
-                            // throw illegal exception in tensor_shrink
+                    outputloop_axis_condition = sup_condition;
+                }
+            }
+        }
+        if (dst_mask_can_empty(out_a_axis, inp_a_axis, inp_a_step)) {
+            cur_step = step;
+        }
+    };
+    auto inputloop_split_ir_directly = [&](const std::vector<expr> &in_indexes,
+                                               const std::vector<expr>
+                                                       &out_indexes,
+                                               const std::vector<expr>
+                                                       &plain_indexes,
+                                               const std::vector<expr>
+                                                       &out_indexes_slice) {
+        assert(!is_dynamic);
+        expr mask, mask_floor, mask_floor_lastdim;
+        int lastdim_bound = get_expr_as_int(src.get_shape()[inp_b_axis]) % step;
+        for (int i = 0; i < (direct_use_bit16x16 ? lanesx16 : step); i++) {
+            auto tmp_in_indexes = in_indexes;
+            auto in_axis = inp_a_axis;
+            tmp_in_indexes[in_axis]
+                    = tmp_in_indexes[in_axis] + static_cast<uint64_t>(i);
+            auto tmp_plain_indexes = plain_indexes;
+            tmp_plain_indexes[input_format_code.get(in_axis)]
+                    = tmp_plain_indexes[input_format_code.get(in_axis)]
+                    + static_cast<uint64_t>(i);
+            expr tmp_in = src.tptr_;
+            if (output_loop) { tmp_in = input; }
+            if (need_mask) {
+                expr cur_step, sup_condition;
+                determine_cur_step(output_loop ? input_blocking_dims_expr
+                                               : src.get_shape(),
+                        tmp_in_indexes, tmp_plain_indexes, cur_step,
+                        sup_condition, in_axis, inp_b_axis, output_loop, step,
+                        input_format_code);
+                src_opt_mask(cur_step, sup_condition, step);
+                if (i == 0 && (lastdim_bound != 0)) {
+                    inputloop_lastdim_condition
+                            = cast_to_s32(src.get_shape()[inp_b_axis])
+                                    - cast_to_s32(step)
+                                    - cast_to_s32(tmp_in_indexes[inp_b_axis])
+                            < 0;
+                }
+
+                stmt mask_def, mask_def_floor;
+                mask = generate_mask_var_by_step(
+                        mask_def, cur_step, step, sup_condition, true);
+                cur_list.emplace_back(mask_def);
+                // if sup_condition is defined, means this axis can
+                // split loop to avoid other axis mask
+                if (inputloop_otheraxis_condition.defined()) {
+                    mask_floor = generate_mask_var_by_step(
+                            mask_def_floor, cur_step, step, expr(), true);
+                    cur_list_floor.emplace_back(mask_def_floor);
+                }
+            }
+
+            auto assign = builder::make_assign_unattached(rows[i],
+                    builder::make_indexing(tmp_in, tmp_in_indexes, step, mask));
+            assign->attr()[op_traits::workload_computable_t::workload_number]
+                    = wkld;
+            cur_list.emplace_back(assign);
+            if (inputloop_otheraxis_condition.defined()) {
+                auto assign_floor = builder::make_assign_unattached(rows[i],
+                        builder::make_indexing(
+                                tmp_in, tmp_in_indexes, step, mask_floor));
+                assign_floor->attr()
+                        [op_traits::workload_computable_t::workload_number]
+                        = wkld;
+                cur_list_floor.emplace_back(assign_floor);
+            }
+            if (inputloop_lastdim_condition.defined()) {
+                stmt assign_floor_lastdim;
+                assign_floor_lastdim = builder::make_assign_unattached(rows[i],
+                        builder::make_indexing(tmp_in, tmp_in_indexes, step));
+                assign_floor_lastdim->attr()
+                        [op_traits::workload_computable_t::workload_number]
+                        = wkld;
+                cur_list_lastdim_floor.emplace_back(assign_floor_lastdim);
+            }
+        }
+        auto tmp_cur_list = cur_list;
+        if (inputloop_otheraxis_condition.defined()
+                || inputloop_lastdim_condition.defined()) {
+            cur_list.clear();
+        }
+        if (is_s8u8) {
+            TRANS2D_REG_CALCULATION_U8S8X16();
+        } else if (direct_use_bit16x16) {
+            TRANS2D_REG_CALCULATION_BIT16x16(type_bits);
+        } else {
+            if (sc_trans_kernel::F32_16X16_TRANS == trans_kernel_used) {
+                TRANS2D_REG_CALCULATION_F32(type_bits);
+            } else {
+                TRANS2D_REG_CALCULATION_F32(type_bits);
+            }
+        }
+        if (inputloop_otheraxis_condition.defined()
+                || inputloop_lastdim_condition.defined()) {
+            cur_list_floor.insert(
+                    cur_list_floor.end(), cur_list.begin(), cur_list.end());
+            cur_list_lastdim_floor.insert(cur_list_lastdim_floor.end(),
+                    cur_list.begin(), cur_list.end());
+            tmp_cur_list.insert(
+                    tmp_cur_list.end(), cur_list.begin(), cur_list.end());
+            cur_list.clear();
+            cur_list = std::move(tmp_cur_list);
+        }
+        for (int i = 0; i < (direct_use_bit16x16 ? lanesx16 : step); i++) {
+            auto tmp_out_indexes = out_indexes;
+            auto out_axis = out_b_axis;
+            tmp_out_indexes[out_axis]
+                    = tmp_out_indexes[out_axis] + static_cast<uint64_t>(i);
+            auto tmp_out_indexes_slice
+                    = output_loop ? out_indexes_slice : out_indexes;
+            tmp_out_indexes_slice[out_axis] = tmp_out_indexes_slice[out_axis]
+                    + static_cast<uint64_t>(i);
+            if (need_mask) {
+                expr cur_step, sup_condition;
+                determine_cur_step(output_loop ? dst.get_shape()
+                                               : output_blocking_dims_expr,
+                        tmp_out_indexes_slice, plain_indexes, cur_step,
+                        sup_condition, out_axis, out_a_axis, output_loop, step,
+                        input_format_code, true);
+                dst_opt_mask(cur_step, sup_condition, in_indexes, i, step);
+                stmt mask_def, mask_def_floor, mask_def_floor_lastdim;
+                mask = generate_mask_var_by_step(
+                        mask_def, cur_step, step, sup_condition, true);
+                cur_list.emplace_back(mask_def);
+
+                if (inputloop_otheraxis_condition.defined()) {
+                    mask_floor = generate_mask_var_by_step(mask_def_floor,
+                            cur_step, step, sup_condition, true);
+                    cur_list_floor.emplace_back(mask_def_floor);
+                }
+                if (inputloop_lastdim_condition.defined()) {
+                    expr sup_condition_lastdim = tmp_out_indexes_slice[out_axis]
+                            >= output_blocking_dims_expr[out_axis];
+                    mask_floor_lastdim = generate_mask_var_by_step(
+                            mask_def_floor_lastdim, expr(step), step,
+                            sup_condition_lastdim, true);
+                    cur_list_lastdim_floor.emplace_back(mask_def_floor_lastdim);
+                }
+            }
+            stmt assign;
+            assign = builder::make_assign_unattached(
+                    builder::make_indexing(output, tmp_out_indexes, step, mask),
+                    rows[i]);
+
+            cur_list.emplace_back(assign);
+            if (inputloop_otheraxis_condition.defined()) {
+                auto assign_floor = builder::make_assign_unattached(
+                        builder::make_indexing(
+                                output, tmp_out_indexes, step, mask_floor),
+                        rows[i]);
+                cur_list_floor.emplace_back(assign_floor);
+            }
+            if (inputloop_lastdim_condition.defined()) {
+                stmt assign_floor_lastdim;
+                assign_floor_lastdim = builder::make_assign_unattached(
+                        builder::make_indexing(output, tmp_out_indexes, step,
+                                mask_floor_lastdim),
+                        rows[i]);
+
+                cur_list_lastdim_floor.emplace_back(assign_floor_lastdim);
+            }
+        }
+    };
+
+    auto outputloop_split_ir_directly = [&](const std::vector<expr> &in_indexes,
+                                                const std::vector<expr>
+                                                        &out_indexes,
+                                                const std::vector<expr>
+                                                        &plain_indexes,
+                                                const std::vector<expr>
+                                                        &out_indexes_slice) {
+        assert(cur_list_floor.empty() && cur_list.empty());
+        expr mask, mask_floor;
+        for (int i = 0; i < (direct_use_bit16x16 ? lanesx16 : step); i++) {
+            auto tmp_in_indexes = in_indexes;
+            auto in_axis = inp_a_axis;
+            tmp_in_indexes[in_axis]
+                    = tmp_in_indexes[in_axis] + static_cast<uint64_t>(i);
+            auto tmp_plain_indexes = plain_indexes;
+            tmp_plain_indexes[input_format_code.get(in_axis)]
+                    = tmp_plain_indexes[input_format_code.get(in_axis)]
+                    + static_cast<uint64_t>(i);
+            expr tmp_in = src.tptr_;
+            if (output_loop) { tmp_in = input; }
+            if (need_mask) {
+                expr cur_step, sup_condition;
+                determine_cur_step(output_loop ? input_blocking_dims_expr
+                                               : src.get_shape(),
+                        tmp_in_indexes, tmp_plain_indexes, cur_step,
+                        sup_condition, in_axis, inp_b_axis, output_loop, step,
+                        input_format_code);
+                src_opt_mask(cur_step, sup_condition, step);
+                stmt mask_def, mask_def_floor;
+                mask = generate_mask_var_by_step(
+                        mask_def, cur_step, step, sup_condition, true);
+                cur_list.emplace_back(mask_def);
+                mask_floor = generate_mask_var_by_step(
+                        mask_def_floor, cur_step, step, sup_condition, true);
+                cur_list_floor.emplace_back(mask_def_floor);
+            }
+
+            auto assign = builder::make_assign_unattached(rows[i],
+                    builder::make_indexing(tmp_in, tmp_in_indexes, step, mask));
+            assign->attr()[op_traits::workload_computable_t::workload_number]
+                    = wkld;
+            cur_list.emplace_back(assign);
+            auto assign_floor = builder::make_assign_unattached(rows[i],
+                    builder::make_indexing(
+                            tmp_in, tmp_in_indexes, step, mask_floor));
+            assign_floor
+                    ->attr()[op_traits::workload_computable_t::workload_number]
+                    = wkld;
+            cur_list_floor.emplace_back(assign_floor);
+        }
+        auto tmp_cur_list = cur_list;
+        if (!cur_list_floor.empty()) { cur_list.clear(); }
+        if (is_s8u8) {
+            TRANS2D_REG_CALCULATION_U8S8X16();
+        } else if (direct_use_bit16x16) {
+            TRANS2D_REG_CALCULATION_BIT16x16(type_bits);
+        } else {
+            if (sc_trans_kernel::F32_16X16_TRANS == trans_kernel_used) {
+                TRANS2D_REG_CALCULATION_F32(type_bits);
+            } else {
+                TRANS2D_REG_CALCULATION_F32(type_bits);
+            }
+        }
+        if (!cur_list_floor.empty()) {
+            cur_list_floor.insert(
+                    cur_list_floor.end(), cur_list.begin(), cur_list.end());
+            tmp_cur_list.insert(
+                    tmp_cur_list.end(), cur_list.begin(), cur_list.end());
+            cur_list.clear();
+            cur_list = std::move(tmp_cur_list);
+        }
+        for (int i = 0; i < (direct_use_bit16x16 ? lanesx16 : step); i++) {
+            auto tmp_out_indexes = out_indexes;
+            auto out_axis = out_b_axis;
+            tmp_out_indexes[out_axis]
+                    = tmp_out_indexes[out_axis] + static_cast<uint64_t>(i);
+            auto tmp_out_indexes_slice
+                    = output_loop ? out_indexes_slice : out_indexes;
+            tmp_out_indexes_slice[out_axis] = tmp_out_indexes_slice[out_axis]
+                    + static_cast<uint64_t>(i);
+            if (need_mask) {
+                expr cur_step, sup_condition;
+                determine_cur_step(output_loop ? dst.get_shape()
+                                               : output_blocking_dims_expr,
+                        tmp_out_indexes_slice, plain_indexes, cur_step,
+                        sup_condition, out_axis, out_a_axis, output_loop, step,
+                        input_format_code, true);
+                dst_opt_mask(cur_step, sup_condition, in_indexes, i, step);
+                stmt mask_def, mask_def_floor;
+                mask = generate_mask_var_by_step(
+                        mask_def, cur_step, step, sup_condition, true);
+                cur_list.emplace_back(mask_def);
+                if (outputloop_axis_condition.defined()) {
+                    mask_floor = generate_mask_var_by_step(
+                            mask_def_floor, cur_step, step, expr(), true);
+                    cur_list_floor.emplace_back(mask_def_floor);
+                }
+            }
+            auto assign = builder::make_assign_unattached(
+                    builder::make_indexing(output, tmp_out_indexes, step, mask),
+                    rows[i]);
+            cur_list.emplace_back(assign);
+            if (outputloop_axis_condition.defined()) {
+                auto assign_floor = builder::make_assign_unattached(
+                        builder::make_indexing(
+                                output, tmp_out_indexes, step, mask_floor),
+                        rows[i]);
+                cur_list_floor.emplace_back(assign_floor);
+            }
+        }
+    };
+
+    auto inputloop_split_ir_bit16 = [&](const std::vector<expr> &in_indexes,
+                                            const std::vector<expr>
+                                                    &out_indexes,
+                                            const std::vector<expr>
+                                                    &plain_indexes,
+                                            const std::vector<expr>
+                                                    &out_indexes_slice) {
+        expr mask, mask_floor;
+        for (int i = 0; i < step; i++) {
+            for (int p = 0; p < 4; p++) {
+                auto tmp_in_indexes = in_indexes;
+                auto in_axis = inp_a_axis;
+                tmp_in_indexes[in_axis] = tmp_in_indexes[in_axis]
+                        + (static_cast<uint64_t>(i) + p * 8);
+                auto tmp_plain_indexes = plain_indexes;
+                tmp_plain_indexes[input_format_code.get(in_axis)]
+                        = tmp_plain_indexes[input_format_code.get(in_axis)]
+                        + (static_cast<uint64_t>(i) + p * 8);
+                expr tmp_in = src.tptr_;
+                if (output_loop) { tmp_in = input; }
+                if (need_mask) {
+                    expr cur_step, sup_condition;
+                    determine_cur_step(output_loop ? input_blocking_dims_expr
+                                                   : src.get_shape(),
+                            tmp_in_indexes, tmp_plain_indexes, cur_step,
+                            sup_condition, in_axis, inp_b_axis, output_loop,
+                            trans_lanesx8, input_format_code);
+                    src_opt_mask(cur_step, sup_condition, trans_lanesx8);
+                    stmt mask_def, mask_def_tail;
+                    mask = generate_mask_var_by_step(mask_def, cur_step,
+                            trans_lanesx8, sup_condition, true);
+                    cur_list.emplace_back(mask_def);
+                    if (inputloop_otheraxis_condition.defined()) {
+                        mask_floor = generate_mask_var_by_step(
+                                mask_def_tail, cur_step, step, expr(), true);
+                        cur_list_floor.emplace_back(mask_def_tail);
+                    }
+                }
+                auto brct_src = builder::make_broadcast(
+                        builder::make_indexing(
+                                tmp_in, tmp_in_indexes, step, mask),
+                        trans_lanes_16bitx8);
+                auto assign = builder::make_assign_unattached(rows[i],
+                        p > 0 ? builder::make_select(
+                                0xff << (p * step), brct_src, rows[i])
+                              : brct_src);
+                assign->attr()
+                        [op_traits::workload_computable_t::workload_number]
+                        = wkld;
+                cur_list.emplace_back(assign);
+                if (inputloop_otheraxis_condition.defined()) {
+                    auto brct_src_floor = builder::make_broadcast(
                             builder::make_indexing(
-                                    tmp_in, tmp_in_indexes, step, mask));
-                    assign->attr()
+                                    tmp_in, tmp_in_indexes, step, mask_floor),
+                            trans_lanes_16bitx8);
+                    auto assign_floor = builder::make_assign_unattached(rows[i],
+                            p > 0 ? builder::make_select(
+                                    0xff << (p * step), brct_src_floor, rows[i])
+                                  : brct_src_floor);
+                    assign_floor->attr()
                             [op_traits::workload_computable_t::workload_number]
                             = wkld;
-                    cur_list.emplace_back(assign);
+                    cur_list_floor.emplace_back(assign_floor);
                 }
-                if (is_s8u8) {
-                    TRANS2D_REG_CALCULATION_U8S8X16();
-                } else if (direct_use_bit16x16) {
-                    TRANS2D_REG_CALCULATION_BIT16x16(type_bits);
-                } else {
-                    if (sc_trans_kernel::F32_16X16_TRANS == trans_kernel_used) {
-                        TRANS2D_REG_CALCULATION_F32(type_bits);
-                    } else {
-                        TRANS2D_REG_CALCULATION_F32(type_bits);
-                    }
+            }
+        }
+        auto tmp_cur_list = cur_list;
+        if (inputloop_otheraxis_condition.defined()) { cur_list.clear(); }
+        TRANS2D_REG_CALCULATION_BIT16();
+        if (inputloop_otheraxis_condition.defined()) {
+            cur_list_floor.insert(
+                    cur_list_floor.end(), cur_list.begin(), cur_list.end());
+            tmp_cur_list.insert(
+                    tmp_cur_list.end(), cur_list.begin(), cur_list.end());
+            cur_list.clear();
+            cur_list = std::move(tmp_cur_list);
+        }
+        for (int i = 0; i < step; i++) {
+            auto tmp_out_indexes = out_indexes;
+            auto out_axis = out_b_axis;
+            tmp_out_indexes[out_axis]
+                    = tmp_out_indexes[out_axis] + static_cast<uint64_t>(i);
+            auto tmp_out_indexes_slice
+                    = output_loop ? out_indexes_slice : out_indexes;
+            tmp_out_indexes_slice[out_axis] = tmp_out_indexes_slice[out_axis]
+                    + static_cast<uint64_t>(i);
+            if (need_mask) {
+                expr cur_step, sup_condition;
+                determine_cur_step(output_loop ? dst.get_shape()
+                                               : output_blocking_dims_expr,
+                        tmp_out_indexes_slice, plain_indexes, cur_step,
+                        sup_condition, out_axis, out_a_axis, output_loop,
+                        trans_lanes_16bitx8, input_format_code, true);
+                dst_opt_mask(cur_step, sup_condition, in_indexes, i,
+                        trans_lanes_16bitx8);
+                stmt mask_def, mask_def_floor;
+                mask = generate_mask_var_by_step(mask_def, cur_step,
+                        trans_lanes_16bitx8, sup_condition, true);
+                cur_list.emplace_back(mask_def);
+                if (inputloop_otheraxis_condition.defined()) {
+                    mask_floor = generate_mask_var_by_step(mask_def_floor,
+                            cur_step, trans_lanes_16bitx8, sup_condition, true);
+                    cur_list_floor.emplace_back(mask_def_floor);
                 }
-                for (int i = 0; i < (direct_use_bit16x16 ? lanesx16 : step);
-                        i++) {
-                    auto tmp_out_indexes = out_indexes;
-                    auto out_axis = out_b_axis;
-                    tmp_out_indexes[out_axis] = tmp_out_indexes[out_axis]
-                            + static_cast<uint64_t>(i);
-                    if (is_padding) {
-                        auto cur_step = builder::make_min(
-                                builder::make_max(
-                                        cast_to_s32(output_blocking_dims_expr
-                                                        [out_a_axis])
-                                                - cast_to_s32(tmp_out_indexes
-                                                                [out_a_axis]),
-                                        0),
-                                step);
-                        auto sup_condition = tmp_out_indexes[out_axis]
-                                < output_blocking_dims_expr[out_axis];
-                        // ABba(4, 4, 16, 4) => AB(16,64)
-                        if (input_format.is_blocking()) {
-                            sup_condition = sup_condition
-                                    && in_indexes[inp_b_axis] + i
-                                            < input_blocking_dims_expr
-                                                    [inp_b_axis];
-                        }
-                        stmt mask_def;
-                        mask = generate_mask_var_by_step(
-                                mask_def, cur_step, step, sup_condition);
-                        cur_list.emplace_back(mask_def);
-                    }
-                    auto assign = builder::make_assign_unattached(
-                            builder::make_indexing(
-                                    output, tmp_out_indexes, step, mask),
-                            rows[i]);
-                    cur_list.emplace_back(assign);
-                }
-            };
+            }
+            auto assign = builder::make_assign_unattached(
+                    builder::make_indexing(
+                            output, tmp_out_indexes, trans_lanes_16bitx8, mask),
+                    rows[i + 8]);
+            cur_list.emplace_back(assign);
+            if (inputloop_otheraxis_condition.defined()) {
+                auto assign_floor = builder::make_assign_unattached(
+                        builder::make_indexing(output, tmp_out_indexes,
+                                trans_lanes_16bitx8, mask_floor),
+                        rows[i + 8]);
+                cur_list_floor.emplace_back(assign_floor);
+            }
+        }
+    };
+
+    auto compute_transpose_direct = [&](const std::vector<expr> &in_indexes,
+                                            const std::vector<expr>
+                                                    &out_indexes,
+                                            const std::vector<expr>
+                                                    &plain_indexes,
+                                            const std::vector<expr>
+                                                    &out_indexes_slice) {
+        expr mask;
+        for (int i = 0; i < (direct_use_bit16x16 ? lanesx16 : step); i++) {
+            auto tmp_in_indexes = in_indexes;
+            auto in_axis = inp_a_axis;
+            tmp_in_indexes[in_axis]
+                    = tmp_in_indexes[in_axis] + static_cast<uint64_t>(i);
+            auto tmp_plain_indexes = plain_indexes;
+            tmp_plain_indexes[input_format_code.get(in_axis)]
+                    = tmp_plain_indexes[input_format_code.get(in_axis)]
+                    + static_cast<uint64_t>(i);
+            expr tmp_in = src.tptr_;
+            if (output_loop) { tmp_in = input; }
+            if (need_mask) {
+                expr cur_step, sup_condition;
+                determine_cur_step(output_loop ? input_blocking_dims_expr
+                                               : src.get_shape(),
+                        tmp_in_indexes, tmp_plain_indexes, cur_step,
+                        sup_condition, in_axis, inp_b_axis, output_loop, step,
+                        input_format_code);
+                src_opt_mask(cur_step, sup_condition, step);
+                stmt mask_def;
+                mask = generate_mask_var_by_step(
+                        mask_def, cur_step, step, sup_condition, true);
+                cur_list.emplace_back(mask_def);
+            }
+            auto assign = builder::make_assign_unattached(rows[i],
+                    // here, use src.tptr instead of input is aimed to
+                    // avoid input is tensor_view_op. Otherwise, it will
+                    // throw illegal exception in tensor_shrink
+                    builder::make_indexing(tmp_in, tmp_in_indexes, step, mask));
+            assign->attr()[op_traits::workload_computable_t::workload_number]
+                    = wkld;
+            cur_list.emplace_back(assign);
+        }
+        if (is_s8u8) {
+            TRANS2D_REG_CALCULATION_U8S8X16();
+        } else if (direct_use_bit16x16) {
+            TRANS2D_REG_CALCULATION_BIT16x16(type_bits);
+        } else {
+            if (sc_trans_kernel::F32_16X16_TRANS == trans_kernel_used) {
+                TRANS2D_REG_CALCULATION_F32(type_bits);
+            } else {
+                TRANS2D_REG_CALCULATION_F32(type_bits);
+            }
+        }
+        for (int i = 0; i < (direct_use_bit16x16 ? lanesx16 : step); i++) {
+            auto tmp_out_indexes = out_indexes;
+            auto out_axis = out_b_axis;
+            tmp_out_indexes[out_axis]
+                    = tmp_out_indexes[out_axis] + static_cast<uint64_t>(i);
+            auto tmp_out_indexes_slice
+                    = output_loop ? out_indexes_slice : out_indexes;
+            tmp_out_indexes_slice[out_axis] = tmp_out_indexes_slice[out_axis]
+                    + static_cast<uint64_t>(i);
+            if (need_mask) {
+                expr cur_step, sup_condition;
+                determine_cur_step(output_loop ? dst.get_shape()
+                                               : output_blocking_dims_expr,
+                        tmp_out_indexes_slice, plain_indexes, cur_step,
+                        sup_condition, out_axis, out_a_axis, output_loop, step,
+                        input_format_code, true);
+                dst_opt_mask(cur_step, sup_condition, in_indexes, i, step);
+                stmt mask_def;
+                mask = generate_mask_var_by_step(
+                        mask_def, cur_step, step, sup_condition, true);
+                cur_list.emplace_back(mask_def);
+            }
+            auto assign = builder::make_assign_unattached(
+                    builder::make_indexing(output, tmp_out_indexes, step, mask),
+                    rows[i]);
+            cur_list.emplace_back(assign);
+        }
+    };
 
     auto compute_transpose_bit16 = [&](const std::vector<expr> &in_indexes,
                                            const std::vector<expr> &out_indexes,
                                            const std::vector<expr>
-                                                   &plain_indexes) {
+                                                   &plain_indexes,
+                                           const std::vector<expr>
+                                                   &out_indexes_slice) {
         expr mask;
         for (int i = 0; i < step; i++) {
             for (int p = 0; p < 4; p++) {
@@ -690,15 +1202,17 @@ void compute_fast_transpose(sc_graph_t &graph, const context_ptr &ctx,
                         + (static_cast<uint64_t>(i) + p * 8);
                 expr tmp_in = src.tptr_;
                 if (output_loop) { tmp_in = input; }
-                if (is_padding) {
+                if (need_mask) {
                     expr cur_step, sup_condition;
-                    determine_cur_step(input_blocking_dims_expr, tmp_in_indexes,
-                            tmp_plain_indexes, cur_step, sup_condition, in_axis,
-                            inp_b_axis, output_loop, trans_lanesx8,
-                            input_format_code);
+                    determine_cur_step(output_loop ? input_blocking_dims_expr
+                                                   : src.get_shape(),
+                            tmp_in_indexes, tmp_plain_indexes, cur_step,
+                            sup_condition, in_axis, inp_b_axis, output_loop,
+                            trans_lanesx8, input_format_code);
+                    src_opt_mask(cur_step, sup_condition, trans_lanesx8);
                     stmt mask_def;
-                    mask = generate_mask_var_by_step(
-                            mask_def, cur_step, trans_lanesx8, sup_condition);
+                    mask = generate_mask_var_by_step(mask_def, cur_step,
+                            trans_lanesx8, sup_condition, true);
                     cur_list.emplace_back(mask_def);
                 }
                 auto brct_src = builder::make_broadcast(
@@ -726,26 +1240,22 @@ void compute_fast_transpose(sc_graph_t &graph, const context_ptr &ctx,
             auto out_axis = out_b_axis;
             tmp_out_indexes[out_axis]
                     = tmp_out_indexes[out_axis] + static_cast<uint64_t>(i);
-            if (is_padding) {
-                auto cur_step = builder::make_min(
-                        builder::make_max(
-                                cast_to_s32(
-                                        output_blocking_dims_expr[out_a_axis])
-                                        - cast_to_s32(
-                                                tmp_out_indexes[out_a_axis]),
-                                0),
+            auto tmp_out_indexes_slice
+                    = output_loop ? out_indexes_slice : out_indexes;
+            tmp_out_indexes_slice[out_axis] = tmp_out_indexes_slice[out_axis]
+                    + static_cast<uint64_t>(i);
+            if (need_mask) {
+                expr cur_step, sup_condition;
+                determine_cur_step(output_loop ? dst.get_shape()
+                                               : output_blocking_dims_expr,
+                        tmp_out_indexes_slice, plain_indexes, cur_step,
+                        sup_condition, out_axis, out_a_axis, output_loop,
+                        trans_lanes_16bitx8, input_format_code, true);
+                dst_opt_mask(cur_step, sup_condition, in_indexes, i,
                         trans_lanes_16bitx8);
-                auto sup_condition = tmp_out_indexes[out_axis]
-                        < output_blocking_dims_expr[out_axis];
-                // ABba(4, 4, 16, 4) => AB(16,64)
-                if (input_format.is_blocking()) {
-                    sup_condition = sup_condition
-                            && in_indexes[inp_b_axis] + i
-                                    < input_blocking_dims_expr[inp_b_axis];
-                }
                 stmt mask_def;
-                mask = generate_mask_var_by_step(
-                        mask_def, cur_step, trans_lanes_16bitx8, sup_condition);
+                mask = generate_mask_var_by_step(mask_def, cur_step,
+                        trans_lanes_16bitx8, sup_condition, true);
                 cur_list.emplace_back(mask_def);
             }
             auto assign = builder::make_assign_unattached(
@@ -768,8 +1278,9 @@ void compute_fast_transpose(sc_graph_t &graph, const context_ptr &ctx,
                                 std::vector<stmt> {std::move(cur)});
                 int cur_step = i == a_axis ? inp_a_step : inp_b_step;
                 cur = make_stmt<for_loop_node_t>(std::move(iter_vars.at(i)),
-                        expr(0), tsr.get_shape()[i], expr(cur_step),
+                        expr(0), (tsr.get_shape()[i]), expr(cur_step),
                         std::move(body), true, for_type::NORMAL);
+                bind_loop_axis(expand_gt, cur, i, true);
             }
         }
         for (int i = static_cast<int>(blocking_dims.size()) - 1; i >= 0; i--) {
@@ -782,20 +1293,30 @@ void compute_fast_transpose(sc_graph_t &graph, const context_ptr &ctx,
                 cur = make_stmt<for_loop_node_t>(std::move(iter_vars.at(i)),
                         expr(0), tsr.get_shape()[i], expr(1), std::move(body),
                         true, for_type::NORMAL);
+                bind_loop_axis(expand_gt, cur, i, true);
             }
         }
     };
+
+    bool use_direct = dtype == datatypes::f32 || is_s8u8 || direct_use_bit16x16;
     if (!output_loop) {
-        std::vector<expr> in_indexes, loop_indexes;
-        for (size_t i = 0; i < input_blocking_dims_expr.size(); i++) {
-            iter_vars.emplace_back(range_from_outer_loop(src.get_ranges()[i])
-                            ? expr(0)
-                            : builder::make_var(datatypes::index,
-                                    std::string("_fuseiter")
-                                            + fusion_create_idx()));
-            in_indexes.emplace_back(iter_vars[i] + src.get_offset()[i]);
-            loop_indexes.emplace_back(iter_vars[i]);
-        }
+        std::vector<expr> in_indexes, loop_indexes, in_indexes_tail,
+                loop_indexes_tail;
+        auto indexvar_or_zero = [&src](size_t idx) {
+            return range_from_outer_loop(src.get_ranges()[idx])
+                    ? expr(0)
+                    : builder::make_var(datatypes::index,
+                            std::string("_fuseiter") + fusion_create_idx());
+        };
+        auto make_iter_vars = [&](std::vector<expr> &iter_vars,
+                                      bool is_tail = false) {
+            for (size_t i = 0; i < input_blocking_dims_expr.size(); i++) {
+                iter_vars.emplace_back(indexvar_or_zero(i));
+                in_indexes.emplace_back(iter_vars[i] + src.get_offset()[i]);
+                loop_indexes.emplace_back(iter_vars[i]);
+            }
+        };
+        make_iter_vars(iter_vars);
         expr condition;
         expr last_axis_offset, other_axis_condition;
         std::vector<expr> tmp_indexes = get_reorder_block2plain_indexes(graph,
@@ -806,18 +1327,59 @@ void compute_fast_transpose(sc_graph_t &graph, const context_ptr &ctx,
                         - 1));
         std::vector<expr> out_indexes
                 = get_reorder_plain2block_indexes(tmp_indexes, output_format);
+        if (use_split_loop && !is_dynamic) {
+            cur_list.clear();
+            cur_list_floor.clear();
+            cur_list_lastdim_floor.clear();
+        }
         if (dtype == datatypes::f32 || is_s8u8 || direct_use_bit16x16) {
-            compute_transpose_f32_s8u8_bit16direct(
-                    loop_indexes, out_indexes, tmp_indexes);
+            if (use_split_loop && !is_dynamic) {
+                inputloop_split_ir_directly(
+                        loop_indexes, out_indexes, tmp_indexes, out_indexes);
+            } else {
+                compute_transpose_direct(
+                        loop_indexes, out_indexes, tmp_indexes, out_indexes);
+            }
         } else {
-            compute_transpose_bit16(loop_indexes, out_indexes, tmp_indexes);
+            if (use_split_loop && !is_dynamic) {
+                inputloop_split_ir_bit16(
+                        loop_indexes, out_indexes, tmp_indexes, out_indexes);
+            } else {
+                compute_transpose_bit16(
+                        loop_indexes, out_indexes, tmp_indexes, out_indexes);
+            }
         }
         cur = builder::make_stmts_unattached(cur_list);
+        if (use_split_loop && !is_dynamic) {
+            if (inputloop_otheraxis_condition.defined()
+                    && inputloop_lastdim_condition.defined()) {
+                auto cur_floor_lastdim = builder::make_stmts_unattached(
+                        cur_list_lastdim_floor);
+                auto cur_floor = builder::make_stmts_unattached(cur_list_floor);
+                // other axis out of bound
+                auto other_axis_meet = builder::make_if_else_unattached(
+                        inputloop_lastdim_condition, cur_floor,
+                        cur_floor_lastdim);
+                cur = builder::make_if_else_unattached(
+                        inputloop_otheraxis_condition, cur, other_axis_meet);
+            } else if (inputloop_lastdim_condition.defined()) {
+                auto cur_floor_lastdim = builder::make_stmts_unattached(
+                        cur_list_lastdim_floor);
+                cur = builder::make_if_else_unattached(
+                        inputloop_lastdim_condition, cur, cur_floor_lastdim);
+            } else if (inputloop_otheraxis_condition.defined()) {
+                auto cur_floor = builder::make_stmts_unattached(cur_list_floor);
+                cur = builder::make_if_else_unattached(
+                        inputloop_otheraxis_condition, cur, cur_floor);
+            }
+            var_define_list.emplace_back(cur);
+            cur = builder::make_stmts_unattached(var_define_list);
+        }
         compute_loops(input_blocking_dims_expr, inp_a_axis, inp_b_axis, src);
         cur->attr()[stmt_attr_key::merge_loop] = true;
         bld->emit(cur);
     } else {
-        std::vector<expr> out_indexes;
+        std::vector<expr> out_indexes, out_indexes_slice;
         for (size_t i = 0; i < output_blocking_dims_expr.size(); i++) {
             iter_vars.emplace_back(range_from_outer_loop(dst.get_ranges()[i])
                             ? expr(0)
@@ -825,6 +1387,7 @@ void compute_fast_transpose(sc_graph_t &graph, const context_ptr &ctx,
                                     std::string("_fuseiter")
                                             + fusion_create_idx()));
             out_indexes.emplace_back(iter_vars[i] + dst.get_offset()[i]);
+            out_indexes_slice.emplace_back(iter_vars[i]);
         }
         expr condition;
         expr last_axis_offset, other_axis_condition;
@@ -833,13 +1396,32 @@ void compute_fast_transpose(sc_graph_t &graph, const context_ptr &ctx,
                 last_axis_offset, other_axis_condition);
         std::vector<expr> in_indexes
                 = get_reorder_plain2block_indexes(tmp_indexes, input_format);
-        if (dtype == datatypes::f32 || is_s8u8 || direct_use_bit16x16) {
-            compute_transpose_f32_s8u8_bit16direct(
-                    in_indexes, out_indexes, tmp_indexes);
+        if (use_split_loop && !is_dynamic) {
+            cur_list.clear();
+            cur_list_floor.clear();
+        }
+        if (use_direct) {
+            if (use_split_loop && !is_dynamic) {
+                outputloop_split_ir_directly(in_indexes, out_indexes,
+                        tmp_indexes, out_indexes_slice);
+            } else {
+                compute_transpose_direct(
+                        in_indexes, out_indexes, tmp_indexes, out_indexes);
+            }
         } else {
-            compute_transpose_bit16(in_indexes, out_indexes, tmp_indexes);
+            compute_transpose_bit16(
+                    in_indexes, out_indexes, tmp_indexes, out_indexes_slice);
         }
         cur = builder::make_stmts_unattached(cur_list);
+        if (use_split_loop && !is_dynamic) {
+            if (outputloop_axis_condition.defined() && use_direct) {
+                auto cur_floor = builder::make_stmts_unattached(cur_list_floor);
+                cur = builder::make_if_else_unattached(
+                        outputloop_axis_condition, cur, cur_floor);
+            }
+            var_define_list.emplace_back(cur);
+            cur = builder::make_stmts_unattached(var_define_list);
+        }
         compute_loops(output_blocking_dims_expr, out_a_axis, out_b_axis, dst);
         cur->attr()[stmt_attr_key::merge_loop] = true;
         bld->emit(cur);

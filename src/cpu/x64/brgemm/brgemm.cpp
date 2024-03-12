@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2020-2023 Intel Corporation
+* Copyright 2020-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -37,6 +37,47 @@ using namespace dnnl::impl::utils;
 using namespace prop_kind;
 using namespace data_type;
 using namespace brgemm_utils;
+
+brgemm_t::brgemm_t(const brgemm_t &other) {
+    *this = other;
+    // Since copy above will make `attr_` and `dst_md_` point to `other`,
+    // nulling them in `this` to avoid cleaning `other` object members.
+
+    set_attr_null();
+    set_dst_md_null();
+
+    set_attr(other.attr());
+    set_dst_md(other.dst_md());
+}
+
+brgemm_t::~brgemm_t() {
+    cleanup_attr();
+    cleanup_dst_md();
+}
+
+void brgemm_t::set_attr(const primitive_attr_t *ppdattr) {
+    if (ppdattr == attr_) return;
+    cleanup_attr();
+    if (ppdattr) attr_ = new primitive_attr_t(*ppdattr);
+}
+
+void brgemm_t::set_dst_md(const memory_desc_t *pdst_md) {
+    if (pdst_md == dst_md_) return;
+    cleanup_dst_md();
+    if (pdst_md) dst_md_ = new memory_desc_t(*pdst_md);
+}
+
+void brgemm_t::cleanup_attr() {
+    if (attr_ == nullptr) return;
+    delete attr_;
+    attr_ = nullptr;
+}
+
+void brgemm_t::cleanup_dst_md() {
+    if (dst_md_ == nullptr) return;
+    delete dst_md_;
+    dst_md_ = nullptr;
+}
 
 void brgemm_kernel_execute(const brgemm_kernel_t *brg_kernel, int bs,
         const brgemm_batch_element_t *batch, void *ptr_C, void *scratch,
@@ -212,8 +253,9 @@ status_t brgemm_desc_init(brgemm_t *brg, cpu_isa_t isa,
                 false, brg->is_int8, brg->is_bf16, brg->is_f32, brg->is_f16))
         return status::unimplemented;
 
-    // Only avx512_core_amx kernel supports u8 weights.
-    if (!IMPLICATION(brg->dt_b == u8, brg->isa_impl == avx512_core_amx))
+    // Only amx_int8 kernel supports u8 weights.
+    if (!IMPLICATION(
+                brg->dt_b == u8, is_superset(brg->isa_impl, avx512_core_amx)))
         return status::unimplemented;
 
     CHECK(brgemm_blocking(brg));
@@ -255,8 +297,8 @@ status_t brgemm_desc_set_postops(brgemm_t *brg, const primitive_attr_t *attr,
         const memory_desc_t *dst_md, dim_t LDD, impl::data_type_t dt_bias) {
     if (!brg || !dst_md) return status::invalid_arguments;
 
-    brg->attr = attr;
-    brg->dst_md = dst_md;
+    brg->set_attr(attr);
+    brg->set_dst_md(dst_md);
 
     brg->with_bias = (dt_bias == data_type::undef) ? false : true;
     brg->dt_bias = dt_bias;
@@ -314,11 +356,11 @@ status_t brgemm_desc_set_postops(brgemm_t *brg, const primitive_attr_t *attr,
     // Rerun blocking heuristic due to reduced zmm register count
     if (brg->is_bf16_emu && brg->is_dgmm) CHECK(brdgmm_blocking(brg));
 
-    if (!brg->attr) return status::success;
+    if (!brg->attr()) return status::success;
 
     using namespace injector;
 
-    const auto &post_ops = brg->attr->post_ops_;
+    const auto &post_ops = brg->attr()->post_ops_;
     const memory_desc_wrapper dst_d(dst_md);
 
     const auto binary_ind = post_ops.find(primitive_kind::binary);
@@ -341,9 +383,11 @@ status_t brgemm_desc_set_postops(brgemm_t *brg, const primitive_attr_t *attr,
                             true /*sum_requires_same_params*/,
                             {broadcasting_strategy_t::per_oc,
                                     broadcasting_strategy_t::scalar,
+                                    broadcasting_strategy_t::per_mb,
                                     broadcasting_strategy_t::per_mb_spatial,
                                     broadcasting_strategy_t::per_mb_w,
                                     broadcasting_strategy_t::per_w,
+                                    broadcasting_strategy_t::batch,
                                     broadcasting_strategy_t::no_broadcast})))
         return status::unimplemented;
 
@@ -436,6 +480,7 @@ status_t brgemm_desc_set_attr(brgemm_t *brg, const brgemm_attr_t &brgattr) {
         return status::unimplemented;
 
     brg->brgattr = brgattr;
+    brg->bs_group = brgattr.hint_bs_group;
 
     if (brgattr.fpmath_mode != fpmath_mode::strict) maybe_try_bf32(brg);
 
@@ -446,7 +491,7 @@ status_t brgemm_desc_set_attr(brgemm_t *brg, const brgemm_attr_t &brgattr) {
                     || brgattr.hint_ld_block != 0 || brgattr.hint_ld_block2 != 0
                     || brgattr.hint_load_nt_A != brgemm_hint_nt_undef
                     || brgattr.hint_load_nt_B != brgemm_hint_nt_undef
-                    || brgattr.bs_group > 1);
+                    || brgattr.hint_bs_group > 1);
     if (brgattr.use_uker || brg->is_bf16_tmm || hint_blocking_set
             || brgattr.bd_mask_level
             || brgattr.fpmath_mode != fpmath_mode::strict || max_vpad > 0) {
@@ -663,7 +708,7 @@ status_t brgemm_init_tiles(const brgemm_t &brg, char palette[64]) {
 
 namespace {
 template <typename T>
-static inline int sign(T v) {
+inline int sign(T v) {
     return (v > 0) ? 1 : ((v < 0) ? -1 : 0);
 }
 
@@ -715,6 +760,7 @@ int brgemm_cmp(const brgemm_t &lhs, const brgemm_t &rhs) {
 
     CMP_BRGEMM_FIELD(is_oc_scale);
     CMP_BRGEMM_FIELD(with_dst_scales);
+    CMP_BRGEMM_FIELD(bs_group);
 
     // Compare all non-pointer parameters of brgemm_attr_t except derived
     CMP_BRGEMM_FIELD(brgattr.max_bs);
@@ -746,7 +792,7 @@ int brgemm_cmp(const brgemm_t &lhs, const brgemm_t &rhs) {
     CMP_BRGEMM_FIELD(brgattr.LDC2_N);
     CMP_BRGEMM_FIELD(brgattr.var_bs);
     CMP_BRGEMM_FIELD(brgattr.postops_only);
-    CMP_BRGEMM_FIELD(brgattr.bs_group);
+    CMP_BRGEMM_FIELD(brgattr.hint_bs_group);
 
     CMP_BRGEMM_FIELD(brgattr.hint_bd_block);
     CMP_BRGEMM_FIELD(brgattr.hint_ld_block);

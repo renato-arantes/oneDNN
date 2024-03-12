@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2023 Intel Corporation
+* Copyright 2023-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -39,7 +39,12 @@ size_t get_arg_size(const std::vector<dnnl_exec_arg_t> &dnnl_args, int arg) {
 }
 } // namespace cold_cache_utils
 
-cold_cache_t::cold_cache_t() : enabled_(false) {}
+cold_cache_t::cold_cache_t()
+    : enabled_(false)
+    , n_buffers_top_limit_(0)
+    , n_buffers_bottom_limit_(0)
+    , n_buffers_(0)
+    , override_n_buffers_(false) {}
 
 cold_cache_t::cold_cache_t(const std::vector<dnnl_exec_arg_t> &dnnl_args)
     : enabled_(use_cold_cache(dnnl_args))
@@ -50,8 +55,9 @@ cold_cache_t::cold_cache_t(const std::vector<dnnl_exec_arg_t> &dnnl_args)
 
     if (!enabled_) return;
 
-    static size_t cpu_cache_capacity = 0;
-    SAFE_V(get_cpu_cache_size(cpu_cache_capacity));
+    static cpu_cache_args_t cpu_cache_args {};
+    SAFE_V(get_cpu_cache_size(cpu_cache_args));
+    const auto cpu_cache_capacity = cpu_cache_args.total_socket_size;
     // `3` potentially to cover both one and two socket scenarios.
     static const size_t cpu_cache_size_upper_bound = cpu_cache_capacity * 3;
 
@@ -150,18 +156,23 @@ cold_cache_t::cold_cache_t(const std::vector<dnnl_exec_arg_t> &dnnl_args)
 
         for (size_t i = 0; i < n_buffers_; i++) {
             cc_entry[i] = dnn_mem_t(orig_cc_mem_md, get_test_engine());
-            if (has_bench_mode_modifier(mode_modifier_t::no_host_memory))
-                continue;
 
-            auto st = fill_random_real(orig_mem, cc_entry[i]);
-            if (st != OK) {
-                BENCHDNN_PRINT(0,
-                        "Error: filling for cold cache tensor %zu failed "
-                        "(%s:%d)!\n",
-                        i, __FILE__, __LINE__);
-                return;
+#ifdef DNNL_EXPERIMENTAL_SPARSE
+            // Sparse memories require this call to replicate the exact original
+            // data distribution because the data structure affects performance
+            // in a direct way.
+            if (cc_entry[i].format_kind() == dnnl_format_kind_sparse) {
+                auto st = fill_random_real(
+                        cc_entry[i], get_default_fill_cfg(), orig_mem);
+                if (st != OK) {
+                    BENCHDNN_PRINT(0,
+                            "Error: filling for cold cache tensor %zu failed "
+                            "(%s:%d)!\n",
+                            i, __FILE__, __LINE__);
+                    return;
+                }
             }
-
+#endif
             if (cc_entry[i].is_mapped()) cc_entry[i].unmap();
         }
     }

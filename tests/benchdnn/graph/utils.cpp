@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2022-2023 Intel Corporation
+* Copyright 2022-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -28,6 +28,36 @@
 #include "utils/timer.hpp"
 
 namespace graph {
+
+bdnn_state_t convert_state(const dnnl_status_t &s) {
+    switch (s) {
+        case dnnl_status_t::dnnl_success:
+            return bdnn_state_t {res_state_t::PASSED};
+        case dnnl_status_t::dnnl_out_of_memory:
+            return bdnn_state_t {
+                    res_state_t::SKIPPED, skip_reason_t::NOT_ENOUGH_RAM};
+        case dnnl_status_t::dnnl_invalid_arguments:
+            return bdnn_state_t {res_state_t::INVALID_ARGUMENTS};
+        case dnnl_status_t::dnnl_unimplemented:
+            return bdnn_state_t {res_state_t::UNIMPLEMENTED};
+        case dnnl_status_t::dnnl_last_impl_reached:
+            return bdnn_state_t {
+                    res_state_t::SKIPPED, skip_reason_t::SKIP_IMPL_HIT};
+        case dnnl_status_t::dnnl_runtime_error:
+            return bdnn_state_t {res_state_t::FAILED};
+        case dnnl_status_t::dnnl_not_required:
+            return bdnn_state_t {res_state_t::INVALID_ARGUMENTS};
+        case dnnl_status_t::dnnl_invalid_graph:
+        case dnnl_status_t::dnnl_invalid_graph_op:
+        case dnnl_status_t::dnnl_invalid_shape:
+            return bdnn_state_t {
+                    res_state_t::SKIPPED, skip_reason_t::INVALID_CASE};
+        case dnnl_status_t::dnnl_invalid_data_type:
+            return bdnn_state_t {res_state_t::SKIPPED,
+                    skip_reason_t::DATA_TYPE_NOT_SUPPORTED};
+        default: assert(!"dnnl state is not found!"); return bdnn_state_t {};
+    }
+}
 
 void compiled_partition_executor(dnnl::graph::compiled_partition &cp,
         dnnl::stream &stream, const std::vector<dnnl::graph::tensor> &inputs,
@@ -58,8 +88,8 @@ int execute_and_wait(const std::vector<dnnl::graph::compiled_partition> &cp_v,
         perf_function_t perf_func = std::bind(&compiled_partition_executor,
                 cp_v[i], std::placeholders::_1, std::placeholders::_2,
                 std::placeholders::_3);
-        DNN_GRAPH_SAFE(perf_func(stream, inputs_v[i], outputs_v[i]), CRIT);
-        DNN_GRAPH_SAFE(stream.wait(), CRIT);
+        DNN_GRAPH_SAFE(perf_func(stream, inputs_v[i], outputs_v[i]), CRIT, res);
+        DNN_GRAPH_SAFE(stream.wait(), CRIT, res);
     }
     res->state = EXECUTED;
     return OK;
@@ -77,7 +107,8 @@ inline dnnl::stream::flags get_profiling_flags() {
 inline int measure_perf_aggregate(timer::timer_t &t,
         std::vector<perf_function_t> &perf_func_v,
         const std::vector<std::vector<dnnl::graph::tensor>> &inputs_v,
-        const std::vector<std::vector<dnnl::graph::tensor>> &outputs_v) {
+        const std::vector<std::vector<dnnl::graph::tensor>> &outputs_v,
+        res_t *res) {
     const int max_batch_times = 4096;
     // Nvidia/AMD don't support profiling.
     const bool use_profiling = is_gpu() && !is_nvidia_gpu() && !is_amd_gpu();
@@ -90,8 +121,9 @@ inline int measure_perf_aggregate(timer::timer_t &t,
     // kernel has not been built and skews the results.
     auto sz = perf_func_v.size();
     for (size_t i = 0; i < sz; i++) {
-        DNN_GRAPH_SAFE(perf_func_v[i](stream, inputs_v[i], outputs_v[i]), WARN);
-        DNN_GRAPH_SAFE(stream.wait(), WARN);
+        DNN_GRAPH_SAFE(
+                perf_func_v[i](stream, inputs_v[i], outputs_v[i]), WARN, res);
+        DNN_GRAPH_SAFE(stream.wait(), WARN, res);
     }
 
     int cur_batch_times
@@ -105,10 +137,10 @@ inline int measure_perf_aggregate(timer::timer_t &t,
     while (true) {
         for_(int i = 0; i < cur_batch_times; i++)
         for (size_t j = 0; j < sz; j++) {
-            DNN_GRAPH_SAFE(
-                    perf_func_v[j](stream, inputs_v[j], outputs_v[j]), WARN);
+            DNN_GRAPH_SAFE(perf_func_v[j](stream, inputs_v[j], outputs_v[j]),
+                    WARN, res);
         }
-        DNN_GRAPH_SAFE(stream.wait(), WARN);
+        DNN_GRAPH_SAFE(stream.wait(), WARN, res);
 
         if (use_profiling) {
             std::vector<uint64_t> nsecs;
@@ -159,7 +191,8 @@ inline int measure_perf_aggregate(timer::timer_t &t,
 inline int measure_perf_individual(timer::timer_t &t,
         std::vector<perf_function_t> &perf_func_v,
         const std::vector<std::vector<dnnl::graph::tensor>> &inputs_v,
-        const std::vector<std::vector<dnnl::graph::tensor>> &outputs_v) {
+        const std::vector<std::vector<dnnl::graph::tensor>> &outputs_v,
+        res_t *res) {
     const bool use_profiling = is_gpu() && !is_nvidia_gpu() && !is_amd_gpu();
     const dnnl::stream::flags flags = use_profiling
             ? dnnl::stream::flags::default_flags | get_profiling_flags()
@@ -170,8 +203,8 @@ inline int measure_perf_individual(timer::timer_t &t,
     while (true) {
         auto sz = perf_func_v.size();
         for (size_t i = 0; i < sz; i++) {
-            DNN_GRAPH_SAFE(
-                    perf_func_v[i](stream, inputs_v[i], outputs_v[i]), WARN);
+            DNN_GRAPH_SAFE(perf_func_v[i](stream, inputs_v[i], outputs_v[i]),
+                    WARN, res);
         }
         t.stamp();
         if (should_stop(t)) break;
@@ -181,14 +214,17 @@ inline int measure_perf_individual(timer::timer_t &t,
 
 int measure_perf(timer::timer_t &t, std::vector<perf_function_t> &perf_func_v,
         const std::vector<std::vector<dnnl::graph::tensor>> &inputs_v,
-        const std::vector<std::vector<dnnl::graph::tensor>> &outputs_v) {
+        const std::vector<std::vector<dnnl::graph::tensor>> &outputs_v,
+        res_t *res) {
     if (has_bench_mode_bit(mode_bit_t::perf)) {
         // enable GPU profiling, Nvidia/AMD dose not support profiling.
         int ret = OK;
         if (is_cpu() && !is_sycl_engine()) {
-            ret = measure_perf_individual(t, perf_func_v, inputs_v, outputs_v);
+            ret = measure_perf_individual(
+                    t, perf_func_v, inputs_v, outputs_v, res);
         } else {
-            ret = measure_perf_aggregate(t, perf_func_v, inputs_v, outputs_v);
+            ret = measure_perf_aggregate(
+                    t, perf_func_v, inputs_v, outputs_v, res);
         }
         return ret;
     } else {
@@ -208,7 +244,7 @@ int measure_perf(timer::timer_t &t,
                 std::placeholders::_3));
     }
 
-    int status = measure_perf(t, perf_func_v, inputs_v, outputs_v);
+    int status = measure_perf(t, perf_func_v, inputs_v, outputs_v, res);
     if (res) res->state = EXECUTED;
 
     return status;
@@ -407,8 +443,9 @@ dnnl::graph::op::kind opstr2kind(const std::string &kind) {
     } else {
         fprintf(stderr, "graph: ERROR: Unsupported opkind: `%s`, exiting...\n",
                 kind.c_str());
-        exit(2);
+        SAFE_V(FAIL);
     }
+    return dnnl::graph::op::kind::LastSymbol;
 }
 
 dnnl::graph::op::attr attrstr2kind(const std::string &attr_name) {
@@ -475,8 +512,9 @@ dnnl::graph::op::attr attrstr2kind(const std::string &attr_name) {
         fprintf(stderr,
                 "graph: ERROR: Unsupported attribute: `%s`, exiting...\n",
                 attr_name.c_str());
-        exit(2);
+        SAFE_V(FAIL);
     }
+    return dnnl::graph::op::attr::undef;
 }
 
 class op_kind_hash_t {
@@ -621,8 +659,9 @@ dnnl_driver_t opkind2driver(const dnnl::graph::op::kind &kind) {
     } else {
         fprintf(stderr, "graph: ERROR: Unsupported opkind: `%d`, exiting...\n",
                 static_cast<int>(kind));
-        exit(2);
+        SAFE_V(FAIL);
     }
+    return dnnl_driver_t::others;
 }
 
 bool is_nxc_lt_arg(const std::string &kind, const int exec_arg) {
@@ -764,6 +803,25 @@ void change_format_to_ncx(dims_t &dims) {
     const auto ndims = static_cast<int>(dims.size());
     dims.insert(dims.begin() + 1, dims[ndims - 1]);
     dims.erase(dims.end() - 1);
+}
+
+std::string verbose_partitions_n_ops(
+        const std::vector<dnnl::graph::partition> &partitions) {
+    std::string s;
+    for (const auto &partition : partitions) {
+        s += " {" + std::to_string(partition.get_ops_num()) + "}";
+    }
+    return s;
+}
+
+std::string lt_dims2str(const dnnl::graph::logical_tensor::dims &dims) {
+    if (dims.empty()) return std::string();
+
+    std::stringstream ss;
+    std::copy(
+            dims.begin(), dims.end(), std::ostream_iterator<int64_t>(ss, "x"));
+    auto res = ss.str();
+    return res.substr(0, res.length() - 1);
 }
 
 void permute_md(dnn_mem_t &mem, std::vector<int64_t> permutation) {

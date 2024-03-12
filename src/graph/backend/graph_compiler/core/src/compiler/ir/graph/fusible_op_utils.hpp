@@ -1,5 +1,5 @@
 /*******************************************************************************
- * Copyright 2020-2023 Intel Corporation
+ * Copyright 2020-2024 Intel Corporation
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -44,19 +44,19 @@ using slice_range_map = std::unordered_map<int, slice_range_list>;
 slice_range_map search_known_input_slice(sc_op *cur, fslice_map &fsmap);
 void set_unknown_input_slice(fusible_op_t *cur,
         const slice_range_map &known_ranges_map, fslice_map &fsmap);
-
 infer_status_code infer_binary_slice_ranges(
         fusible_op_t *cur, fslice_map &fsmap);
 
-std::unordered_map<int, bound_axis> search_known_input_axis(
-        sc_op *cur, bound_axis_map &bdax_map);
+std::unordered_map<int, binding_axis> search_known_input_axis(
+        sc_op *cur, binding_axis_map &bdax_map);
 void set_unknown_binding_axis(sc_op *cur,
-        const std::unordered_map<int, bound_axis> &known_axis_map,
-        bound_axis_map &bdax_map);
-
-void infer_identical_binding_axis(fusible_op_t *cur, bound_axis_map &bdax_map);
+        const std::unordered_map<int, binding_axis> &known_axis_map,
+        binding_axis_map &bdax_map);
+void call_output_user_axis_binding(sc_op *cur, binding_axis_map &bdax_map);
+void infer_identical_binding_axis(
+        fusible_op_t *cur, binding_axis_map &bdax_map);
 void pre_infer_identical_binding_axis(
-        fusible_op_t *cur, bound_axis_map &bdax_map);
+        fusible_op_t *cur, binding_axis_map &bdax_map);
 
 sc_dims get_expr_to_dims(const std::vector<expr> &dims);
 size_t get_dims_product(const sc_dims &dims);
@@ -120,15 +120,17 @@ void compute_vectorized_op(const context_ptr &ctx, sc_graph_t &graph,
         sc_op_info_t &info, const vectorized_info_t &vx_info,
         const mask_compute_func_t &compute_lanes,
         const mask_compute_func_t &compute_scalar, any_map_t &attrs,
-        size_t wkld = 0UL, bool use_mask = false,
+        const graph_tensor_ptr &expand_gt, size_t wkld = 0UL,
+        bool use_mask = false,
         const tensor_slice *expand_loop_by
         = nullptr /*by default expand loop by dst*/,
         bool unroll_inner_loop = false);
 expr make_select_by_mask(const expr &, const expr &, const expr &, uint32_t);
 expr generate_mask_var_by_step(stmt &mask_def, const expr &cur_step,
-        int32_t step, const expr &sup_condition = expr());
-expr generate_mask_by_step_directly(
-        const expr &cur_step, int32_t step, const expr &sup_condition = expr());
+        int32_t step, const expr &sup_condition = expr(),
+        bool direct_sup_cond = false);
+expr generate_mask_by_step_directly(const expr &cur_step, int32_t step,
+        const expr &sup_condition = expr(), bool direct_sup_cond = false);
 expr calculate_mask_cur_step(
         const expr &len, const expr &iter_var, const int32_t lanes);
 expr indexing_from_diff_cond(const bool is_last_dim_1, const bool has_tail,

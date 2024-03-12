@@ -1,5 +1,5 @@
 /*******************************************************************************
- * Copyright 2022-2023 Intel Corporation
+ * Copyright 2022-2024 Intel Corporation
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -126,10 +126,12 @@ public:
     sc_dims get_shapes() const;
     std::vector<expr> get_shapes_expr();
     bool try_penetrate(sc_data_format_t &new_output_format) const;
+    // the dim change is [a, b] --> [1, 1, a, b] or [1, 1, a, b] --> [a, b]
+    bool is_only_expand_or_penetrate() const;
     shape_rl_vec get_dynamic_shape_relations() const override;
 
-    void infer_binding_axis(bound_axis_map &bdax_map) override;
-    void pre_infer_binding_axis(bound_axis_map &bdax_map) override;
+    void infer_binding_axis(binding_axis_map &bdax_map) override;
+    void pre_infer_binding_axis(binding_axis_map &bdax_map) override;
 
 private:
     sc_dims shapes_;
@@ -211,8 +213,8 @@ public:
     bool support_output_loop() const;
     bool support_optimized_kernel(const context_ptr &ctx) const;
     bool meet_vnni_reorder_require(const context_ptr &ctx) const;
-    void infer_binding_axis(bound_axis_map &bdax_map) override;
-    void pre_infer_binding_axis(bound_axis_map &bdax_map) override;
+    void infer_binding_axis(binding_axis_map &bdax_map) override;
+    void pre_infer_binding_axis(binding_axis_map &bdax_map) override;
 
 private:
     sc_dims plain_dims_;

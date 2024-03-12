@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2019-2023 Intel Corporation
+* Copyright 2019-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -25,21 +25,21 @@
 #include "gpu/compute/device_info.hpp"
 #include "gpu/compute/kernel_ctx.hpp"
 #include "gpu/compute/utils.hpp"
-#include "gpu/gpu_primitive_attr.hpp"
 
 namespace dnnl {
 namespace impl {
 namespace gpu {
 namespace compute {
 
-void get_optimal_lws(const size_t *gws, size_t *lws, const size_t n,
-        const int mapped_vec_dim_idx, const gpu_arch_t gpu_arch);
+range_t get_optimal_lws(const range_t &gws, const int mapped_vec_dim_idx,
+        const gpu_arch_t gpu_arch);
 
 class compute_engine_t;
 
 class dispatch_t {
 public:
-    static const int min_nesting_level = -1;
+    static constexpr int min_nesting_level = -1;
+    static constexpr int dim_not_found = -1;
 
     // md - memory descriptor hint to extract nesting levels based on the layout.
     dispatch_t(const compute_engine_t *engine = nullptr,
@@ -76,8 +76,8 @@ public:
     void generate(bool generate_lws = true);
 
     void generate_override(
-            const size_t *grange, const size_t *lrange = nullptr);
-    void set_lws(const size_t *lrange);
+            const range_t &grange, const range_t &lrange = range_t());
+    void set_lws(const range_t &lrange);
 
     // Dimension information necessary for mapping to global work IDs.
     struct dim_info_t {
@@ -110,10 +110,10 @@ protected:
             dim_t size, dim_t block = 1);
 
     int find_vectorized_dim() const {
-        int vec_dim_idx = -1;
+        int vec_dim_idx = dim_not_found;
         for (int i = 0; i < ndims_; ++i) {
             if (dims_[i].vector_size != 1) {
-                assert(vec_dim_idx == -1);
+                assert(vec_dim_idx == dim_not_found);
                 assert(dims_[i].block > 0);
                 vec_dim_idx = i;
             }

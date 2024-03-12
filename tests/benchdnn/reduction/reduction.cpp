@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2020-2023 Intel Corporation
+* Copyright 2020-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -19,12 +19,12 @@
 #include <random>
 #include <sstream>
 
+#include "utils/fill.hpp"
 #include "utils/parallel.hpp"
 
 #include "dnnl_common.hpp"
 #include "dnnl_memory.hpp"
 
-#include "binary/binary.hpp"
 #include "reduction/reduction.hpp"
 
 namespace reduction {
@@ -81,11 +81,12 @@ problem_bounds get_problem_bounds(alg_t alg, dnnl_data_type_t dt) {
 dnnl_status_t init_pd(init_pd_args_t<prb_t> &init_pd_args) {
     const prb_t *prb = init_pd_args.prb;
     res_t *res = init_pd_args.res;
+    bool force_f32_dt = init_pd_args.force_f32_dt;
 
-    auto src_d = dnn_mem_t::init_md(
-            prb->ndims, prb->vdims[0].data(), prb->sdt, prb->stag);
-    auto dst_d = dnn_mem_t::init_md(
-            prb->ndims, prb->vdims[1].data(), prb->ddt, prb->dtag);
+    auto src_d = dnn_mem_t::init_md(prb->ndims, prb->vdims[0].data(),
+            force_f32_dt ? dnnl_f32 : prb->sdt, prb->stag);
+    auto dst_d = dnn_mem_t::init_md(prb->ndims, prb->vdims[1].data(),
+            force_f32_dt ? dnnl_f32 : prb->ddt, prb->dtag);
 
     attr_args_t attr_args;
     attr_args.prepare_post_ops_mds(prb->attr, prb->ndims, prb->vdims[1].data());
@@ -109,6 +110,12 @@ bool is_norm_alg(const alg_t alg) {
 int fill_mem(const prb_t *prb, dnn_mem_t &mem_dt, dnn_mem_t &mem_fp,
         float non_neutral_prob, bool expanded_range,
         bool only_positive_values) {
+    // Refer to modes documentation for filling principles.
+    // Multiply alg overflows extremely fast. Exclude it from validation.
+    if (has_bench_mode_bit(mode_bit_t::bitwise) && prb->alg != alg_t::mul) {
+        return fill_random_real(mem_dt, mem_fp, nullptr);
+    }
+
     const auto sdt = mem_dt.dt();
     const auto ddt = prb->ddt;
     const auto nelems = mem_fp.nelems();
@@ -165,7 +172,6 @@ int fill_mem(const prb_t *prb, dnn_mem_t &mem_dt, dnn_mem_t &mem_fp,
 
 int fill_src(const prb_t *prb, dnn_mem_t &mem_dt, dnn_mem_t &mem_fp) {
     const auto nelems = mem_fp.nelems();
-    const auto sdt = prb->sdt;
     if (!nelems) return OK;
 
     int nelems_to_reduce = 1;
@@ -176,7 +182,7 @@ int fill_src(const prb_t *prb, dnn_mem_t &mem_dt, dnn_mem_t &mem_fp) {
     }
 
     // Determine number of non-neutral elements to have in the reduction chain
-    int safe_to_reduce_elems = get_problem_bounds(prb->alg, sdt).first;
+    int safe_to_reduce_elems = get_problem_bounds(prb->alg, prb->sdt).first;
     if (safe_to_reduce_elems == -1) safe_to_reduce_elems = nelems_to_reduce;
 
     const float non_neutral_prob
@@ -230,8 +236,28 @@ std::vector<int> supported_exec_args(dir_t dir) {
     return exec_args;
 };
 
+fill_cfg_t binary_po_fill_cfg(
+        int exec_arg, const dnn_mem_t &mem, const attr_t &attr) {
+    fill_cfg_t cfg;
+    const int post_ops_range = DNNL_ARG_ATTR_MULTIPLE_POST_OP(31)
+            - DNNL_ARG_ATTR_MULTIPLE_POST_OP(0);
+    const bool is_post_ops_arg = (exec_arg & post_ops_range);
+    if (is_post_ops_arg) {
+        // Config secures only positive values since reduction output is
+        // positive in several scenarios, and using negative values leads to the
+        // cancellation effect.
+        const int bin_po_idx
+                = exec_arg / DNNL_ARG_ATTR_MULTIPLE_POST_OP_BASE - 1;
+        assert(bin_po_idx < attr.post_ops.len());
+        const auto alg = attr.post_ops.entry[bin_po_idx].kind;
+        cfg = fill_cfg_t(mem.dt(), 0.f, 16.f, /* int = */ true, alg,
+                "reduction_binary_post_op");
+    }
+    return cfg;
+}
+
 int init_ref_memory_args(dnn_mem_map_t &ref_mem_map, dnn_mem_map_t &mem_map,
-        dnnl_primitive_t prim, const prb_t *prb, res_t *res, dir_t dir,
+        dnnl_primitive_t prim, const prb_t *prb, res_t *res,
         dnnl_primitive_t prim_ref) {
     if (has_bench_mode_modifier(mode_modifier_t::no_host_memory)) return OK;
 
@@ -239,35 +265,42 @@ int init_ref_memory_args(dnn_mem_map_t &ref_mem_map, dnn_mem_map_t &mem_map,
 
     for (auto &entry : mem_map) {
         const int exec_arg = entry.first;
+        // The function targets regular exec_args that are positive.
+        // Negative args are used by bitwise and are broken in the `default`
+        // branch due to `&` always returns `true`.
+        if (exec_arg <= 0) continue;
+
         auto &mem = entry.second; // `mem` is modified by filler (reorder).
 
-        ref_mem_map.emplace(
-                exec_arg, dnn_mem_t(mem.md_, dnnl_f32, tag::abx, ref_engine));
+        // Scratchpad memory relates to a primitive. If reference needs it,
+        // use switch below to define a memory desc for it.
+        if (exec_arg != DNNL_ARG_SCRATCHPAD) {
+            ref_mem_map.emplace(exec_arg,
+                    dnn_mem_t(mem.md_, dnnl_f32, tag::abx, ref_engine));
+        }
         auto &ref_mem = ref_mem_map[exec_arg];
 
         switch (exec_arg) {
             case DNNL_ARG_SRC: SAFE(fill_src(prb, mem, ref_mem), WARN); break;
             case DNNL_ARG_DST:
                 if (prb->attr.post_ops.find(attr_t::post_ops_t::kind_t::SUM)
-                        >= 0)
+                        >= 0) {
                     SAFE(fill_dst(prb, mem, ref_mem), WARN);
-                break;
-            case DNNL_ARG_SCRATCHPAD: break;
-            default: { // Process all attributes here
-                int post_ops_range = DNNL_ARG_ATTR_MULTIPLE_POST_OP(31)
-                        - DNNL_ARG_ATTR_MULTIPLE_POST_OP(0);
-                bool is_post_ops_arg = (exec_arg & post_ops_range);
-                if (is_post_ops_arg) {
-                    if (exec_arg & DNNL_ARG_SRC_1) {
-                        const bool is_signed
-                                = prb->sdt != dnnl_u8 && prb->ddt != dnnl_u8;
-                        const bool use_positive
-                                = is_norm_alg(prb->alg) || !is_signed;
-                        SAFE(binary::fill_mem(
-                                     exec_arg, mem, ref_mem, use_positive),
-                                WARN);
+                    // Bitwise mode for sum requires a copy due to data for
+                    // post-op will be overwritten and it must be refreshed.
+                    if (has_bench_mode_bit(mode_bit_t::bitwise)) {
+                        SAFE(mem_map.at(-exec_arg).reorder(ref_mem), WARN);
                     }
                 }
+                break;
+            default: {
+                const auto &binary_fill_cfg
+                        = binary_po_fill_cfg(exec_arg, mem, prb->attr);
+                std::unordered_map<int, fill_cfg_t> fill_cfg_map {
+                        {DNNL_ARG_SRC_1, binary_fill_cfg}};
+                SAFE(init_ref_memory_args_default_case(exec_arg, mem, ref_mem,
+                             prb->attr, res, fill_cfg_map),
+                        WARN);
             } break;
         }
         // Don't keep reference memory if it is not used further.
@@ -296,17 +329,15 @@ int doit(const std::vector<benchdnn_dnnl_wrapper_t<dnnl_primitive_t>> &v_prim,
 
     dnn_mem_map_t mem_map, ref_mem_map;
     init_memory_args<prb_t>(mem_map, prb, prim, supported_exec_args(prb->dir));
-    TIME_FILL(SAFE(init_ref_memory_args(
-                           ref_mem_map, mem_map, prim, prb, res, prb->dir),
-            WARN));
+    TIME_FILL(SAFE(
+            init_ref_memory_args(ref_mem_map, mem_map, prim, prb, res), WARN));
 
     args_t args(mem_map), ref_args(ref_mem_map);
 
     SAFE(execute_and_wait(prim, args, res), WARN);
 
-    if (has_bench_mode_bit(mode_bit_t::corr)) {
-        check_correctness(prb, {DST}, args, ref_args, setup_cmp, res);
-    }
+    check_correctness(prb, {DST}, args, ref_args, setup_cmp, res);
+    SAFE(check_bitwise(prim, {DST}, args, prb->attr, prb->inplace, res), WARN);
 
     return measure_perf(prb->ctx_exe, res, prim, args);
 }

@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2021-2023 Intel Corporation
+* Copyright 2021-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -152,6 +152,7 @@ bool dpas_t::matches(const multiply_desc_t &desc) const {
 bool dpas_t::matches_types(
         const hw_t &hw, const type_t &a, const type_t &b, const type_t &c) {
     if (a.is_x8() && b.is_x8() && c.is_s32()) return true;
+    if (a.is_bf8() && b.is_bf8() && c.is_f32()) return true;
     if (a.is_f16() && b.is_f16() && c.is_f32()) return true;
     if (a.is_bf16() && b.is_bf16() && c.is_f32()) return true;
     if (a.is_tf32() && b.is_tf32() && c.is_f32() && hw >= ngen::HW::XeHPC)
@@ -164,14 +165,13 @@ bool mad_t::matches_types(
         const hw_t &hw, const type_t &a, const type_t &b, const type_t &c) {
     if (a != b && !(a.is_x8() && b.is_x8())) return false;
 
+    if (a.is_bf8() && b.is_bf8()) return true;
     if (a.is_f64() && c.is_f64()) return true;
     if (a.is_f32() && c.is_f32()) return true;
     if (a.is_f16() && c.is_f16()) return true;
     if (a.is_f16() && c.is_f32()) return true;
-    if (hw >= ngen::HW::XeHP) {
-        if (a.is_bf16() && c.is_f32()) return true;
-        if (a.is_f32() && c.is_bf16()) return true;
-    }
+    if (a.is_bf16() && c.is_f32()) return true;
+    if (a.is_f32() && c.is_bf16()) return true;
     if (a.is_x8() && (c.is_x16() || c.is_x32())) return true;
     if ((a.is_x16() || a.is_x32()) && (c.is_x16() || c.is_x32())) return true;
 

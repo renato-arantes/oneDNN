@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2020-2022 Intel Corporation
+* Copyright 2020-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -68,6 +68,7 @@ struct jit_eltwise_injector_f32 {
     void prepare();
     void compute(const ngen::GRF &reg) { compute(reg - reg); }
     void compute(const ngen::GRFRange &regs);
+    void compute(const int *grfs, int ngrf);
 
 private:
     const alg_kind_t alg_;
@@ -90,6 +91,7 @@ private:
     int max_batch_size();
     int phase_count(alg_kind_t alg);
 
+    void relu_zero_ns_prepare_fwd();
     void relu_prepare_bwd();
     void abs_prepare_bwd();
     void clip_prepare_bwd();

@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2023 Intel Corporation
+* Copyright 2023-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -37,15 +37,14 @@ public:
             const std::vector<dnnl::graph::logical_tensor> &ins,
             const std::vector<dnnl::graph::logical_tensor> &outs);
 
-    // prepare memorise in both paths, one by one ref primitive
-    void init_ref(const bench_mode_t mode,
-            const std::vector<size_t> &graph_ports,
+    // prepare memories in both paths, one by one ref primitive
+    int init_ref(const std::vector<size_t> &graph_ports,
             partition_mem_map_t &partition_mem_map, res_t *res);
     // run partition in ref path, one by one ref primitive
     void exec_ops(res_t *res);
 
     // ref execution and cmp
-    void check_partition_correctness(
+    int check_partition_correctness(
             partition_mem_map_t &partition_mem_map, res_t *res);
 
     // get the reference of ops of the partition
@@ -64,6 +63,9 @@ private:
 
     // bf16 cases:use f32 as intermediate tensor dt to improve accuracy
     void handle_special_case_bf16(res_t *res);
+
+    // rewrite x16->f32 from typecast (f32->x16) to typecast (x16->f32)
+    void handle_typecast_x16();
 
     // Objects below are constructed.
     // OPs in the partition, which is Topo ordered

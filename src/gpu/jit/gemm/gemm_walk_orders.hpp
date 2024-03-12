@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2021-2023 Intel Corporation
+* Copyright 2021-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -18,6 +18,7 @@
 #define GPU_JIT_GEMM_GEMM_WALK_ORDERS_HPP
 
 #include "common/utils.hpp"
+#include "gpu/compute/utils.hpp"
 #include "gpu/jit/gemm/gen_gemm_kernel.hpp"
 
 namespace dnnl {
@@ -31,8 +32,8 @@ inline uint32_t uint32_reciprocal(uint32_t x) {
 }
 
 inline void gemm_linear_order_args(compute::kernel_arg_list_t &arg_list,
-        int &argn, const size_t (&lws)[3], size_t (&gws)[3], int32_t m,
-        int32_t n, int32_t k, bool disable_hilbert,
+        int &argn, const compute::range_t &lws, compute::range_t &gws,
+        int32_t m, int32_t n, int32_t k, bool disable_hilbert,
         const CommonDriverInfo &info, const EvaluateAuxOutput *aux,
         const compute::device_info_t *dev_info) {
 
@@ -52,7 +53,7 @@ inline void gemm_linear_order_args(compute::kernel_arg_list_t &arg_list,
     uint32_t ss_count = dev_info->eu_count() / dev_info->max_eus_per_wg();
     bool large_grf_mode = (info.grfCount > 128);
     uint32_t thread_per_ss = dev_info->hw_threads(large_grf_mode) / ss_count;
-    uint32_t thread_per_tg = uint32_t(lws[0] * lws[1] * lws[2]);
+    uint32_t thread_per_tg = gpu_utils::into<uint32_t>(lws.nelems());
     uint32_t tg_per_ss = thread_per_ss / thread_per_tg;
     uint32_t concurrent_tg = tg_per_ss * ss_count;
 
@@ -112,7 +113,7 @@ inline void gemm_linear_order_args(compute::kernel_arg_list_t &arg_list,
                 else
                     thresh = utils::div_up(gc, s0) - (s0 - rem);
 
-                ok = (thresh >= 0) && (gco >= 2 * s0);
+                ok = (thresh >= 0) && (gco >= 2 * nstl::max(s0, s1));
                 slice = s0;
                 if (!up) {
                     if (thresh > 0)

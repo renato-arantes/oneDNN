@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2019-2023 Intel Corporation
+* Copyright 2019-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -28,6 +28,7 @@ namespace ocl {
 
 using namespace dnnl::impl::utils;
 using namespace dnnl::impl::gpu::gpu_utils;
+using namespace dnnl::impl::gpu::compute;
 using namespace prop_kind;
 using namespace data_type;
 
@@ -58,8 +59,10 @@ void rnn_utils::init_rnn_conf(conf_t &rnn, const rnn_desc_t &rd,
         const memory_desc_wrapper &src_iter_d,
         const memory_desc_wrapper &weights_layer_d,
         const memory_desc_wrapper &weights_iter_d,
-        const memory_desc_wrapper &dst_layer_d, bool is_xe_hpc) {
+        const memory_desc_wrapper &dst_layer_d, data_type_t acc_data_t,
+        const device_info_t &device_info) {
 
+    bool is_xe_hpc = device_info.gpu_arch() == gpu_arch_t::xe_hpc;
     rnn = utils::zero<decltype(rnn)>();
     rnn.is_fwd = utils::one_of(rd.prop_kind, prop_kind::forward_training,
             prop_kind::forward_inference);
@@ -103,6 +106,12 @@ void rnn_utils::init_rnn_conf(conf_t &rnn, const rnn_desc_t &rd,
             = rnn.dt_conf == all_f16 ? data_type::f16 : data_type::f32;
     rnn.diff_data_type = data_type::f32;
 
+    rnn.acc_data_type = acc_data_t;
+    rnn.acc_data_type_elsz = types::data_type_size(acc_data_t);
+
+    rnn.wei_layer_type = weights_layer_d.data_type();
+    rnn.wei_iter_type = weights_iter_d.data_type();
+
     rnn.n_layer = weights_layer_d.dims()[0];
     rnn.n_iter = src_layer_d.dims()[0];
     rnn.n_dir = weights_layer_d.dims()[1];
@@ -136,9 +145,10 @@ void rnn_utils::init_rnn_conf(conf_t &rnn, const rnn_desc_t &rd,
             rd.cell_kind, alg_kind::vanilla_gru, alg_kind::lbr_gru);
 
     // Decide if to merge gemm across iterations or layers
-    auto dst_layer_ld = dst_layer_d.blocking_desc().strides[1];
-    auto dst_layer_is_trivial_stride
-            = dst_layer_d.blocking_desc().strides[0] == (dst_layer_ld * rnn.mb);
+    auto dst_layer_is_trivial_stride = dst_layer_d.dims()[0] <= 1
+            || dst_layer_d.dims()[1] <= 1
+            || (dst_layer_d.blocking_desc().strides[0]
+                    == (dst_layer_d.blocking_desc().strides[1] * rnn.mb));
 
     // Does not account for alignment striding
     dim_t merge_scratch_size_estimate = rnn.gates_ld * rnn.mb * rnn.n_iter;
@@ -148,6 +158,78 @@ void rnn_utils::init_rnn_conf(conf_t &rnn, const rnn_desc_t &rd,
     rnn.merge_gemm_iter = dev_getenv("merge_gemm_iter",
             is_small_scratch && dst_layer_is_trivial_stride
                     && !(rnn.is_fwd || is_gru));
+
+    if (rnn.is_fwd) {
+        bool can_fuse_gemm = rnn.dt_conf == all_f32 && rnn.is_fwd
+                && utils::one_of(rd.cell_kind, alg_kind::vanilla_rnn,
+                        alg_kind::vanilla_lstm);
+        // Poor implementation performance if dhc % subgroup_size != 0
+        bool tail_dhc = rnn.dhc % device_info.min_subgroup_size() != 0;
+
+        // Since RNN cells may result in very small workloads the CPU overhead
+        // to dispatch kernels may be significant. As such, if the work per eu
+        // is too small, we need to fuse kernel operations to reduce CPU
+        // workload.
+        dim_t fuse_gemm_limit = [&]() {
+            const dim_t work_threshold = tail_dhc ? 512 : 1024;
+            return work_threshold * device_info.eu_count()
+                    * device_info.max_subgroup_size(rnn.acc_data_type);
+        }();
+
+        // For large enough k dimension, parallelization in external gemm
+        // kernels is more performant.
+        const dim_t k_limit = tail_dhc ? 50 : 160;
+
+        // The fused gemm implementation assumes the dst channel dimension is
+        // dense
+        auto is_dense_dst_c = [](const memory_desc_wrapper &md) {
+            if (md.format_kind() == format_kind::any) return true;
+            if (md.format_kind() != format_kind::blocked) return false;
+            if (md.dims()[4] == 1) return true;
+            if (md.blocking_desc().strides[4] == 1) return true;
+            return false;
+        };
+
+        rnn.cell_fusion.gemm_iter
+                = dev_getenv("fuse_gemm_iter",
+                          !rnn.merge_gemm_iter
+                                  && rnn.dhc * rnn.sic * rnn.mb * rnn.n_gates
+                                          < fuse_gemm_limit
+                                  && rnn.sic < k_limit
+                                  && is_dense_dst_c(weights_layer_d))
+                && can_fuse_gemm;
+        rnn.cell_fusion.gemm_layer
+                = dev_getenv("fuse_gemm_layer",
+                          rnn.cell_fusion.gemm_iter && !rnn.merge_gemm_layer
+                                  && rnn.dhc * rnn.slc * rnn.mb * rnn.n_gates
+                                          < fuse_gemm_limit
+                                  && rnn.slc < k_limit
+                                  && is_dense_dst_c(weights_iter_d))
+                && can_fuse_gemm;
+
+        // Currently, external gemm_iter always accumulates in C. As such,
+        // external gemm_layer is required to initialize the memory.
+        gpu_assert(IMPLICATION(
+                rnn.cell_fusion.gemm_layer, rnn.cell_fusion.gemm_iter));
+
+        bool can_iter_loop = rnn.cell_fusion.gemm_iter
+                && (rnn.merge_gemm_layer || rnn.cell_fusion.gemm_layer);
+
+        const int loop_all = 0;
+        rnn.iter_loop = dev_getenv("iter_loop", can_iter_loop ? loop_all : 1);
+        if (rnn.iter_loop == loop_all) rnn.iter_loop = rnn.n_iter;
+
+        rnn.dhc_loop = dev_getenv("dhc_loop", rnn.iter_loop ? loop_all : 1);
+        if (rnn.dhc_loop == loop_all) rnn.dhc_loop = rnn.dhc;
+
+        // A synchronization point is required after cell computation on along
+        // the dhc dimension. This requires dhc to be calculated on one thread
+        // group.
+        gpu_assert(IMPLICATION(rnn.iter_loop, rnn.dhc_loop == rnn.dhc));
+    } else {
+        rnn.iter_loop = 1;
+        rnn.dhc_loop = 1;
+    }
 
     // Decide to copy bias
     rnn.copy_bias = rnn.is_int8;
@@ -207,30 +289,6 @@ void rnn_utils::set_rnn_conf(conf_t &rnn, const rnn_desc_t &rd,
 
     const bool is_fwd = rnn.is_fwd;
     const bool is_bwd = !rnn.is_fwd;
-
-    //Set leading dimensions for input weights arrays depending on input format
-    auto set_dims = [&](const memory_desc_wrapper &md, dim_t &ld, dim_t &nld) {
-        ld = 0;
-        nld = 0;
-        if (md.is_blocking_desc()) {
-            if (is_ldigo(md)) {
-                ld = md.blocking_desc().strides[2];
-                nld = md.dims()[2];
-            } else if (is_ldgoi(md)) {
-                ld = md.blocking_desc().strides[4];
-                nld = md.dims()[3] * md.dims()[4];
-            } else
-                assert(!"unsupported weights format");
-        }
-    };
-    set_dims(weights_layer_d, rnn.weights_layer_ld, rnn.weights_layer_nld);
-    set_dims(weights_iter_d, rnn.weights_iter_ld, rnn.weights_iter_nld);
-    if (is_bwd) {
-        set_dims(diff_weights_layer_d, rnn.diff_weights_layer_ld,
-                rnn.diff_weights_layer_nld);
-        set_dims(diff_weights_iter_d, rnn.diff_weights_iter_ld,
-                rnn.diff_weights_iter_nld);
-    }
 
     int sizeof_states_dt
             = rnn.dt_conf == all_f32 ? sizeof(cl_float) : sizeof(cl_half);
@@ -354,19 +412,12 @@ void rnn_utils::set_rnn_conf(conf_t &rnn, const rnn_desc_t &rd,
     bool require_copy_diff_src_layer = [&]() {
         if (is_fwd) return false;
 
-        auto &strides = diff_src_layer_d.strides();
-        auto &pdims = diff_src_layer_d.padded_dims();
-
         // Unimplemented
         if (rnn.merge_gemm_iter || rnn.merge_gemm_layer) return true;
 
         // Direction need to be summed together. This requires generating new
         // GEMM kernels to perform a sum accumulation for the final accumulation.
         if (rnn.n_dir > 1) return true;
-
-        // A new kernel needs to be generated if the strides differ.
-        if (pdims[1] == 1 || rnn.scratch_diff_states_ld != strides[1])
-            return true;
 
         return false;
     }();
@@ -384,10 +435,9 @@ void rnn_utils::set_rnn_conf(conf_t &rnn, const rnn_desc_t &rd,
     // TODO: seprate diff_c_offsets from diff-states & seprate h- and c- off
     rnn.ws_c_states_cell_size
             = is_lstm ? rnn.mb * rnn.states_ws_ld * aux_elsz : 0;
-    rnn.ws_c_states_size = is_lstm
-            ? (copy_src_layer ? rnn.n_layer + 1 : rnn.n_layer) * rnn.n_dir
-                    * (rnn.n_iter + 1) * rnn.ws_c_states_cell_size
-            : 0;
+    rnn.ws_c_states_size = is_lstm ? rnn.n_layer * rnn.n_dir * (rnn.n_iter + 1)
+                    * rnn.ws_c_states_cell_size
+                                   : 0;
 
     auto scratch_diff_n_states
             = copy_diff_dst_layer || copy_diff_src_layer || rnn.n_layer != 1
@@ -511,68 +561,6 @@ dim_t rnn_utils::get_workspace_size(const conf_t &rnn) {
             ws_c_states_offset, ws_grid_comp_offset, ws_bias_offset);
 }
 
-void rnn_utils::set_offsets_fwd_gemm(const conf_t &rnn, dim_t dir, dim_t lay,
-        const std::vector<dim_t> &wei_layer_offsets,
-        dim_t &grid_wei_lay_offset) {
-    // Function overloaded. This function is called by grid execution
-    dim_t n_layer = rnn.n_layer;
-    dim_t n_dir = rnn.n_dir;
-
-    const AOC<const dim_t, 3> off_weights_lay(wei_layer_offsets.data(), n_layer,
-            n_dir, rnn.n_parts_weights_layer);
-
-    grid_wei_lay_offset = off_weights_lay(lay, dir, 0);
-    UNUSED(n_layer);
-}
-
-void rnn_utils::set_offsets_fwd_gemm(const conf_t &rnn, dim_t iter, dim_t dir,
-        dim_t lay, const std::vector<dim_t> &wei_iter_offsets,
-        dim_t &cell_wei_iter_offset) {
-    if (!wei_iter_offsets.empty()) {
-        const AOC<const dim_t, 3> off_weights_iter(wei_iter_offsets.data(),
-                rnn.n_layer, rnn.n_dir, rnn.n_parts_weights_iter);
-        cell_wei_iter_offset = off_weights_iter(lay, dir, 0);
-    }
-}
-
-void rnn_utils::set_gru_offsets_part2(const conf_t &rnn, dim_t iter, dim_t dir,
-        dim_t lay, const std::vector<dim_t> &wei_iter_offsets,
-        dim_t &cell_wei_iter_offset, dim_t &cell_scratch_fwd_offset) {
-
-    AOC<const dim_t, 3> off_weights_iter(wei_iter_offsets.data(), rnn.n_layer,
-            rnn.n_dir, rnn.n_parts_weights_iter);
-    cell_wei_iter_offset = off_weights_iter(lay, dir, 1);
-    cell_scratch_fwd_offset = 2 * rnn.dhc * rnn.scratch_gates_elsz;
-}
-
-void rnn_utils::set_offsets_bwd_gemm(const conf_t &rnn, dim_t iter, dim_t dir,
-        dim_t lay, dim_t &cell_diff_wei_iter_off, dim_t &cell_diff_wei_lay_off,
-        dim_t &cell_diff_wei_iter_off2) {
-
-    set_offsets_bwd_gemm(
-            rnn, iter, dir, lay, cell_diff_wei_iter_off, cell_diff_wei_lay_off);
-    cell_diff_wei_iter_off2
-            = cell_diff_wei_iter_off + 2 * rnn.dhc * sizeof(float);
-}
-
-void rnn_utils::set_offsets_bwd_gemm(const conf_t &rnn, dim_t iter, dim_t dir,
-        dim_t lay, dim_t &cell_diff_wei_iter_off,
-        dim_t &cell_diff_wei_lay_off) {
-    dim_t n_layers = rnn.n_layer;
-    dim_t n_dir = rnn.n_dir;
-
-    cell_diff_wei_lay_off
-            = OFF3(lay, n_layers, dir, n_dir, 0,
-                      rnn.diff_weights_layer_nld * rnn.diff_weights_layer_ld)
-            * sizeof(float);
-    cell_diff_wei_iter_off
-            = OFF3(lay, n_layers, dir, n_dir, 0,
-                      rnn.diff_weights_iter_nld * rnn.diff_weights_iter_ld)
-            * sizeof(float);
-
-    UNUSED(n_layers);
-}
-
 status_t rnn_utils::set_good_strides(
         dim_t ld_, memory_desc_t &weights_md, format_tag_t tag) {
     auto &strides = weights_md.format_desc.blocking.strides;
@@ -613,9 +601,13 @@ status_t rnn_utils::set_expected_desc(
     return status::success;
 }
 
-memory_storage_t &rnn_utils::get_storage(
-        const std::unique_ptr<memory_storage_t> &storage) {
+const memory_storage_t &rnn_utils::get_storage(
+        const memory_storage_t *storage) {
     return storage ? *storage : memory_storage_t::empty_storage();
+}
+const memory_storage_t &rnn_utils::get_storage(
+        const std::unique_ptr<memory_storage_t> &storage) {
+    return rnn_utils::get_storage(storage.get());
 }
 
 } // namespace ocl

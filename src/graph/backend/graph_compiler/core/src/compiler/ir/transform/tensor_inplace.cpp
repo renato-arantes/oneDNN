@@ -1,5 +1,5 @@
 /*******************************************************************************
- * Copyright 2022-2023 Intel Corporation
+ * Copyright 2022-2024 Intel Corporation
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -39,6 +39,11 @@ namespace impl {
 namespace graph {
 namespace gc {
 
+std::ostream &operator<<(std::ostream &os, const tensor_inplace_info_t &value) {
+    os << '{' << value.used_arg_idx_ << '}';
+    return os;
+}
+
 SC_DECL_PASS_INFO(tensor_inplace,
         SC_PASS_DEPENDS_ON(
                 constant_folder, index_flattener, validator, auto_caster),
@@ -62,12 +67,13 @@ public:
 using inplace_hint_t
         = std::vector<std::pair<int, std::vector<tensor_inplace_info_t>>>;
 
-static void filter_and_sync_inplace_hint(const func_t &f) {
-    if (!f->attr_) { return; }
-    auto hint_in_def = f->attr_->get_or_null<inplace_hint_t>(
+static void filter_and_sync_inplace_hint(
+        const func_base *callee, const func_t &f) {
+    if (!callee->attr_) { return; }
+    auto hint_in_def = callee->attr_->get_or_null<inplace_hint_t>(
             function_attrs::inplace_hint);
     if (!hint_in_def) { return; }
-    auto &params = f->decl_->params_;
+    auto &params = callee->params_;
     // the alias id is the in-place result selected by
     // buffer_scheduler_t, try to use it to filter the
     // inplace_hint
@@ -93,7 +99,12 @@ static void filter_and_sync_inplace_hint(const func_t &f) {
             itrkv = hint_in_def->erase(itrkv);
         }
     }
+    f->attr()[function_attrs::inplace_hint] = *hint_in_def;
     f->decl_->attr()[function_attrs::inplace_hint] = *hint_in_def;
+    if (!hint_in_def->empty()) {
+        SC_MODULE_INFO << "arg inplace: " << f->name_ << " : "
+                       << utils::general_print(*hint_in_def);
+    }
 }
 
 static void get_inplace_args_from_called_funcs(const func_c &f, // caller
@@ -137,7 +148,8 @@ static void get_inplace_args_from_called_funcs(const func_c &f, // caller
                         }
                         if (ticks.find(in_arg) != ticks.end()
                                 && ticks.at(in_arg).is_arg_ && in_arg->attr_
-                                && in_arg->attr_->has_key("read_buffer")) {
+                                && in_arg->attr_->has_key("read_buffer")
+                                && !(in_arg->attr_->has_key("write_buffer"))) {
                             // this func in arg is also graph's in arg
                             if (inplaced_in_args.count(in_arg)) { continue; }
                             inplaced_in_args.insert(in_arg);
@@ -223,6 +235,7 @@ void schedule_func_args(const func_c &f,
         const auto &out_arg = tsr_tick.first;
         // only care about output args
         if (!(out_arg->attr_ && out_arg->attr_->has_key("write_buffer")
+                    && !(out_arg->attr_->has_key("read_buffer"))
                     && tsr_tick.second.is_arg_)) {
             continue;
         }
@@ -246,7 +259,8 @@ void schedule_func_args(const func_c &f,
         auto titr = last_read_tensor.lower_bound(out_tsr_tick.first_access_);
         while (titr != last_read_tensor.end()) {
             if (!(titr->second->attr_
-                        && titr->second->attr_->has_key("read_buffer"))) {
+                        && titr->second->attr_->has_key("read_buffer")
+                        && !(titr->second->attr_->has_key("write_buffer")))) {
                 ++titr;
                 continue;
             }
@@ -263,7 +277,8 @@ void schedule_func_args(const func_c &f,
             SC_MODULE_INFO << "Candidate input arg: " << in_arg;
             if (in_tsr_tick.create_ <= out_tsr_tick.first_access_
                     && in_tsr_tick.delete_ >= out_tsr_tick.delete_
-                    && in_tsr->elem_dtype_ == out_tsr->elem_dtype_) {
+                    && utils::get_sizeof_type(in_tsr->elem_dtype_)
+                            == utils::get_sizeof_type(out_tsr->elem_dtype_)) {
                 // check that the candidate has no writes during the time range
                 // when out_tsr is in use: [out_tsr_tick.first_access_,
                 // out_tsr_tick.last_read_]
@@ -288,7 +303,7 @@ void schedule_func_args(const func_c &f,
                 assert(in_tsr->dims_.size() == 1);
                 int64_t in_tsr_size = get_const_as_int(
                         in_tsr->dims_[0].static_as<constant_c>());
-                if (out_tsr_size > in_tsr_size) {
+                if (out_tsr_size != in_tsr_size) {
                     ++titr;
                     continue;
                 }
@@ -299,7 +314,7 @@ void schedule_func_args(const func_c &f,
                                         && in_arg.ptr_same(e.second);
                             })) {
                     inplace_map.emplace_back(std::make_pair(out_arg, in_arg));
-                    SC_MODULE_INFO << "Inplace reslut: " << out_arg << " use "
+                    SC_MODULE_INFO << "Inplace result: " << out_arg << " use "
                                    << in_arg;
                 }
                 // It is possible that an out arg can inplace multiple in args.
@@ -357,9 +372,9 @@ const_ir_module_ptr tensor_inplace_t::operator()(const_ir_module_ptr f) {
             std::vector<std::pair<size_t, size_t>> inplace_pairs;
             if (!inplace_map.empty()) {
                 for (const auto &out_in : inplace_map) {
-                    size_t out_idx = 0;
-                    size_t in_idx = 0;
-                    for (size_t i = 0; i < entry_f->params_.size(); ++i) {
+                    int out_idx = -1;
+                    int in_idx = -1;
+                    for (int i = 0; i < int(entry_f->params_.size()); ++i) {
                         if (out_in.first.ptr_same(entry_f->params_[i])) {
                             out_idx = i;
                         }
@@ -367,9 +382,13 @@ const_ir_module_ptr tensor_inplace_t::operator()(const_ir_module_ptr f) {
                             in_idx = i;
                         }
                     }
-                    inplace_pairs.emplace_back(std::make_pair(in_idx, out_idx));
+                    if (out_idx >= 0 && in_idx >= 0) {
+                        inplace_pairs.emplace_back(
+                                std::make_pair(in_idx, out_idx));
+                    }
                 }
-                entry_f->attr()[function_attrs::inplace_hint] = inplace_pairs;
+                // entry_f->attr()[function_attrs::inplace_hint] =
+                // inplace_pairs;
             }
         }
 
@@ -377,13 +396,14 @@ const_ir_module_ptr tensor_inplace_t::operator()(const_ir_module_ptr f) {
         auto new_func = scheduler(entry_f);
         // if no changes, continue
         if (new_func == entry_f) { continue; }
+        finder.funcs_.clear();
+        finder.dispatch(entry_f);
         // sync back alias group info to callee functions
         for (auto &funct : finder.funcs_) {
-            if (!funct->body_.defined()) {
-                // if the callee func is decl
-                auto func_def = f->get_func(funct->name_);
-                if (func_def) {
-                    filter_and_sync_inplace_hint(func_def);
+            auto func_def = f->get_func(funct->name_);
+            if (func_def) {
+                filter_and_sync_inplace_hint(funct.get(), func_def);
+                if (func_def != funct) {
                     for (size_t arg_id = 0; arg_id < funct->params_.size();
                             arg_id++) {
                         auto &arg_in_decl = funct->params_[arg_id];

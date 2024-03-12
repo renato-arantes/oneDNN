@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2019-2023 Intel Corporation
+* Copyright 2019-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -17,25 +17,18 @@
 #ifndef GPU_OCL_RNN_REF_RNN_HPP
 #define GPU_OCL_RNN_REF_RNN_HPP
 
-#include <assert.h>
 #include <stdio.h>
 
 #include "common/c_types_map.hpp"
 #include "common/primitive.hpp"
 #include "common/primitive_desc_iterator.hpp"
-#include "common/type_helpers.hpp"
 #include "common/utils.hpp"
-#include "gpu/compute/compute.hpp"
-#include "gpu/gemm/gpu_gemm.hpp"
 #include "gpu/gpu_primitive.hpp"
 #include "gpu/gpu_resource.hpp"
 #include "gpu/gpu_rnn_pd.hpp"
-#include "gpu/ocl/ocl_memory_storage.hpp"
-#include "gpu/ocl/ocl_stream.hpp"
 #include "gpu/ocl/ocl_utils.hpp"
 #include "gpu/ocl/rnn/rnn_utils.hpp"
 #include "gpu/primitive_conf.hpp"
-#include "gpu/utils.hpp"
 
 // TODO just to debug
 #define WS_NAN_FILLING 0
@@ -71,7 +64,6 @@ struct _ref_rnn_common_t : public gpu_primitive_t {
     typedef cell_execution_sig((class_name::*cell_execution_f));
     typedef grid_execution_sig((class_name::*grid_execution_f));
     typedef gemm_sig((class_name::*gemm_t));
-    typedef weights_assign_sig((class_name::*weights_assign_t));
 
     using base_pd_t =
             typename utils::conditional<false || aprop == prop_kind::forward,
@@ -162,7 +154,7 @@ private:
             lws_max = lws_max / l_dim;
         }
 
-        return compute::nd_range_t(gws, lws);
+        return compute::nd_range_t(gws, {lws});
     }
 
     // set the class names
@@ -179,8 +171,6 @@ private:
     elemwise_sig_gru_lbr(gru_lbr_elemwise);
 
     gemm_sig(gemm_primitive);
-
-    weights_assign_sig(assign_weight_offsets);
 
     float (*activation_func)(float dd, float s, float alpha, float cliping)
             = nullptr;
@@ -230,24 +220,8 @@ private:
             const memory_storage_t &diff_src_iter_c,
             const rnn_utils::workspace_t &ws, const float shift,
             const float scale, const bool dequantize) const;
-    status_t ws_set(const exec_ctx_t &ctx,
-            compute::compute_stream_t *compute_stream,
-            const memory_storage_t &workspace, const dim_t ws_offset,
-            const int ws_part, const float val, const dim_t size) const;
-    status_t ws_print(const exec_ctx_t &ctx, compute::compute_stream_t *s,
-            const rnn_utils::workspace_t &workspace) const;
 
-    compute::kernel_t ws_print_kernel_;
-
-    compute::kernel_t bias_prepare_kernel_;
-    compute::kernel_t copy_init_layer_kernel_;
-    compute::kernel_t copy_init_iter_kernel_;
-    compute::kernel_t copy_res_layer_kernel_;
-    compute::kernel_t copy_res_iter_kernel_;
-
-    compute::kernel_t ws_set_kernel_;
-    compute::kernel_t elemwise_fwd_kernel_;
-    compute::kernel_t elemwise_bwd_kernel_;
+    std::vector<compute::kernel_t> kernels_;
 
     // ptrs to GEMM primitives
     std::shared_ptr<primitive_t> gemm_layer_fwd_;

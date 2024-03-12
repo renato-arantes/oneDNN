@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2017-2023 Intel Corporation
+* Copyright 2017-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -45,6 +45,8 @@ dnnl_data_type_t str2dt(const char *str) {
     CASE(boolean);
     CASE(f8_e5m2);
     CASE(f8_e4m3);
+    CASE(s4);
+    CASE(u4);
     CASE(data_type_max);
 #undef CASE
     if (!strcmp("undef", str) || !strcmp("dnnl_data_type_undef", str))
@@ -901,6 +903,10 @@ dnnl_format_tag_t str2fmt_tag(const char *str) {
     CASE(AcB4b8a4b);
     CASE(AcdB4b8a4b);
     CASE(AcdeB4b8a4b);
+    CASE(Ab4a);
+    CASE(Ab8a);
+    CASE(BA4b4a);
+    CASE(BA8b4a);
     CASE(x);
     CASE(nc);
     CASE(cn);

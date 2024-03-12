@@ -1,5 +1,5 @@
 /*******************************************************************************
- * Copyright 2020-2023 Intel Corporation
+ * Copyright 2020-2024 Intel Corporation
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -633,8 +633,9 @@ public:
                     || (v->type_ == intrin_type::list_brgemm
                             && v->check_brgemm_arg_size(
                                     brgemm_args::NUM_FULL_ARGS_LIST)));
-            for (int i = 0; i < brgemm_args::C + 1; i++) {
+            for (auto i = 0UL; i < v->args_.size(); i++) {
                 auto &p = v->args_[i];
+                if (!p.defined()) continue;
                 tensor_c tsr = get_base_tensor_of(p);
                 if (tsr.defined()) {
                     switch (i) {
@@ -654,7 +655,7 @@ public:
                             }
                             break;
                         case brgemm_args::C: set_write_tick(tsr, tick_); break;
-                        default: break;
+                        default: set_read_tick(tsr, tick_); break;
                     }
                 }
             }
@@ -1016,7 +1017,12 @@ static const tensor_node *get_inplace_target_if_single_inplace(
                 return utils::find_map_value(
                         identity_to_tensor, (*v)[0].to_reuse_.get());
             })
-            .map([](const expr_c *v) { return v->as<tensor_c>().get(); })
+            .map([](const expr_c *v) {
+                // identity_to_tensor might map to empty pointer if the identity
+                // is mapped to multiple buffers. Let's filter that out.
+                return *v;
+            })
+            .map([](const expr_c &v) { return v.as<tensor_c>().get(); })
             .filter([base](const tensor_node *v) {
                 return base->elem_dtype_ == v->elem_dtype_
                         && get_const_as_int(
@@ -1059,12 +1065,40 @@ static std::vector<size_t> schedule_tensor_memory_planner(
                 return x->first.checked_as<tensor>()->name_
                         < y->first.checked_as<tensor>()->name_;
             });
+    // collect alias info of func args
+    std::vector<alias_info::tensor_alias_identity_t *> arg_identities;
+    for (auto &itr_ptr : sorted_ticks) {
+        auto &itr = *itr_ptr;
+        auto tsr = itr.first.checked_as<tensor>();
+        if (itr.second.is_arg_) {
+            auto alias_data = alias_info::get_alias_info(*tsr);
+            if (alias_data) { arg_identities.emplace_back(alias_data); }
+        }
+    }
     for (auto &itr_ptr : sorted_ticks) {
         auto &itr = *itr_ptr;
         auto tsr = itr.first.checked_as<tensor>();
         if (itr.second.is_arg_) {
             auto inplace_parent = get_inplace_target_if_single_inplace(
                     identity_to_tensor, tsr.get(), tsr.get());
+            if (inplace_parent) {
+                // if this output buffer in func arg has already an alias with
+                // another arg by arg-tensor-inplace, temp buffers cannot
+                // in-place reuse this buffer
+                auto alias_data = alias_info::get_alias_info(*tsr);
+                if (alias_data) {
+                    for (auto &tid : arg_identities) {
+                        if (tid != alias_data && alias_data->is_alias_of(tid)) {
+                            SC_MODULE_INFO
+                                    << "Cannot in-place reuse output buffer"
+                                    << tsr
+                                    << ", because it is reusing other buffers";
+                            inplace_parent = nullptr;
+                            break;
+                        }
+                    }
+                }
+            }
             while (inplace_parent) {
                 if (auto pinfo = utils::find_map_value(
                             ticks, inplace_parent->node_ptr_from_this())
@@ -1209,6 +1243,9 @@ static std::vector<size_t> schedule_tensor_memory_planner(
                                 = alias_info::get_or_create_alias_info(
                                         *cur_arg);
                         if (!arg.defined()) { arg = cur_arg; }
+                        SC_MODULE_INFO << "inplace-func "
+                                       << callsite->func_->name_
+                                       << " Add arg1:" << cur_arg;
                         cur_aliasinfo->add_to_clique(aliasinfo);
                     }
                 }
@@ -1223,6 +1260,9 @@ static std::vector<size_t> schedule_tensor_memory_planner(
                             auto cur_aliasinfo
                                     = alias_info::get_or_create_alias_info(
                                             *cur_arg);
+                            SC_MODULE_INFO << "inplace-func "
+                                           << callsite->func_->name_
+                                           << " Add arg2:" << cur_arg;
                             cur_aliasinfo->add_to_clique(aliasinfo);
                         }
                     }

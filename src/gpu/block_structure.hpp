@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2021-2023 Intel Corporation
+* Copyright 2021-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -23,6 +23,7 @@
 #include "common/c_types_map.hpp"
 #include "common/memory_desc_wrapper.hpp"
 #include "common/utils.hpp"
+#include "gpu/compute/kernel_arg_list.hpp"
 #include "gpu/serialization.hpp"
 #include "gpu/utils.hpp"
 
@@ -42,7 +43,7 @@ public:
 
     bool operator!=(const stride_t &other) const { return !operator==(other); }
 
-    size_t get_hash() const { return dnnl::impl::gpu::get_hash(this); }
+    size_t get_hash() const { return serialized_t::get_hash(*this); }
 
     operator dim_t() const {
         assert(is_fixed());
@@ -94,6 +95,13 @@ private:
 
     dim_t stride_ = undefined_stride;
 };
+
+namespace compute {
+template <>
+struct scalar_type_traits<stride_t> {
+    static const auto type = scalar_type_t::_long;
+};
+} // namespace compute
 assert_trivially_serializable(stride_t);
 
 inline stride_t operator*(const stride_t &a, const stride_t &b) {
@@ -117,6 +125,12 @@ struct block_t {
     block_t(dim_t dim_idx, dim_t block, const stride_t &stride)
         : dim_idx(dim_idx), block(block), stride(stride) {}
 
+    bool can_merge(const block_t &other, bool same_dim_only = true) const {
+        bool dim_ok = !same_dim_only || (dim_idx == other.dim_idx);
+        bool is_dense = (stride * block == other.stride);
+        return dim_ok && is_dense;
+    }
+
 #if __cplusplus >= 202002L
     // Enabling default operator== on C++20 for validation purposes.
     bool operator==(const block_t &) const = default;
@@ -128,13 +142,13 @@ struct block_t {
 #endif
     bool operator!=(const block_t &other) const { return !(*this == other); }
 
-    size_t get_hash() const { return dnnl::impl::gpu::get_hash(this); }
+    size_t get_hash() const { return serialized_t::get_hash(*this); }
 
     std::string str() const {
         std::ostringstream oss;
         oss << "block_t(dim_idx = " << dim_idx;
         oss << ", block = " << block;
-        oss << ", stride = " << stride;
+        oss << ", stride = " << stride.str();
         oss << ")";
         return oss.str();
     }
@@ -149,9 +163,14 @@ assert_trivially_serializable(block_t);
 
 // Static-sized layout of blocks
 struct block_layout_t {
-#if __cplusplus >= 202002L
-    bool operator==(const block_layout_t &) const = default;
-#endif
+    bool operator==(const block_layout_t &other) const {
+        if (num_blocks != other.num_blocks) return false;
+        return blocks == other.blocks;
+    }
+    bool operator!=(const block_layout_t &other) const {
+        return !operator==(other);
+    }
+
     using value_type = std::array<block_t, DNNL_MAX_NDIMS>;
     using iterator = value_type::iterator;
     using reverse_iterator = value_type::reverse_iterator;
@@ -214,11 +233,20 @@ struct block_layout_t {
     const block_t &operator[](size_t idx) const { return blocks[idx]; }
 
     void append(const block_t &block) { blocks[num_blocks++] = block; }
-    size_t get_hash() const { return dnnl::impl::gpu::get_hash(this); }
+    size_t get_hash() const { return serialized_t::get_hash(*this); }
 
     block_t &operator[](size_t idx) {
         assert(idx < num_blocks);
         return blocks[idx];
+    }
+
+    std::string str() const {
+        std::ostringstream ss;
+        for (size_t i = 0; i < num_blocks; i++) {
+            const auto &block = blocks[i];
+            ss << block.str() << " ";
+        }
+        return ss.str();
     }
 
     block_layout_t normalized(bool remove_size_1_blocks = true) const;

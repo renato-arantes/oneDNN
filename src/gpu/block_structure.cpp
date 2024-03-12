@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2021-2023 Intel Corporation
+* Copyright 2021-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -20,32 +20,18 @@ namespace dnnl {
 namespace impl {
 namespace gpu {
 
-static bool can_combine(
-        const block_t &a, const block_t &b, bool same_dim_only = true) {
-    bool dim_ok = !same_dim_only || (a.dim_idx == b.dim_idx);
-    bool a_then_b = (a.stride * a.block == b.stride);
-    return dim_ok && a_then_b;
-}
-
 block_layout_t block_layout_t::normalized(bool remove_size_1_blocks) const {
     if (num_blocks == 0) return block_layout_t();
     block_layout_t res;
 
-    res.append(blocks.front());
-    auto cur = res.begin();
-    for (size_t i = 1; i < num_blocks; i++) {
-        const auto &block = blocks[i];
-        if (block.block <= 1 && remove_size_1_blocks) continue;
-        if (can_combine(*cur, block)) {
-            cur->stride = std::min(cur->stride, block.stride);
-            cur->block = cur->block * block.block;
-        } else {
-            res.append(block);
-            cur++;
-        }
-    }
+    std::vector<block_t> block_vec(num_blocks);
+    memcpy(&block_vec[0], &blocks[0], num_blocks * sizeof(block_t));
 
-    if (res.front().block <= 1 && remove_size_1_blocks) res.erase(0);
+    std::vector<block_t> new_blocks
+            = normalize_blocks(block_vec, remove_size_1_blocks);
+    for (const block_t &block : new_blocks) {
+        res.append(block);
+    }
 
     return res;
 }
@@ -55,21 +41,15 @@ std::vector<block_t> normalize_blocks(
     if (blocks.empty()) return {};
     std::vector<block_t> res;
 
-    res.emplace_back(blocks.front());
-    auto *cur = &res.back();
-    for (size_t i = 1; i < blocks.size(); i++) {
-        const auto &block = blocks[i];
-        if (block.block == 1 && remove_size_1_blocks) continue;
-        if (can_combine(*cur, block)) {
-            cur->stride = std::min(cur->stride, block.stride);
-            cur->block = cur->block * block.block;
+    for (const block_t &block : blocks) {
+        if (remove_size_1_blocks && block.block == 1) continue;
+
+        if (!res.empty() && res.back().can_merge(block)) {
+            res.back().block *= block.block;
         } else {
             res.emplace_back(block);
-            cur = &res.back();
         }
     }
-
-    if (res.front().block == 1 && remove_size_1_blocks) res.erase(res.begin());
 
     return res;
 }

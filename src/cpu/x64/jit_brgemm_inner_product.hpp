@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2020-2023 Intel Corporation
+* Copyright 2020-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -24,12 +24,14 @@
 #include "common/utils.hpp"
 
 #include "cpu/cpu_inner_product_pd.hpp"
+#include "cpu/scale_utils.hpp"
 
 #include "cpu/x64/amx_tile_configure.hpp"
 #include "cpu/x64/brgemm/brgemm.hpp"
 #include "cpu/x64/brgemm/brgemm_containers.hpp"
 #include "cpu/x64/cpu_barrier.hpp"
 #include "cpu/x64/cpu_reducer.hpp"
+#include "cpu/x64/jit_avx512_core_scale_precompute.hpp"
 #include "cpu/x64/jit_brgemm_inner_product_utils.hpp"
 #include "cpu/x64/jit_brgemm_post_ops.hpp"
 #include "cpu/x64/jit_brgemm_transpose_utils.hpp"
@@ -60,20 +62,35 @@ struct brgemm_inner_product_fwd_t : public primitive_t {
             const bool is_int8 = one_of(src_dt, u8, s8);
 
             using skip_mask_t = primitive_attr_t::skip_mask_t;
-            auto skip_mask = skip_mask_t::post_ops | skip_mask_t::sum_dt;
+            auto skip_mask = skip_mask_t::post_ops | skip_mask_t::sum_dt
+                    | skip_mask_t::fpmath_mode;
             if (is_int8) skip_mask |= skip_mask_t::scales_runtime;
 
-            bool ok = is_fwd() && mayiuse(isa)
-                    && expect_data_types(src_dt, wei_dt, data_type::undef,
-                            dst_dt, data_type::undef)
-                    && IMPLICATION(with_bias() && is_int8,
-                            one_of(bias_md_.data_type, f32, bf16, s32, s8, u8))
-                    && IMPLICATION(with_bias() && !is_int8,
-                            one_of(bias_md_.data_type, f32, src_dt))
-                    && attr()->has_default_values(skip_mask, dst_dt)
-                    && attr()->post_ops_.check_sum_consistency(dst_dt, is_int8)
-                    && !has_zero_dim_memory() && arg_scales_ok();
-            if (!ok) return status::unimplemented;
+            if (!mayiuse(isa)) return status::unimplemented;
+
+            VDISPATCH_INNER_PRODUCT(is_fwd(), VERBOSE_BAD_PROPKIND);
+            VDISPATCH_INNER_PRODUCT(
+                    expect_data_types(src_dt, wei_dt, data_type::undef, dst_dt,
+                            data_type::undef),
+                    VERBOSE_UNSUPPORTED_DT);
+            VDISPATCH_INNER_PRODUCT(
+                    IMPLICATION(with_bias() && is_int8,
+                            one_of(bias_md_.data_type, f32, bf16, s32, s8, u8)),
+                    VERBOSE_UNSUPPORTED_DT);
+            VDISPATCH_INNER_PRODUCT(
+                    IMPLICATION(with_bias() && !is_int8,
+                            one_of(bias_md_.data_type, f32, src_dt)),
+                    VERBOSE_UNSUPPORTED_DT);
+            VDISPATCH_INNER_PRODUCT(
+                    attr()->has_default_values(skip_mask, dst_dt),
+                    VERBOSE_UNSUPPORTED_ATTR);
+            VDISPATCH_INNER_PRODUCT(
+                    attr()->post_ops_.check_sum_consistency(dst_dt, is_int8),
+                    VERBOSE_UNSUPPORTED_POSTOP);
+            VDISPATCH_INNER_PRODUCT(
+                    !has_zero_dim_memory(), VERBOSE_EMPTY_TENSOR, "");
+            VDISPATCH_INNER_PRODUCT(
+                    arg_scales_ok(), VERBOSE_UNSUPPORTED_SCALES_CFG);
 
             CHECK(jbgp_.init_conf(isa, *desc(), src_md_, weights_md_, dst_md_,
                     bias_md_, attr_, dnnl_get_max_threads()));
@@ -118,7 +135,7 @@ struct brgemm_inner_product_fwd_t : public primitive_t {
                     brgattr.use_uker = jbgp_.use_uker;
                     brgattr.use_interleave_stores = jbgp_.use_interleave_stores;
                     brgattr.hint_prefetching = jbgp_.hint_prefetching;
-                    brgattr.fpmath_mode = attr()->fpmath_mode_;
+                    brgattr.fpmath_mode = attr()->fpmath_.mode_;
                 }
                 if (are_post_ops_applicable && jbgp_.nthr_ic_b > 1) {
                     brgattr.generate_skip_accumulation = true;
@@ -199,6 +216,20 @@ struct brgemm_inner_product_fwd_t : public primitive_t {
                     acc_ker_, new cpu_accumulator_1d_t<data_type::f32>()));
             CHECK(acc_ker_->create_kernel());
         }
+
+        // JIT to precompute scales
+        const bool is_jit_supported = mayiuse(avx512_core);
+        const auto attr = pd()->attr();
+        if (is_jit_supported && req_copy_scales(attr)) {
+            const auto &attr_scales = attr->scales_;
+            int wei_scale_mask = attr_scales.get(DNNL_ARG_WEIGHTS).mask_;
+            if (wei_scale_mask != 0) {
+                CHECK(safe_ptr_assign(jit_scale_precompute_,
+                        new jit_avx512_core_scale_precompute_t()));
+                CHECK(jit_scale_precompute_->create_kernel());
+            }
+        }
+
         return status::success;
     }
 
@@ -214,6 +245,7 @@ private:
             brg_kernels_[brgemm_inner_product_utils::max_num_brg_kernels_ip];
     std::unique_ptr<jit_brgemm_copy_to_coarse_t> copy_src_kernel_;
     std::unique_ptr<cpu_accumulator_1d_t<data_type::f32>> acc_ker_;
+    std::unique_ptr<jit_avx512_core_scale_precompute_t> jit_scale_precompute_;
     brgemm_containers::brgemm_palette_container_t brgemm_palettes_ {
             brgemm_inner_product_utils::max_num_brg_kernels_ip};
 };
@@ -229,19 +261,29 @@ struct brgemm_inner_product_bwd_data_t : public primitive_t {
                 brgemm_inner_product_bwd_data_t);
 
         status_t init(engine_t *engine) {
+            using skip_mask_t = primitive_attr_t::skip_mask_t;
 
             auto diff_src_dt = invariant_src_md()->data_type;
             auto diff_dst_dt = invariant_dst_md()->data_type;
             auto wei_dt = invariant_wei_md()->data_type;
 
-            bool ok = true && desc()->prop_kind == prop_kind::backward_data
-                    && !has_zero_dim_memory() && mayiuse(isa)
-                    && utils::one_of(diff_dst_dt, data_type::f32,
-                            data_type::bf16, data_type::f16)
-                    && wei_dt == diff_dst_dt
-                    && utils::one_of(diff_src_dt, data_type::f32, diff_dst_dt)
-                    && attr()->has_default_values();
-            if (!ok) return status::unimplemented;
+            if (!mayiuse(isa)) return status::unimplemented;
+            VDISPATCH_INNER_PRODUCT(
+                    desc()->prop_kind == prop_kind::backward_data,
+                    VERBOSE_BAD_PROPKIND);
+            VDISPATCH_INNER_PRODUCT(
+                    !has_zero_dim_memory(), VERBOSE_EMPTY_TENSOR, "");
+            VDISPATCH_INNER_PRODUCT(utils::one_of(diff_dst_dt, data_type::f32,
+                                            data_type::bf16, data_type::f16),
+                    VERBOSE_UNSUPPORTED_DT);
+            VDISPATCH_INNER_PRODUCT(wei_dt == diff_dst_dt,
+                    VERBOSE_INCONSISTENT_DT, "weights", "diff_dst");
+            VDISPATCH_INNER_PRODUCT(
+                    utils::one_of(diff_src_dt, data_type::f32, diff_dst_dt),
+                    VERBOSE_UNSUPPORTED_DT);
+            VDISPATCH_INNER_PRODUCT(
+                    attr()->has_default_values(skip_mask_t::fpmath_mode),
+                    VERBOSE_UNSUPPORTED_ATTR);
 
             memory_desc_t dummy_bias_md;
             CHECK(jbgp_.init_conf(isa, *desc(), diff_src_md_, weights_md_,
@@ -286,7 +328,7 @@ struct brgemm_inner_product_bwd_data_t : public primitive_t {
                     brgattr.use_uker = jbgp_.use_uker;
                     brgattr.use_interleave_stores = jbgp_.use_interleave_stores;
                     brgattr.hint_prefetching = jbgp_.hint_prefetching;
-                    brgattr.fpmath_mode = attr()->fpmath_mode_;
+                    brgattr.fpmath_mode = attr()->fpmath_.mode_;
 
                     CHECK(brgemm_desc_set_attr(&brg, brgattr));
                     jbgp_.amx_buf_size_per_thread
@@ -394,19 +436,29 @@ struct brgemm_inner_product_bwd_weights_t : public primitive_t {
                 brgemm_inner_product_bwd_weights_t);
 
         status_t init(engine_t *engine) {
+            using skip_mask_t = primitive_attr_t::skip_mask_t;
 
             auto src_dt = invariant_src_md()->data_type;
             auto diff_wei_type = invariant_wei_md()->data_type;
             auto diff_dst_type = invariant_dst_md()->data_type;
 
-            bool ok = true && desc()->prop_kind == prop_kind::backward_weights
-                    && !has_zero_dim_memory() && mayiuse(isa)
-                    && utils::one_of(src_dt, data_type::f32, data_type::bf16,
-                            data_type::f16)
-                    && diff_dst_type == src_dt
-                    && utils::one_of(diff_wei_type, data_type::f32, src_dt)
-                    && attr()->has_default_values();
-            if (!ok) return status::unimplemented;
+            if (!mayiuse(isa)) return status::unimplemented;
+            VDISPATCH_INNER_PRODUCT(
+                    desc()->prop_kind == prop_kind::backward_weights,
+                    VERBOSE_BAD_PROPKIND);
+            VDISPATCH_INNER_PRODUCT(
+                    !has_zero_dim_memory(), VERBOSE_EMPTY_TENSOR, "");
+            VDISPATCH_INNER_PRODUCT(utils::one_of(src_dt, data_type::f32,
+                                            data_type::bf16, data_type::f16),
+                    VERBOSE_UNSUPPORTED_DT);
+            VDISPATCH_INNER_PRODUCT(diff_dst_type == src_dt,
+                    VERBOSE_INCONSISTENT_DT, "diff_dst", "src");
+            VDISPATCH_INNER_PRODUCT(
+                    utils::one_of(diff_wei_type, data_type::f32, src_dt),
+                    VERBOSE_UNSUPPORTED_DT);
+            VDISPATCH_INNER_PRODUCT(
+                    attr()->has_default_values(skip_mask_t::fpmath_mode),
+                    VERBOSE_UNSUPPORTED_ATTR);
 
             CHECK(jbgp_.init_conf(isa, *desc(), src_md_, diff_weights_md_,
                     diff_dst_md_, diff_bias_md_, attr_,
@@ -449,7 +501,7 @@ struct brgemm_inner_product_bwd_weights_t : public primitive_t {
                     brgattr.use_uker = jbgp_.use_uker;
                     brgattr.use_interleave_stores = jbgp_.use_interleave_stores;
                     brgattr.hint_prefetching = jbgp_.hint_prefetching;
-                    brgattr.fpmath_mode = attr()->fpmath_mode_;
+                    brgattr.fpmath_mode = attr()->fpmath_.mode_;
 
                     CHECK(brgemm_desc_set_attr(&brg, brgattr));
                     jbgp_.amx_buf_size_per_thread

@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2020-2023 Intel Corporation
+* Copyright 2020-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -14,10 +14,10 @@
 * limitations under the License.
 *******************************************************************************/
 
-#include <mutex>
 #include <thread>
 #include <type_traits>
 
+#include "common/type_helpers.hpp"
 #include "gpu/compute/device_info.hpp"
 
 #ifdef DNNL_WITH_SYCL
@@ -79,7 +79,9 @@ bool device_info_t::has_native(data_type_t type) const {
         case data_type::boolean: return true;
         case data_type::f64: return has(device_ext_t::khr_fp64);
         case data_type::bf16: return has(device_ext_t::future_bf16_cvt);
-        case data_type::f8_e5m2:
+        case data_type::f8_e5m2: return gpu_arch_ >= gpu_arch_t::xe_hpc;
+        case data_type::u4:
+        case data_type::s4:
         case data_type::f8_e4m3: return false;
         default: return false;
     }
@@ -113,9 +115,22 @@ int device_info_t::max_subgroup_size(gpu_arch_t gpu_arch) {
     return 16;
 }
 
-int device_info_t::max_exec_size(gpu_arch_t gpu_arch) {
+int device_info_t::min_subgroup_size() const {
+    switch (gpu_arch()) {
+        case gpu_arch_t::gen9:
+        case gpu_arch_t::gen11:
+        case gpu_arch_t::xe_lp:
+        case gpu_arch_t::xe_hp:
+        case gpu_arch_t::xe_hpg: return 8;
+        case gpu_arch_t::xe_hpc:
+        case gpu_arch_t::xe2: return 16;
+        default: return 0;
+    }
+}
 
+int device_info_t::max_exec_size(gpu_arch_t gpu_arch) {
     switch (gpu_arch) {
+        case gpu::compute::gpu_arch_t::xe2:
         case gpu::compute::gpu_arch_t::xe_hpc: return 128;
         default: return 64;
     }

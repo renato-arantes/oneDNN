@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2019-2023 Intel Corporation
+* Copyright 2019-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -149,6 +149,7 @@ struct prb_t : public prb_vdims_t {
     sparse_options_t sparse_options;
 #endif
 
+    bool inplace = false; // Lacks placement, always considered `false`.
     attr_t attr;
     thr_ctx_t ctx_init, ctx_exe;
 
@@ -180,6 +181,13 @@ struct prb_t : public prb_vdims_t {
         return prb_vdims_t::get_broadcast_mask(1);
     }
     int bias_broadcast_mask() const { return bia_mask; }
+
+    bool weights_decompression() const {
+        return src_dt() != dnnl_s8 && src_dt() != dnnl_u8
+                && (wei_dt() == dnnl_s8 || wei_dt() == dnnl_u8
+                        || wei_dt() == dnnl_s4 || wei_dt() == dnnl_u4)
+                && attr.fpmath_mode.apply_to_int;
+    }
 
     dnnl_data_type_t src_dt() const { return dt[0]; }
     dnnl_data_type_t wei_dt() const { return dt[1]; }
@@ -285,7 +293,7 @@ void setup_cmp(compare::compare_t &cmp, const prb_t *prb, data_kind_t kind,
         const args_t &ref_args);
 std::vector<int> supported_exec_args(dir_t dir);
 int init_ref_memory_args(dnn_mem_map_t &ref_mem_map, dnn_mem_map_t &mem_map,
-        dnnl_primitive_t prim, const prb_t *prb, res_t *res, dir_t dir,
+        dnnl_primitive_t prim, const prb_t *prb, res_t *res,
         dnnl_primitive_t prim_ref = nullptr);
 
 void skip_unimplemented_prb(const prb_t *prb, res_t *res);

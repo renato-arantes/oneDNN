@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2023 Intel Corporation
+* Copyright 2023-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -263,11 +263,11 @@ private:
         auto &prb = cfg.prb();
         bool is_dpas = cfg.is_dp_fma();
         int rdims = 0;
-        for (auto d : iter_) {
+        for (auto &d : iter_) {
             if (is_reduction_dim(d, prb)) rdims++;
         }
         bool is_fused_reduction = (rdims > 1);
-        for (auto d : iter_) {
+        for (auto &d : iter_) {
             auto &info = tile_info(d);
             int unit = 1;
             if (is_vectorized_dim(d, prb)) unit = cfg.vec_size();
@@ -303,7 +303,7 @@ private:
             // Reduce min block size for mad/x8 as it requires a lot of
             // additional space for x8 -> s16 reorder.
             int min_m_iter_block_hint = 2;
-            for (auto d : iter_) {
+            for (auto &d : iter_) {
                 if (to_gemm(d, prb) != prb_dims::m) continue;
                 auto &info = tile_info(d);
                 int blk = std::min(info.min_iter_blk, min_m_iter_block_hint);
@@ -319,7 +319,7 @@ private:
         int rdims = 0;
         prb_dim_t d0;
         prb_dim_t d1;
-        for (auto d : iter_) {
+        for (auto &d : iter_) {
             if (!is_reduction_dim(d, prb)) continue;
             rdims++;
             (d0.is_undef() ? d0 : d1) = d;
@@ -361,7 +361,7 @@ private:
             auto shape = cfg.shape(/*pad=*/true);
             std::vector<loop_dim_t> loop_dims;
             const int iter_dim_hint = 16;
-            for (auto d : loop_) {
+            for (auto &d : loop_) {
                 if (any(tile_info(d).flags & tile_flags_t::loop_iter_unroll))
                     continue;
                 loop_dim_t ld;
@@ -375,14 +375,18 @@ private:
                     [&](const loop_dim_t &a, const loop_dim_t &b) {
                         return a.size > b.size;
                     });
-            // For XeHPG and earlier hardware use only linear loops with SLM
-            // pipelining to avoid overflowing icache. Prefetch pipeline can
-            // handle nested loops without fully unrolling them.
-            int max_loop_ndims = (cfg.hw() <= ngen::HW::XeHPG ? 1 : 2);
-            for (int i = max_loop_ndims; i < (int)loop_dims.size(); i++)
-                loop_dims[i].dim = prb_dim_t();
 
-            for (auto d : loop_) {
+            // Deterministic mode doesn't allow reduction splitting between threadgroups.
+            if (!prb.deterministic) {
+                // For XeHPG and earlier hardware use only linear loops with SLM
+                // pipelining to avoid overflowing icache. Prefetch pipeline can
+                // handle nested loops without fully unrolling them.
+                int max_loop_ndims = (cfg.hw() <= ngen::HW::XeHPG ? 1 : 2);
+                for (int i = max_loop_ndims; i < (int)loop_dims.size(); i++)
+                    loop_dims[i].dim = prb_dim_t();
+            }
+
+            for (auto &d : loop_) {
                 auto &info = tile_info(d);
                 if (any(info.flags & tile_flags_t::loop_iter_unroll)) continue;
                 if (!loop_dim_t::find(d, loop_dims))
@@ -516,8 +520,13 @@ public:
         check_mask_ = 0;
         optional_check_mask_ = 0;
         set_check(optional_check_mask_, check_kind_t::limit_k_iter);
-        set_check(optional_check_mask_,
-                check_kind_t::check_k_slicing_utilization);
+        if (cfg_.prb().deterministic) {
+            set_check(check_kind_t::check_deterministic);
+        } else {
+            set_check(optional_check_mask_,
+                    check_kind_t::check_k_slicing_utilization);
+            set_check(check_kind_t::check_k_slicing_utilization);
+        }
         set_check(check_kind_t::check_vec);
         set_check(check_kind_t::check_tg_size);
         set_check(check_kind_t::check_dpas);
@@ -525,7 +534,6 @@ public:
         set_check(check_kind_t::check_slm_usage);
         set_check(check_kind_t::check_bwd_d_optimize);
         set_check(check_kind_t::check_layouts);
-        set_check(check_kind_t::check_k_slicing_utilization);
         set_check(check_kind_t::limit_m_iter);
         set_check(check_kind_t::limit_n_iter);
         set_check(check_kind_t::limit_k_iter);
@@ -552,6 +560,7 @@ public:
         if (!check_bwd_d_optimize_ok(ctx)) return false;
         if (!check_layouts_ok(ctx)) return false;
         if (!check_k_slicing_utilization_ok(ctx)) return false;
+        if (!check_deterministic_ok(ctx)) return false;
         if (!limit_m_iter_ok(ctx)) return false;
         if (!limit_n_iter_ok(ctx)) return false;
         if (!limit_k_iter_ok(ctx)) return false;
@@ -583,7 +592,7 @@ private:
 
             // Use 2x reduction when the reduction dimension is dense to avoid
             // partial cache line loads.
-            for (auto d : blk.iter())
+            for (auto &d : blk.iter())
                 if (is_reduction_dim(d, cfg.prb()))
                     if (is_inner_non_blocked(cfg, d)) return true;
 
@@ -617,6 +626,7 @@ private:
         check_bwd_d_optimize,
         check_layouts,
         check_k_slicing_utilization,
+        check_deterministic,
         limit_m_iter,
         limit_n_iter,
         limit_k_iter,
@@ -660,7 +670,7 @@ private:
         if (!is_enabled(check_kind_t::check_vec)) return true;
 
         int vec_ndims = 0;
-        for (auto d : ctx.blk.iter()) {
+        for (auto &d : ctx.blk.iter()) {
             if (is_vectorized_dim(d, cfg_.prb())) vec_ndims++;
         }
         return vec_ndims == 1;
@@ -672,7 +682,7 @@ private:
         auto &tg = ctx.blk.thread_group();
         int tg_size = 1;
         int max_tg = 1;
-        for (auto d : tg) {
+        for (auto &d : tg) {
             tg_size *= tg[d];
             max_tg = std::max(tg[d], max_tg);
         }
@@ -835,6 +845,12 @@ private:
         return true;
     }
 
+    bool check_deterministic_ok(const context_t &ctx) const {
+        if (!is_enabled(check_kind_t::check_deterministic)) return true;
+        int k = padded_gemm_shape_.get(prb_dims::k, 1);
+        return ctx.k_loop * ctx.k_iter >= k;
+    }
+
     int hint_min_m_iter() const {
         if (is_mad_x8_non_dw(cfg_)) return min_mad_x8_non_dw_m_iter_;
         return min_m_iter_;
@@ -843,7 +859,7 @@ private:
     int min_m_iter(const context_t &ctx) const {
         auto &prb = cfg_.prb();
         int max_blk = 1;
-        for (auto d : ctx.blk.iter()) {
+        for (auto &d : ctx.blk.iter()) {
             if (to_gemm(d, prb) == prb_dims::m) {
                 int d_blk = inner_block(cfg_, d);
                 max_blk = std::max(max_blk, d_blk);
@@ -940,11 +956,15 @@ conv_blocking_scheme_t bwd_d_T_o_I_wio("ls:[oc,kd,kh,kw],T:[oc],i:[iw,ic,oc]");
 conv_blocking_scheme_t bwd_d_dw_T_w_I_wgk("ls:[kd,kh,kw],T:[iw],i:[iw,g,kw]");
 conv_blocking_scheme_t bwd_d_dw_T_w_I_ngk("ls:[kd,kh,kw],T:[iw],i:[mb,g,kw]");
 conv_blocking_scheme_t bwd_w_T_io_I_ion("l:[oh,ow],li:[mb],T:[oc,ic],i:[ic,oc,mb]");
+conv_blocking_scheme_t bwd_w_T_io_I_ion_d("ls:[mb,od,oh,ow],T:[oc,ic],i:[ic,oc,mb]");
 conv_blocking_scheme_t bwd_w_T_io_I_kon("l:[oh,ow],li:[mb],T:[oc,ic],i:[kw,oc,mb]");
 conv_blocking_scheme_t bwd_w_T_io_I_ikon("l:[oh,ow],li:[mb],T:[oc,ic],i:[ic,kw,oc,mb]");
 conv_blocking_scheme_t bwd_w_dw_I_gw("l:[mb,oh,ow],i:[g,ow]");
+conv_blocking_scheme_t bwd_w_dw_I_gw_d("ls:[mb,od,oh,ow],i:[g,ow]");
 conv_blocking_scheme_t bwd_w_dw_I_gn("l:[mb,oh,ow],i:[g,mb]");
+conv_blocking_scheme_t bwd_w_dw_I_gn_d("ls:[mb,od,oh,ow],i:[g,mb]");
 conv_blocking_scheme_t bwd_w_T_io_I_iow("l:[mb,oh,ow],T:[oc,ic],i:[ic,oc,ow]");
+conv_blocking_scheme_t bwd_w_T_io_I_iow_d("ls:[mb,od,oh,ow],T:[oc,ic],i:[ic,oc,ow]");
 conv_blocking_scheme_t bwd_w_T_io_I_ikow("l:[mb,oh,ow],T:[oc,ic],i:[ic,kw,oc,ow]");
 } // namespace conv_schemes
 // clang-format on
@@ -967,7 +987,7 @@ prb_dim_t select_non_blocked_iter_dim(
         const conv_config_t &cfg, const std::vector<prb_dim_t> &dims) {
     const auto shape = cfg.shape(/*pad=*/false);
     std::vector<double> scores;
-    for (auto d : dims)
+    for (auto &d : dims)
         scores.push_back(get_iter_dim_score(d, cfg, shape[d]));
     auto max_it = std::max_element(scores.begin(), scores.end());
     return dims[max_it - scores.begin()];
@@ -979,7 +999,7 @@ prb_dim_t select_iter_dim(
             bwd_d_optimize_kind_t::skip_strided_dhw,
             bwd_d_optimize_kind_t::skip_out_of_bound_w);
     std::vector<prb_dim_t> dims;
-    for (auto d : _dims) {
+    for (auto &d : _dims) {
         if (is_bwd_d_w_opt && d == prb_dims::iw) continue;
         dims.push_back(d);
     }
@@ -1032,6 +1052,8 @@ conv_blocking_scheme_list_t get_blocking_schemes_bwd_w_dw(
     bool k_is_ow = (k_iter_dim == prb_dims::ow);
     ret.add(k_is_mb, conv_schemes::bwd_w_dw_I_gn);
     ret.add(k_is_ow, conv_schemes::bwd_w_dw_I_gw);
+    ret.add(k_is_mb && cfg.prb().deterministic, conv_schemes::bwd_w_dw_I_gn_d);
+    ret.add(k_is_ow && cfg.prb().deterministic, conv_schemes::bwd_w_dw_I_gw_d);
     return ret;
 }
 
@@ -1091,6 +1113,8 @@ conv_blocking_scheme_list_t get_blocking_schemes_bwd_w(
     ret.add(k_is_mb && small_ic, conv_schemes::bwd_w_T_io_I_kon);
     ret.add(k_is_mb && small_ic, conv_schemes::bwd_w_T_io_I_ikon);
     ret.add(k_is_ow && small_ic, conv_schemes::bwd_w_T_io_I_ikow);
+    ret.add(cfg.prb().deterministic, conv_schemes::bwd_w_T_io_I_ion_d);
+    ret.add(cfg.prb().deterministic, conv_schemes::bwd_w_T_io_I_iow_d);
     return ret;
 }
 
@@ -1407,18 +1431,20 @@ public:
         return params_gen_.can_move_next();
     }
 
-    void set_params(prim_config_t &cfg) {
+    void set_params(conv_config_t &cfg) {
+        init_regs(cfg);
         if (is_tuning_mode()) {
             tuner_->move_next();
             tuner_->set_params(cfg);
         } else {
-            params_gen_.move_next();
+            if (!try_small_grf_) params_gen_.move_next();
             params_gen_.set_params(cfg);
+            maybe_try_small_grf(cfg);
         }
     }
 
     void notify_out_of_registers(const conv_config_t &cfg) {
-        if (is_tuning_mode()) return;
+        if (is_tuning_mode() || cfg.regs() != default_regs(cfg)) return;
         grf_usage_limit_ = estimate_register_count(cfg) * cfg.grf_size();
     }
 
@@ -1450,7 +1476,9 @@ private:
         std::vector<level_tile_set_t> level_tile_sets;
         for (auto &s : get_blocking_schemes(cfg))
             level_tile_sets.emplace_back(s.make_level_tile_set(padded_shape));
-        conv_blocking_checker_t chk(cfg);
+        auto try_cfg = cfg;
+        init_regs(try_cfg);
+        conv_blocking_checker_t chk(try_cfg);
         const int simd_size = cfg.vec_size();
         const int tune_level = conv_tune_level();
 
@@ -1465,16 +1493,10 @@ private:
                 break;
                 break;
             case tiler_mode_t::lookup: {
-                const bool transposed = cfg.prb().ab_swap_transpose;
                 const auto params = const_conv_lookup_table().find(cfg.key());
-                if (!params.is_empty()
-                        && (!transposed || chk.is_ok(params.blocking()))) {
-                    if (transposed) {
-                        params_gen_ = params_generator_t(tune_level, simd_size,
-                                chk, level_tile_sets, params);
-                    } else {
-                        params_gen_ = params_generator_t(params);
-                    }
+                if (!params.is_empty() && chk.is_ok(params.blocking())) {
+                    params_gen_ = params_generator_t(tune_level, simd_size, chk,
+                            level_tile_sets, params);
                 } else {
                     mode_ = tiler_mode_t::model;
                     params_gen_ = params_generator_t(
@@ -1503,6 +1525,27 @@ private:
         if (tiler_params().do_list) print_all();
     }
 
+    void maybe_try_small_grf(conv_config_t &cfg) {
+        auto try_cfg = cfg;
+        init_kernel_grid(try_cfg);
+        init_thread_group_grid(try_cfg);
+        int kg_elems = try_cfg.kernel_grid().elems(),
+            tg_elems = try_cfg.thread_group_grid().elems();
+        try_cfg.set_regs(128);
+        int new_wave_util = conv_config_t::get_wave_utilization(
+                try_cfg.exec_cfg(), kg_elems, tg_elems);
+        int wave_util = conv_config_t::get_wave_utilization(
+                cfg.exec_cfg(), kg_elems, tg_elems);
+        if (wave_util > 90 && new_wave_util >= wave_util && !try_small_grf_
+                && cfg.regs() > 128
+                && !cfg.exec_cfg_param().is_overridden("regs")) {
+            cfg.set_regs(128);
+            try_small_grf_ = true;
+        } else {
+            try_small_grf_ = false;
+        }
+    }
+
     void print_info(double init_time_ms) {
         ir_info() << "Convolution tiler:" << std::endl;
         ir_info() << "  Mode:              " << to_string(mode_) << std::endl;
@@ -1514,6 +1557,7 @@ private:
     params_generator_t params_gen_;
     conv_tuner_t *tuner_ = nullptr;
     int grf_usage_limit_ = 0;
+    bool try_small_grf_ = false;
 };
 
 conv_tiler_t::conv_tiler_t(const conv_config_t &cfg)
@@ -1531,7 +1575,7 @@ bool conv_tiler_t::can_move_next() const {
     return impl_->can_move_next();
 }
 
-void conv_tiler_t::set_params(prim_config_t &cfg) {
+void conv_tiler_t::set_params(conv_config_t &cfg) {
     impl_->set_params(cfg);
 }
 

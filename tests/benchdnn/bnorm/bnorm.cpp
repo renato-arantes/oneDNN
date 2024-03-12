@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2017-2023 Intel Corporation
+* Copyright 2017-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -25,6 +25,7 @@
 
 #include "oneapi/dnnl/dnnl.h"
 
+#include "utils/fill.hpp"
 #include "utils/parallel.hpp"
 
 #include "dnnl_common.hpp"
@@ -34,133 +35,149 @@
 
 namespace bnorm {
 
-static int prepare_fwd_with_stats(const prb_t *prb, const dnn_mem_t &src,
-        const dnn_mem_t &src_add, const dnn_mem_t &mean, const dnn_mem_t &var,
-        const dnn_mem_t &sc, const dnn_mem_t &sh, res_t *res) {
-    const bool use_sc = prb->use_sc();
-    const bool use_sh = prb->use_sh();
-    const bool fill_src_add = prb->fuse_add_relu();
+int fill_mean(const prb_t *prb, const cfg_t &cfg, dnn_mem_t &mem_fp,
+        dnn_mem_t &mem_dt) {
+    // Refer to modes documentation for filling principles.
+    if (has_bench_mode_bit(mode_bit_t::bitwise)) {
+        // Mean must be computed unless it is passed by user directly.
+        if (!(prb->flags & GLOB_STATS)) return OK;
+
+        return fill_random_real(mem_dt, mem_fp, nullptr);
+    }
 
     benchdnn_parallel_nd(prb->ic, [&](int64_t c) {
-        mean.set_elem(c, 4 * ((c % 5) - 2));
-        var.set_elem(c, ((c % 7) << 1));
-
-        const float sc_value = 1 << (c % 7);
-        const float sh_value = ((c % 3) - 1) * sc_value;
-        if (use_sc) sc.set_elem(c, sc_value);
-        if (use_sh) sh.set_elem(c, sh_value);
+        float val = 0.f;
+        if (cfg.check_alg_ != ALG_0 || (prb->flags & GLOB_STATS))
+            val = 0.25f * (1 << (c % 7));
+        mem_fp.set_elem(c, val);
     });
 
-    benchdnn_parallel_nd(prb->ic, prb->mb, prb->id, prb->ih, prb->iw,
-            [&](int64_t c, int64_t mb, int64_t d, int64_t h, int64_t w) {
-                int64_t l_base = mb * prb->id * prb->ih * prb->iw + c * 239 * 2;
-                float *s = (float *)src + data_off(prb, mb, c, 0, 0, 0);
-
-                const int64_t sp = d * prb->ih * prb->iw + h * prb->iw + w;
-                const int64_t l = l_base + sp;
-                const int64_t value = (l % 65) - 32;
-                s[sp] = round_to_nearest_representable(prb->dt, value);
-                if (fill_src_add) {
-                    float *s_add
-                            = (float *)src_add + data_off(prb, mb, c, 0, 0, 0);
-                    s_add[sp] = round_to_nearest_representable(
-                            prb->dt, (l % 17) - 8);
-                }
-            });
+    if (mem_dt && prb->use_stats()) SAFE(mem_dt.reorder(mem_fp), WARN);
 
     return OK;
 }
 
-static int prepare_fwd_no_stats(const prb_t *prb, const dnn_mem_t &src,
-        const dnn_mem_t &src_add, const dnn_mem_t &mean, const dnn_mem_t &var,
-        const dnn_mem_t &sc, const dnn_mem_t &sh, res_t *res) {
-    /** Idea: choose src[] values so that both mean and variance are computed
-     * exactly (independently of the order of the computations).
-     *
-     * The `exactness` is achieved via [a1]: src[i] + src[i+1] = 2 * mean.
-     *
-     * The variation in src is allowed in the last flex_bits bits.
-     * If the sequence (L) is too big (flex_bits <= min_flex_bits), the mean
-     * value is set to 0 and src is partially filled with zeros (according to
-     * density so that at least want_flex_bits is reserved for src variation.
-     * Once src is set, variance is computed.
-     *
-     * ALG_0: mean is set to 0
-     * ALG_1: mean is set to 2^prb, where prb \in {-2, -1, ..., 4}
-     * ALG_AUTO: choose between ALG_0 and ALG_1 automatically */
-    const int64_t exact_bits = digits_dt(prb->dt);
-    const int64_t L = prb->mb * prb->id * prb->ih * prb->iw;
-    const int64_t logL = (int64_t)ceilf(log2f(L));
-
-    assert(logL <= 0 || (1LL << (logL - 1)) < L);
-    assert(L <= (1LL << logL));
-
-    const int64_t min_flex_bits = 3;
-    const int64_t want_flex_bits = MIN2(6, exact_bits / 2);
-
-    check_alg_t alg = prb->check_alg;
-    if (alg == ALG_AUTO) /* choose appropriate checking algorithm */
-        alg = (exact_bits - logL) / 2 - 1 >= min_flex_bits ? ALG_1 : ALG_0;
-
-    const int64_t flex_bits = alg == ALG_0
-            ? want_flex_bits /* BFloat16 has only 7 bits of mantissa */
-            : MIN2(prb->dt == dnnl_bf16 ? 7 : exact_bits,
-                    (exact_bits - logL) / 2 - 1);
-
-    if (flex_bits < min_flex_bits) {
-        res->state = UNTESTED;
-        return FAIL;
+int fill_src(const prb_t *prb, const cfg_t &cfg, dnn_mem_t &mem_fp,
+        dnn_mem_t &mem_dt, const dnn_mem_t &ref_mean, res_t *res) {
+    // Refer to modes documentation for filling principles.
+    if (has_bench_mode_bit(mode_bit_t::bitwise)) {
+        return fill_random_real(mem_dt, mem_fp, res);
     }
 
-    const int64_t flex_mask = (static_cast<int64_t>(1) << flex_bits) - 1;
-
-    /* density: (exact_bits - log_2(L * density)) / 2 >= flex_bits */
-    const float density = alg == ALG_0
-            ? 1.f * (1 << (exact_bits - 2 * flex_bits)) / L
-            : 1.f;
-    assert((exact_bits - ceilf(log2f(L * density))) / 2 >= flex_bits);
-
-    BENCHDNN_PRINT(6, "check_alg: %s, density = %g, flex_bits = " IFMT "\n",
-            check_alg2str(alg), density, flex_bits);
-
-    const bool use_sc = prb->use_sc();
-    const bool use_sh = prb->use_sh();
-    const bool fill_src_add = prb->fuse_add_relu();
-
     benchdnn_parallel_nd(prb->ic, [&](int64_t c) {
-        const float m = ((float *)mean)[c]
-                = alg == ALG_0 ? 0.f : 0.25f * (1 << (c % 7));
-        float v = 0; /* current variance */
-
+        const float m = ref_mean.get_elem(c);
         for (int64_t mb = 0; mb < prb->mb; ++mb) {
-            int64_t l_base = mb * prb->id * prb->ih * prb->iw
-                    + c * 239 * 2; // l[0] must be even
+            // l[0] must be even
+            int64_t l_base = mb * prb->id * prb->ih * prb->iw + c * 239 * 2;
             int64_t off = data_off(prb, mb, c, 0, 0, 0);
-            float *s = (float *)src + off;
 
             for_(int64_t d = 0; d < prb->id; ++d)
             for_(int64_t h = 0; h < prb->ih; ++h)
             for (int64_t w = 0; w < prb->iw; ++w) {
-
                 const int64_t sp = d * prb->ih * prb->iw + h * prb->iw + w;
                 const int64_t l = l_base + sp;
 
-                if (alg == ALG_0 && !flip_coin(l / 2 * 257ULL, density)) {
-                    s[sp] = 0;
-                    if (fill_src_add) src_add.set_elem(off + sp, 1.f);
+                // Shortcut for zero values.
+                if (cfg.check_alg_ == ALG_0
+                        && !flip_coin(l / 2 * 257ULL, cfg.density_)) {
+                    mem_fp.set_elem(off + sp, 0);
                     continue;
                 }
 
-                const int64_t gen = (l / 2 * 1637) & flex_mask;
-                const int sgn = l % 2 == 0 ? 1 : -1; /* [a1] */
-                const float f = 1.f * sgn * gen / (1 << flex_bits);
+                const int64_t gen = (l / 2 * 1637) & cfg.flex_mask_;
+                const int sgn = l % 2 == 0 ? 1 : -1; // s_{i} + s_{i+1} = 2 * m
+                const float f = 1.f * sgn * gen / (1 << cfg.flex_bits_);
 
-                s[sp] = alg == ALG_0 ? f : m * (1.f + f);
-                if (L % 2 && (mb * prb->id * prb->ih * prb->iw + sp == L - 1)) {
-                    s[sp] = m;
+                float val = cfg.check_alg_ == ALG_0 ? f : m * (1.f + f);
+                if (prb->flags & GLOB_STATS) {
+                    val = (l % 65) - 32;
+                } else if (cfg.L_ % 2
+                        && (mb * prb->id * prb->ih * prb->iw + sp
+                                == cfg.L_ - 1)) {
+                    val = m;
                 }
-                v += (s[sp] - m) * (s[sp] - m);
-                if (fill_src_add) {
+                mem_fp.set_elem(
+                        off + sp, round_to_nearest_representable(prb->dt, val));
+            }
+        }
+    });
+
+    if (mem_dt) SAFE(mem_dt.reorder(mem_fp), WARN);
+
+    return OK;
+}
+
+int fill_variance(const prb_t *prb, const cfg_t &cfg, dnn_mem_t &mem_fp,
+        dnn_mem_t &mem_dt, const dnn_mem_t &ref_src,
+        const dnn_mem_t &ref_mean) {
+    // Refer to modes documentation for filling principles.
+    if (has_bench_mode_bit(mode_bit_t::bitwise)) {
+        // Variance must be computed unless it is passed by user directly.
+        if (!(prb->flags & GLOB_STATS)) return OK;
+
+        // Variance must be always positive by definition.
+        fill_cfg_t fill_cfg(dnnl_f32, 0.f, 16.f, /* int = */ false,
+                attr_t::post_ops_t::kind_t::ADD, "variance");
+        return fill_random_real(mem_dt, mem_fp, nullptr, fill_cfg);
+    }
+
+    benchdnn_parallel_nd(prb->ic, [&](int64_t c) {
+        float val = 0.f;
+        if (prb->flags & GLOB_STATS) {
+            val = ((c % 7) << 1);
+        } else {
+            const float m = ref_mean.get_elem(c);
+            for (int64_t mb = 0; mb < prb->mb; ++mb) {
+                int64_t off = data_off(prb, mb, c, 0, 0, 0);
+
+                for_(int64_t d = 0; d < prb->id; ++d)
+                for_(int64_t h = 0; h < prb->ih; ++h)
+                for (int64_t w = 0; w < prb->iw; ++w) {
+                    const int64_t sp = d * prb->ih * prb->iw + h * prb->iw + w;
+                    const float s = ref_src.get_elem(sp + off);
+                    val += (s - m) * (s - m);
+                }
+            }
+            val /= cfg.L_;
+        }
+        mem_fp.set_elem(c, val);
+    });
+
+    if (mem_dt && prb->use_stats()) SAFE(mem_dt.reorder(mem_fp), WARN);
+
+    return OK;
+}
+
+int fill_src_add(const prb_t *prb, const cfg_t &cfg, dnn_mem_t &mem_fp,
+        dnn_mem_t &mem_dt, const dnn_mem_t &ref_src,
+        const dnn_mem_t &ref_mean) {
+    const bool fill_src_add = prb->fuse_add_relu();
+    if (!fill_src_add) return OK;
+
+    // Refer to modes documentation for filling principles.
+    if (has_bench_mode_bit(mode_bit_t::bitwise)) {
+        return fill_random_real(mem_dt, mem_fp, nullptr);
+    }
+
+    benchdnn_parallel_nd(prb->ic, prb->mb, prb->id, prb->ih, prb->iw,
+            [&](int64_t c, int64_t mb, int64_t d, int64_t h, int64_t w) {
+                const int64_t l_base
+                        = mb * prb->id * prb->ih * prb->iw + c * 239 * 2;
+                const int64_t sp = d * prb->ih * prb->iw + h * prb->iw + w;
+                const int64_t offset = data_off(prb, mb, c, 0, 0, 0) + sp;
+                const int64_t l = l_base + sp;
+                const float s = ref_src.get_elem(offset);
+                const float m = ref_mean.get_elem(c);
+
+                if (!(prb->flags & GLOB_STATS) && s == 0) {
+                    mem_fp.set_elem(offset, 1.f);
+                    return;
+                }
+
+                float val = 0.f;
+                if (prb->flags & GLOB_STATS) {
+                    val = (l % 17) - 8;
+                } else {
                     // The main purpose of such filling is to avoid catastrophic
                     // cancellation. To do that, the sign of `Add` tensor final
                     // values is kept the same as it would be after applying
@@ -168,71 +185,117 @@ static int prepare_fwd_no_stats(const prb_t *prb, const dnn_mem_t &src,
                     // equal or higher - positive.
                     const int64_t mod2_base = (mb + c + d + h + w) % 5;
                     const float mod2_val = 1.f / (2LL << mod2_base);
-                    const int64_t sign_val = s[sp] < m ? -1 : 1;
-                    float *s_add = (float *)src_add + off;
-                    s_add[sp] = round_to_nearest_representable(
-                            prb->dt, mod2_val * sign_val);
+                    const int64_t sign_val = s < m ? -1 : 1;
+                    val = mod2_val * sign_val;
                 }
-            }
-        }
+                mem_fp.set_elem(
+                        offset, round_to_nearest_representable(prb->dt, val));
+            });
 
-        ((float *)var)[c] = v / (prb->mb * prb->id * prb->ih * prb->iw);
+    if (mem_dt) SAFE(mem_dt.reorder(mem_fp), WARN);
 
-        const float sc_value = 1.f / 8 * (1 << (c % 7));
-        const float sh_value = ((c % 3) - 1) * sc_value / 64;
-        if (use_sc) sc.set_elem(c, sc_value);
-        if (use_sh) sh.set_elem(c, sh_value);
+    return OK;
+}
+
+int fill_scale(const prb_t *prb, dnn_mem_t &mem_fp, dnn_mem_t &mem_dt) {
+    const bool use_sc = prb->use_sc();
+    if (!use_sc) return OK;
+
+    // Refer to modes documentation for filling principles.
+    if (has_bench_mode_bit(mode_bit_t::bitwise)) {
+        return fill_random_real(mem_dt, mem_fp, nullptr);
+    }
+
+    benchdnn_parallel_nd(prb->ic, [&](int64_t c) {
+        float val = (1.f / 8) * (1 << (c % 7));
+        if (prb->flags & GLOB_STATS) val *= 8.f;
+        mem_fp.set_elem(c, val);
     });
+
+    if (mem_dt) SAFE(mem_dt.reorder(mem_fp), WARN);
+
+    return OK;
+}
+
+int fill_shift(const prb_t *prb, dnn_mem_t &mem_fp, dnn_mem_t &mem_dt) {
+    const bool use_sh = prb->use_sh();
+    if (!use_sh) return OK;
+
+    // Refer to modes documentation for filling principles.
+    if (has_bench_mode_bit(mode_bit_t::bitwise)) {
+        return fill_random_real(mem_dt, mem_fp, nullptr);
+    }
+
+    benchdnn_parallel_nd(prb->ic, [&](int64_t c) {
+        float val = ((c % 3) - 1) * (1.f / 512 * (1 << (c % 7)));
+        if (prb->flags & GLOB_STATS) val *= 512.f;
+        mem_fp.set_elem(c, val);
+    });
+
+    if (mem_dt) SAFE(mem_dt.reorder(mem_fp), WARN);
 
     return OK;
 }
 
 int prepare_fwd(const prb_t *prb, dnn_mem_map_t &mem_map,
         dnn_mem_map_t &ref_mem_map, res_t *res) {
-    const auto &ref_src = ref_mem_map[DNNL_ARG_SRC];
-    const auto &ref_src_add = ref_mem_map[DNNL_ARG_SRC_1];
-    const auto &ref_mean = ref_mem_map[DNNL_ARG_MEAN];
-    const auto &ref_var = ref_mem_map[DNNL_ARG_VARIANCE];
-    const auto &ref_sc = ref_mem_map[DNNL_ARG_SCALE];
-    const auto &ref_sh = ref_mem_map[DNNL_ARG_SHIFT];
+    cfg_t cfg(prb);
 
-    if (prb->flags & GLOB_STATS)
-        SAFE(prepare_fwd_with_stats(prb, ref_src, ref_src_add, ref_mean,
-                     ref_var, ref_sc, ref_sh, res),
-                WARN);
-    else
-        SAFE(prepare_fwd_no_stats(prb, ref_src, ref_src_add, ref_mean, ref_var,
-                     ref_sc, ref_sh, res),
-                WARN);
+    auto &mean = mem_map.at(DNNL_ARG_MEAN);
+    auto &ref_mean = ref_mem_map.at(DNNL_ARG_MEAN);
+    SAFE(fill_mean(prb, cfg, ref_mean, mean), WARN);
 
-    auto &src = mem_map[DNNL_ARG_SRC];
-    SAFE(src.reorder(ref_src), WARN);
+    auto &src = mem_map.at(DNNL_ARG_SRC);
+    auto &ref_src = ref_mem_map.at(DNNL_ARG_SRC);
+    SAFE(fill_src(prb, cfg, ref_src, src, ref_mean, res), WARN);
 
-    auto &src_add = mem_map[DNNL_ARG_SRC_1];
-    if (src_add) SAFE(src_add.reorder(ref_src_add), WARN);
+    // Need a copy of source data for inplace mode for bitwise testing.
+    if (has_bench_mode_bit(mode_bit_t::bitwise) && prb->inplace) {
+        auto &src_copy = mem_map.at(-DNNL_ARG_SRC);
+        SAFE(bool(src_copy) ? OK : FAIL, WARN);
+        SAFE(src_copy.reorder(src), WARN);
+    }
 
-    auto &mean = mem_map[DNNL_ARG_MEAN];
-    if (mean && prb->use_stats()) SAFE(mean.reorder(ref_mean), WARN);
+    auto &var = mem_map.at(DNNL_ARG_VARIANCE);
+    auto &ref_var = ref_mem_map.at(DNNL_ARG_VARIANCE);
+    SAFE(fill_variance(prb, cfg, ref_var, var, ref_src, ref_mean), WARN);
 
-    auto &var = mem_map[DNNL_ARG_VARIANCE];
-    if (var && prb->use_stats()) SAFE(var.reorder(ref_var), WARN);
+    auto &src_add = mem_map.at(DNNL_ARG_SRC_1);
+    auto &ref_src_add = ref_mem_map.at(DNNL_ARG_SRC_1);
+    SAFE(fill_src_add(prb, cfg, ref_src_add, src_add, ref_src, ref_mean), WARN);
 
-    auto &sc = mem_map[DNNL_ARG_SCALE];
-    if (sc) SAFE(sc.reorder(ref_sc), WARN);
+    auto &scale = mem_map.at(DNNL_ARG_SCALE);
+    auto &ref_scale = ref_mem_map.at(DNNL_ARG_SCALE);
+    SAFE(fill_scale(prb, ref_scale, scale), WARN);
 
-    auto &sh = mem_map[DNNL_ARG_SHIFT];
-    if (sh) SAFE(sh.reorder(ref_sh), WARN);
+    auto &shift = mem_map.at(DNNL_ARG_SHIFT);
+    auto &ref_shift = ref_mem_map.at(DNNL_ARG_SHIFT);
+    SAFE(fill_shift(prb, ref_shift, shift), WARN);
 
     return OK;
 }
 
 int prepare_bwd(
         const prb_t *prb, dnn_mem_map_t &mem_map, dnn_mem_map_t &ref_mem_map) {
-    const auto &mem_fp = ref_mem_map[DNNL_ARG_DIFF_DST];
-    auto &mem_dt = mem_map[DNNL_ARG_DIFF_DST];
+    auto &mem_fp = ref_mem_map.at(DNNL_ARG_DIFF_DST);
+    auto &mem_dt = mem_map.at(DNNL_ARG_DIFF_DST);
 
     const auto nelems = mem_fp.nelems();
     if (nelems == 0) return OK;
+
+    // Refer to modes documentation for filling principles.
+    if (has_bench_mode_bit(mode_bit_t::bitwise)) {
+        SAFE(fill_random_real(mem_dt, mem_fp, nullptr), WARN);
+
+        // Need a copy of source data for inplace mode for bitwise testing.
+        if (prb->inplace) {
+            auto &diff_dst_copy = mem_map.at(-DNNL_ARG_DIFF_DST);
+            SAFE(bool(diff_dst_copy) ? OK : FAIL, WARN);
+            SAFE(diff_dst_copy.reorder(mem_dt), WARN);
+        }
+
+        return OK;
+    }
 
     // Idea behind filling: integer diff_dst values decrease norms unlike fp32
     // values in [-1.f, 1.f] range. To decrease norms more, make data pretty
@@ -273,8 +336,8 @@ int prepare_bwd(
 }
 
 int check_fwd_ws(dnn_mem_map_t &mem_map, res_t *res) {
-    const auto &dst_dt = mem_map[DNNL_ARG_DST];
-    const auto &ws_dt = mem_map[DNNL_ARG_WORKSPACE];
+    const auto &dst_dt = mem_map.at(DNNL_ARG_DST);
+    const auto &ws_dt = mem_map.at(DNNL_ARG_WORKSPACE);
 
     if (ws_dt.ndims() == 0) return OK;
 
@@ -323,17 +386,18 @@ dnnl_status_t init_pd(init_pd_args_t<prb_t> &init_pd_args) {
     const prb_t *prb = init_pd_args.prb;
     const dir_t dir = init_pd_args.dir;
     res_t *res = init_pd_args.res;
+    bool force_f32_dt = init_pd_args.force_f32_dt;
 
-    auto src_d = dnn_mem_t::init_md(
-            prb->ndims, prb->data_dims().data(), prb->dt, prb->tag);
+    auto src_d = dnn_mem_t::init_md(prb->ndims, prb->data_dims().data(),
+            force_f32_dt ? dnnl_f32 : prb->dt, prb->tag, prb->strides[0]);
 
     auto dnnl_attr = make_benchdnn_dnnl_wrapper(
             create_dnnl_attr(prb->attr, attr_args_t()));
 
     auto flags = (dnnl_normalization_flags_t)prb->flags;
     if (dir & FLAG_FWD) {
-        auto dst_d = dnn_mem_t::init_md(
-                prb->ndims, prb->data_dims().data(), prb->dt, tag::any);
+        auto dst_d = dnn_mem_t::init_md(prb->ndims, prb->data_dims().data(),
+                force_f32_dt ? dnnl_f32 : prb->dt, tag::any, prb->strides[1]);
         auto prop = prb->dir & FLAG_INF ? dnnl_forward_inference
                                         : dnnl_forward_training;
         TIME_C_PD(DNN_SAFE_STATUS(
@@ -342,10 +406,12 @@ dnnl_status_t init_pd(init_pd_args_t<prb_t> &init_pd_args) {
                         init_pd_args.src_md ? init_pd_args.src_md : src_d,
                         dst_d, prb->eps, flags, dnnl_attr)));
     } else {
-        auto diff_src_d = dnn_mem_t::init_md(
-                prb->ndims, prb->data_dims().data(), prb->dt, tag::any);
-        auto diff_dst_d = dnn_mem_t::init_md(
-                prb->ndims, prb->data_dims().data(), prb->dt, tag::any);
+        auto diff_src_d = dnn_mem_t::init_md(prb->ndims,
+                prb->data_dims().data(), force_f32_dt ? dnnl_f32 : prb->dt,
+                tag::any, prb->strides[0]);
+        auto diff_dst_d = dnn_mem_t::init_md(prb->ndims,
+                prb->data_dims().data(), force_f32_dt ? dnnl_f32 : prb->dt,
+                tag::any, prb->strides[1]);
         auto prop = prb->dir & FLAG_WEI ? dnnl_backward : dnnl_backward_data;
         TIME_C_PD(DNN_SAFE_STATUS(
                 dnnl_batch_normalization_backward_primitive_desc_create(
@@ -515,22 +581,31 @@ std::vector<int> supported_exec_args(dir_t dir) {
 };
 
 int init_ref_memory_args(dnn_mem_map_t &ref_mem_map, dnn_mem_map_t &mem_map,
-        dnnl_primitive_t prim, const prb_t *prb, res_t *res, dir_t dir,
+        dnnl_primitive_t prim, const prb_t *prb, res_t *res,
         dnnl_primitive_t prim_ref) {
-    update_inplace_memory_args(mem_map, prb, dir);
     if (has_bench_mode_modifier(mode_modifier_t::no_host_memory)) return OK;
 
     // TODO: this function still allocates the full memory print needed to fill
     // the data and each argument can't be destroyed right away since filling
     // requires all of them at a time.
     const auto &ref_engine = get_cpu_engine();
+    const bool is_fwd_prim = is_fwd_prop_kind(query_prop_kind(query_pd(prim)));
 
     for (auto &entry : mem_map) {
         const int exec_arg = entry.first;
+        // The function targets regular exec_args that are positive.
+        // Negative args are used by bitwise and are broken in the `default`
+        // branch due to `&` always returns `true`.
+        if (exec_arg <= 0) continue;
+
         auto &mem = entry.second;
 
-        ref_mem_map.emplace(
-                exec_arg, dnn_mem_t(mem.md_, dnnl_f32, tag::abx, ref_engine));
+        // Scratchpad memory relates to a primitive. If reference needs it,
+        // use switch below to define a memory desc for it.
+        if (exec_arg != DNNL_ARG_SCRATCHPAD && exec_arg != DNNL_ARG_WORKSPACE) {
+            ref_mem_map.emplace(exec_arg,
+                    dnn_mem_t(mem.md_, dnnl_f32, tag::abx, ref_engine));
+        }
 
         switch (exec_arg) {
             case DNNL_ARG_DST:
@@ -551,11 +626,16 @@ int init_ref_memory_args(dnn_mem_map_t &ref_mem_map, dnn_mem_map_t &mem_map,
                             1, dims1d, dnnl_f32, tag::abx, ref_engine);
                 }
                 break;
+            case DNNL_ARG_WORKSPACE: {
+                ref_mem_map[exec_arg]
+                        = dnn_mem_t(mem.md_, dnnl_u8, tag::abx, ref_engine);
+                break;
+            }
             default: break;
         }
     }
 
-    if (dir & FLAG_FWD) {
+    if (is_fwd_prim) {
         SAFE(prepare_fwd(prb, mem_map, ref_mem_map, res), WARN);
     } else {
         SAFE(prepare_bwd(prb, mem_map, ref_mem_map), WARN);
@@ -575,6 +655,25 @@ int init_ref_memory_args(dnn_mem_map_t &ref_mem_map, dnn_mem_map_t &mem_map,
     }
 
     return OK;
+}
+
+std::vector<data_kind_t> get_kinds_to_check(const prb_t *prb, dir_t dir) {
+    std::vector<data_kind_t> check_kinds;
+    if ((prb->dir & FLAG_FWD) && (dir & FLAG_FWD)) {
+        if (!(prb->flags & GLOB_STATS) && !(prb->dir & FLAG_INF)) {
+            check_kinds.push_back(MEAN);
+            check_kinds.push_back(VAR);
+        }
+        check_kinds.push_back(DST);
+    } else if ((prb->dir & FLAG_BWD) && (dir & FLAG_BWD)) {
+        if (prb->dir & FLAG_WEI) {
+            if (prb->use_sc()) check_kinds.push_back(SC);
+            if (prb->use_sh()) check_kinds.push_back(SH);
+        }
+        check_kinds.push_back(SRC);
+    }
+    // `check_kinds` is empty for `(prb->dir & FLAG_BWD) && (dir & FLAG_FWD)`.
+    return check_kinds;
 }
 
 int createit(std::vector<benchdnn_dnnl_wrapper_t<dnnl_primitive_t>> &v_prim,
@@ -606,37 +705,28 @@ int doit(const std::vector<benchdnn_dnnl_wrapper_t<dnnl_primitive_t>> &v_prim,
     dnn_mem_map_t mem_map, ref_mem_map;
     init_memory_args<prb_t>(
             mem_map, prb, v_prim[0], supported_exec_args(FLAG_FWD));
-    TIME_FILL(SAFE(init_ref_memory_args(
-                           ref_mem_map, mem_map, v_prim[0], prb, res, FLAG_FWD),
+    TIME_FILL(SAFE(
+            init_ref_memory_args(ref_mem_map, mem_map, v_prim[0], prb, res),
             WARN));
 
     args_t args(mem_map), ref_args(ref_mem_map);
 
     SAFE(execute_and_wait(v_prim[0], args, res), WARN);
 
-    // Running ref to collect src_hat (used instead of src + mean) and ws, if
-    // fuse_relu flag is requested.
-    if (has_bench_mode_bit(mode_bit_t::corr)) {
-        if (prb->dir & FLAG_FWD) {
-            std::vector<data_kind_t> kinds {DST};
-            if (!(prb->flags & GLOB_STATS) && !(prb->dir & FLAG_INF)) {
-                kinds.push_back(MEAN);
-                kinds.push_back(VAR);
-            }
-
-            // TODO: make kinds empty for BWD?
-            check_correctness(prb, kinds, args, ref_args, setup_cmp, res);
-
-            if (prb->debug_check_ws) check_fwd_ws(mem_map, res);
-        }
-    }
+    check_correctness(prb, get_kinds_to_check(prb, FLAG_FWD), args, ref_args,
+            setup_cmp, res);
+    SAFE(check_bitwise(prim, get_kinds_to_check(prb, FLAG_FWD), args, prb->attr,
+                 prb->inplace, res),
+            WARN);
+    if (prb->debug_check_ws && has_bench_mode_bit(mode_bit_t::corr))
+        check_fwd_ws(mem_map, res);
 
     if (prb->dir & FLAG_BWD) {
         // Pass same memory map as we need data from forward on backward.
         init_memory_args<prb_t>(
                 mem_map, prb, v_prim[1], supported_exec_args(FLAG_BWD));
-        TIME_FILL(SAFE(init_ref_memory_args(ref_mem_map, mem_map, v_prim[1],
-                               prb, res, FLAG_BWD),
+        TIME_FILL(SAFE(
+                init_ref_memory_args(ref_mem_map, mem_map, v_prim[1], prb, res),
                 WARN));
 
         args = args_t(mem_map);
@@ -644,13 +734,11 @@ int doit(const std::vector<benchdnn_dnnl_wrapper_t<dnnl_primitive_t>> &v_prim,
 
         SAFE(execute_and_wait(v_prim[1], args, res), WARN);
 
-        if (has_bench_mode_bit(mode_bit_t::corr)) {
-            std::vector<data_kind_t> kinds {SRC};
-            if (prb->use_sc() && (prb->dir & FLAG_WEI)) kinds.push_back(SC);
-            if (prb->use_sh() && (prb->dir & FLAG_WEI)) kinds.push_back(SH);
-
-            check_correctness(prb, kinds, args, ref_args, setup_cmp, res);
-        }
+        check_correctness(prb, get_kinds_to_check(prb, FLAG_BWD), args,
+                ref_args, setup_cmp, res);
+        SAFE(check_bitwise(prim, get_kinds_to_check(prb, FLAG_BWD), args,
+                     prb->attr, prb->inplace, res),
+                WARN);
     }
 
     return measure_perf(prb->ctx_exe, res, prim, args);

@@ -83,6 +83,7 @@ runtimes. `KIND` values can be `usm` (default), `buffer`, `usm_device`
   - `F` or `f` for fast performance testing, an alias for
                `--mode=P --mode-modifier=PM --max-ms-per-prb=10`
   - `CP` or `cp` for both correctness and performance testing
+  - `B` or `b` for bitwise (numerical determinism) testing
   - `R` or `r` for run mode
   - `I` or `i` for initialization mode
   - `L` or `l` for listing mode
@@ -156,10 +157,11 @@ names mismatch for two descriptors. It indicates that appending an attribute
 changes the implementation dispatching which is an undesired behavior. When
 `BOOL` is `false` (the default), the check is disabled.
 
-### --fast-ref-gpu
-`--fast-ref-gpu=BOOL` instructs the driver to use an optimized implementation
+### --fast-ref
+`--fast-ref=BOOL` instructs the driver to use an optimized implementation
 from the library as a reference path for correctness comparison when `BOOL` is
-`true` (the default).
+`true` (the default). Refer to [additional documentation](knob_use_fast_ref.md)
+for more information.
 
 ## Performance mode settings
 

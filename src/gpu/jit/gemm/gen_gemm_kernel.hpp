@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2019-2023 Intel Corporation
+* Copyright 2019-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -18,17 +18,13 @@
 #define GPU_JIT_GEMM_GEN_GEMM_KERNEL_HPP
 
 #include "common/c_types_map.hpp"
-#include "common/type_helpers.hpp"
-#include "gpu/compute/compute.hpp"
 #include "gpu/compute/device_info.hpp"
 #include "gpu/compute/kernel_arg_list.hpp"
 #include "gpu/jit/gemm/gen_gemm_kernel_generator.hpp"
 #include "gpu/jit/gemm/kernel_catalog.hpp"
 #include "gpu/jit/gemm/kernel_evaluator.hpp"
 #include "gpu/jit/jit_generator_base.hpp"
-#include "gpu/jit/utils/ngen_type_bridge.hpp"
 #include "gpu/kernel_cache.hpp"
-#include "gpu/primitive_conf.hpp"
 
 namespace dnnl {
 namespace impl {
@@ -46,6 +42,8 @@ struct gen_gemm_kernel_desc_t {
 
     compute::scalar_type_t scalar_type() const {
         switch (problem_.Ts) {
+            case Type::s4: return compute::scalar_type_t::_int4;
+            case Type::u4: return compute::scalar_type_t::_uint4;
             case Type::s8: return compute::scalar_type_t::_char;
             case Type::u8: return compute::scalar_type_t::_uchar;
             case Type::s16: return compute::scalar_type_t::_short;
@@ -54,6 +52,7 @@ struct gen_gemm_kernel_desc_t {
             case Type::u32: return compute::scalar_type_t::_uint;
             case Type::s64: return compute::scalar_type_t::_long;
             case Type::u64: return compute::scalar_type_t::_ulong;
+            case Type::bf8: return compute::scalar_type_t::_bfloat8;
             case Type::bf16: return compute::scalar_type_t::_bfloat16;
             case Type::f16: return compute::scalar_type_t::_half;
             case Type::f32: return compute::scalar_type_t::_float;
@@ -64,12 +63,7 @@ struct gen_gemm_kernel_desc_t {
     status_t create_generator(const compute::compute_engine_t &engine,
             compute::kernel_t &kernel) const;
 
-    serialized_t serialize() const {
-        serialized_t s {};
-        problem_.serialize(s);
-        strategy_.serialize(s);
-        return s;
-    }
+    serialized_t serialize() const { return serialized_t(problem_, strategy_); }
     compute::gpu_arch_t arch() const { return arch_; }
 
     const kcatalog::Entry &entry() const {
@@ -84,9 +78,12 @@ protected:
             case data_type::f32: return Type::f32;
             case data_type::f16: return Type::f16;
             case data_type::bf16: return Type::bf16;
+            case data_type::f8_e5m2: return Type::bf8;
             case data_type::s32: return Type::s32;
             case data_type::u8: return Type::u8;
             case data_type::s8: return Type::s8;
+            case data_type::u4: return Type::u4;
+            case data_type::s4: return Type::s4;
         }
     }
 
@@ -117,35 +114,44 @@ protected:
     int eu_count_ = -1;
     bool disable_systolic_ = false;
 
-    status_t transfer_post_ops(
-            const post_ops_t &post_ops, bool swap_ab = false);
+    status_t transfer_post_ops(gpu_post_ops_t &&post_ops, bool swap_ab);
 
     status_t finalize();
     void update_driver_info();
 };
 
 struct gen_gemm_nocopy_kernel_desc_t : public gen_gemm_kernel_desc_t {
-    enum compute_mode { mode_default = 0, mode_tf32 = 0x1, mode_bf16x1 = 0x2 };
+    enum compute_mode {
+        mode_default = 0,
+        mode_tf32 = 0x1,
+        mode_bf16x1 = 0x2,
+        mode_w_decomp = 0x4,
+        mode_deterministic = 0x8000
+    };
+
+    friend void set_mode(compute_mode &mode, compute_mode flag) {
+        mode = static_cast<compute_mode>(mode | flag);
+    }
 
     status_t select_kernel(compute::gpu_arch_t arch, int stepping, int eu_count,
             bool has_systolic, compute_mode mode, int batch_dims, bool trans_a,
-            bool trans_b, bool trans_co, bool swap_ab, bool a_offset,
-            bool b_offset, bool c_offset, bool bias, sum_ab_t reduce_ab,
-            float alpha, float beta, const post_ops_t &post_ops,
-            data_type_t a_type, data_type_t b_type, data_type_t c_type,
+            bool trans_b, bool trans_co, bool swap_ab, int ao_dims, int bo_dims,
+            bool c_offset, bool bias, sum_ab_t reduce_ab, float alpha,
+            float beta, data_type_t a_type, data_type_t b_type,
+            data_type_t c_type, data_type_t ao_type, data_type_t bo_type,
             data_type_t co_type, data_type_t acc_type, int align_a, int align_b,
             int align_c, dim_t m, dim_t n, dim_t k, dim_t lda, dim_t ldb,
-            dim_t ldc, dim_t batch);
+            dim_t ldc, dim_t batch, gpu_post_ops_t &&post_ops);
 };
 
 struct gen_gemm_xe_systolic_kernel_desc_t : public gen_gemm_kernel_desc_t {
     status_t select_kernel(compute::gpu_arch_t arch, int stepping, int eu_count,
             int batch_dims, bool packed_c, bool trans_co, bool a_offset,
             bool b_offset, bool c_offset, bool bias, float alpha, float beta,
-            const post_ops_t &post_ops, data_type_t a_type, data_type_t b_type,
-            data_type_t c_type, data_type_t co_type, data_type_t acc_type,
-            dim_t m, dim_t n, dim_t k, dim_t batch, int unroll_m, int unroll_n,
-            bool alt);
+            data_type_t a_type, data_type_t b_type, data_type_t c_type,
+            data_type_t ao_type, data_type_t bo_type, data_type_t co_type,
+            data_type_t acc_type, dim_t m, dim_t n, dim_t k, dim_t batch,
+            int unroll_m, int unroll_n, bool alt, gpu_post_ops_t &&post_ops);
 
     static void choose_unrolls(compute::gpu_arch_t arch, int eu_count,
             data_type_t a_type, data_type_t b_type, data_type_t c_type, dim_t m,

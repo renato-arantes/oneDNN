@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2018-2023 Intel Corporation
+* Copyright 2018-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -154,9 +154,11 @@ CFG(f16f32) {
 }
 
 // f16_math_mode
+dt_conf_t::entry_t F16_MATH_ENTRY {dnnl_f32, -f32_max_exact, f32_max_exact,
+        MIN_F16, MAX_F16, MEAN_F16, STDDEV_F16, EPS_F16};
 CFG_INTERNAL(f16_math, f32) {
     CASE(BIAS, F32_ENTRY);
-    DEFAULT(F16_ENTRY);
+    DEFAULT(F16_MATH_ENTRY);
 }
 
 // s8
@@ -332,10 +334,10 @@ CFG(f32s8f32f32) {
 
 const dt_conf_t &dt_conf_t::create(const std::string &str, const attr_t &attr) {
     if (str == "f32") {
-        if (dnnl::impl::utils::one_of(attr.fpmath_mode, dnnl_fpmath_mode_bf16,
-                    dnnl_fpmath_mode_tf32))
+        if (dnnl::impl::utils::one_of(attr.fpmath_mode.mode,
+                    dnnl_fpmath_mode_bf16, dnnl_fpmath_mode_tf32))
             return conf_bf32;
-        if (attr.fpmath_mode == dnnl_fpmath_mode_f16) return conf_f16_math;
+        if (attr.fpmath_mode.mode == dnnl_fpmath_mode_f16) return conf_f16_math;
     }
     for (const auto cfg : cfg_list)
         if (cfg->str() == str) return *cfg;

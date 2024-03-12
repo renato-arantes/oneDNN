@@ -1,5 +1,5 @@
 /*******************************************************************************
- * Copyright 2020-2023 Intel Corporation
+ * Copyright 2020-2024 Intel Corporation
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -109,6 +109,7 @@ ostream &operator<<(ostream &os, intrin_type val) {
         HANDLE_CASE(reduce_max)
         HANDLE_CASE(reduce_min)
         HANDLE_CASE(fmadd)
+        HANDLE_CASE(fnmadd)
         HANDLE_CASE(unpack_low)
         HANDLE_CASE(unpack_high)
         HANDLE_CASE(shuffle)
@@ -125,7 +126,8 @@ ostream &operator<<(ostream &os, intrin_type val) {
         HANDLE_CASE(permutexvar)
         HANDLE_CASE(insert)
         HANDLE_CASE(extract)
-        HANDLE_CASE(load_const_mem)
+        HANDLE_CASE(constant_load)
+        HANDLE_CASE(volatile_load)
         HANDLE_CASE(brgemm)
         HANDLE_CASE(list_brgemm)
         HANDLE_CASE(NUM_INTRINSICS)
@@ -245,7 +247,8 @@ expr::lvalue_proxy_t expr::operator[](const span_t &index) const {
     }
 
     return expr::lvalue_proxy_t(
-            builder::make_indexing(*this, idx, index.length_, index.mask_),
+            builder::make_indexing(
+                    *this, idx, index.length_, index.mask_, index.rows_),
             true);
 }
 
@@ -454,8 +457,9 @@ expr select_node::remake() const {
 }
 
 expr indexing_node::remake() const {
-    return copy_attr(
-            *this, builder::make_indexing(ptr_, idx_, dtype_.lanes_, mask_));
+    return copy_attr(*this,
+            builder::make_indexing(
+                    ptr_, idx_, dtype_.lanes_, mask_, dtype_.rows_));
 }
 
 bool indexing_node::equals(expr_c v, ir_comparer &ctx) const {

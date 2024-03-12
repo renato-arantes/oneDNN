@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2023 Intel Corporation
+* Copyright 2023-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -20,7 +20,7 @@
 
 NAMED_KERNEL_ATTR(CALC)
 __kernel void reusable_calculate_mean(__global DATA_T *src,
-        __global float *mean, dim_t reduce_dim_stride, dim_t reduce_dim,
+        __global float *mean, off_t reduce_dim_stride, off_t reduce_dim,
         dispatch_gws_rt_params_t gws_params) {
     src = GWS_GET_BUFFER_POS_NAMED(SRC, CALC, gws_params, src);
     mean = GWS_GET_BUFFER_POS_NAMED(DST, CALC, gws_params, mean);
@@ -34,9 +34,9 @@ __kernel void reusable_calculate_mean(__global DATA_T *src,
 
 NAMED_KERNEL_ATTR(CALC)
 __kernel void reusable_calculate_variance(__global DATA_T *src,
-        __global float *mean, __global float *variance, dim_t reduce_dim_stride,
-        dim_t reduce_dim, dispatch_gws_rt_params_t gws_params) {
-    const off_t c = GWS_GET_NAMED(IC_DIM, CALC, gws_params);
+        __global float *mean, __global float *variance, off_t reduce_dim_stride,
+        off_t reduce_dim, dispatch_gws_rt_params_t gws_params) {
+    const off_t c = GWS_GET_OFF_NAMED(IC_DIM, CALC, gws_params);
     src = GWS_GET_BUFFER_POS_NAMED(SRC, CALC, gws_params, src);
     variance = GWS_GET_BUFFER_POS_NAMED(DST, CALC, gws_params, variance);
     float sum = 0;
@@ -51,7 +51,7 @@ __kernel void reusable_calculate_variance(__global DATA_T *src,
 
 NAMED_KERNEL_ATTR(REDUCE)
 __kernel void reusable_reduce_mean(__global float *reduce_temp,
-        __global float *mean, dim_t ic, dim_t reduce_dim, dim_t div,
+        __global float *mean, off_t ic, off_t reduce_dim, off_t div,
         dispatch_gws_rt_params_t gws_params) {
     reduce_temp
             = GWS_GET_BUFFER_POS_NAMED(BUFFER, REDUCE, gws_params, reduce_temp);
@@ -67,7 +67,7 @@ __kernel void reusable_reduce_mean(__global float *reduce_temp,
 
 NAMED_KERNEL_ATTR(REDUCE)
 __kernel void reusable_reduce_variance(__global float *reduce_temp,
-        __global float *variance, dim_t ic, dim_t reduce_dim, dim_t div,
+        __global float *variance, off_t ic, off_t reduce_dim, off_t div,
         dispatch_gws_rt_params_t gws_params) {
     reduce_temp
             = GWS_GET_BUFFER_POS_NAMED(BUFFER, REDUCE, gws_params, reduce_temp);
@@ -86,7 +86,7 @@ __kernel void reusable_bnorm_fwd(__global DATA_T *src, __global float *mean,
         __global float *shift, __global char *ws, float eps,
         __global DATA_T *src_add, float relu_alpha,
         dispatch_gws_rt_params_t gws_params) {
-    const off_t c = GWS_GET(IC_DIM, gws_params);
+    const off_t c = GWS_GET_OFF(IC_DIM, gws_params);
     src = GWS_GET_BUFFER_POS(BUFFER, gws_params, src);
     src_add = GWS_GET_BUFFER_POS(BUFFER, gws_params, src_add);
     ws = GWS_GET_BUFFER_POS(BUFFER, gws_params, ws);
@@ -104,7 +104,11 @@ __kernel void reusable_bnorm_fwd(__global DATA_T *src, __global float *mean,
 #if FUSE_BN_RELU == 1
     if (bn_res <= 0) {
         bn_res = 0;
-        *ws = IS_TRAINING ? 0 : -1;
+#if IS_TRAINING == 1
+        *ws = 0;
+    } else {
+        *ws = -1;
+#endif
     }
 #endif
 
@@ -122,13 +126,16 @@ __kernel void reusable_bnorm_fwd(__global DATA_T *src, __global float *mean,
 NAMED_KERNEL_ATTR(CALC)
 __kernel void reusable_calculate_stats(__global DATA_T *src,
         __global float *mean, __global DATA_T *diff_dst, __global char *ws,
-        __global float *reduce_temp, dim_t reduce_dim_stride, dim_t reduce_dim,
-        dim_t nelems, dispatch_gws_rt_params_t gws_params) {
+        __global float *reduce_temp, __global float *reduce_temp_shift,
+        off_t reduce_dim_stride, off_t reduce_dim,
+        dispatch_gws_rt_params_t gws_params) {
     float diff_gamma = 0;
     float diff_beta = 0;
 
-    const off_t c = GWS_GET_NAMED(IC_DIM, CALC, gws_params);
+    const off_t c = GWS_GET_OFF_NAMED(IC_DIM, CALC, gws_params);
     reduce_temp = GWS_GET_BUFFER_POS_NAMED(DST, CALC, gws_params, reduce_temp);
+    reduce_temp_shift = GWS_GET_BUFFER_POS_NAMED(
+            DST, CALC, gws_params, reduce_temp_shift);
     diff_dst = GWS_GET_BUFFER_POS_NAMED(SRC, CALC, gws_params, diff_dst);
     ws = GWS_GET_BUFFER_POS_NAMED(SRC, CALC, gws_params, ws);
     src = GWS_GET_BUFFER_POS_NAMED(SRC, CALC, gws_params, src);
@@ -142,16 +149,18 @@ __kernel void reusable_calculate_stats(__global DATA_T *src,
     }
 
     *reduce_temp = diff_gamma;
-    reduce_temp[nelems] = diff_beta;
+    *reduce_temp_shift = diff_beta;
 }
 
 NAMED_KERNEL_ATTR(REDUCE)
 __kernel void reusable_reduce_stats(__global float *reduce_temp,
-        __global float *diff_scale, __global float *diff_shift,
-        __global float *variance, float eps, dim_t ic, dim_t reduce_dim,
-        dispatch_gws_rt_params_t gws_params) {
+        __global float *reduce_temp_shift, __global float *diff_scale,
+        __global float *diff_shift, __global float *variance, float eps,
+        off_t ic, off_t reduce_dim, dispatch_gws_rt_params_t gws_params) {
     reduce_temp
             = GWS_GET_BUFFER_POS_NAMED(BUFFER, REDUCE, gws_params, reduce_temp);
+    reduce_temp_shift = GWS_GET_BUFFER_POS_NAMED(
+            BUFFER, REDUCE, gws_params, reduce_temp_shift);
     variance = GWS_GET_BUFFER_POS_NAMED(BUFFER, REDUCE, gws_params, variance);
     diff_scale
             = GWS_GET_BUFFER_POS_NAMED(BUFFER, REDUCE, gws_params, diff_scale);
@@ -162,7 +171,7 @@ __kernel void reusable_reduce_stats(__global float *reduce_temp,
 
     unroll_16_for(off_t i = 0; i < reduce_dim; i++) {
         diff_gamma += reduce_temp[i * (off_t)ic];
-        diff_beta += reduce_temp[ic * reduce_dim + i * (off_t)ic];
+        diff_beta += reduce_temp_shift[i * (off_t)ic];
     }
     float sqrt_variance = 1.0f / sqrt(*variance + eps);
 
@@ -175,9 +184,9 @@ __kernel void reusable_bnorm_bwd(__global DATA_T *src, __global float *mean,
         __global float *variance, __global DATA_T *diff_dst,
         __global float *scale, __global char *ws, __global DATA_T *diff_src,
         __global float *diff_scale, __global float *diff_shift, float eps,
-        __global DATA_T *diff_src_add, dim_t div,
+        __global DATA_T *diff_src_add, off_t div,
         dispatch_gws_rt_params_t gws_params) {
-    const off_t c = GWS_GET(IC_DIM, gws_params);
+    const off_t c = GWS_GET_OFF(IC_DIM, gws_params);
     diff_dst = GWS_GET_BUFFER_POS(BUFFER, gws_params, diff_dst);
     ws = GWS_GET_BUFFER_POS(BUFFER, gws_params, ws);
     diff_src_add = GWS_GET_BUFFER_POS(BUFFER, gws_params, diff_src_add);

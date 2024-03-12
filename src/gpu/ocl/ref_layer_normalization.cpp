@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2019-2023 Intel Corporation
+* Copyright 2019-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -30,14 +30,16 @@ static status_t init_conf_common(lnorm_conf_t &conf,
         const layer_normalization_pd_t *pd, engine_t *engine) {
     using namespace dnnl::impl::format_tag;
 
-    memory_desc_wrapper src_mdw(pd->src_md());
+    memory_desc_wrapper src_mdw(
+            pd->is_fwd() ? pd->src_md() : pd->diff_src_md());
     memory_desc_wrapper stat_mdw(pd->stat_md());
     memory_desc_wrapper dst_mdw(
             pd->is_fwd() ? pd->dst_md() : pd->diff_dst_md());
 
     int ndims = src_mdw.ndims();
 
-    conf.data_type = src_mdw.data_type();
+    conf.src_dt = src_mdw.data_type();
+    conf.dst_dt = dst_mdw.data_type();
     conf.ndims = ndims;
     conf.norm_axis = pd->norm_axis();
 
@@ -91,7 +93,7 @@ static status_t init_conf_common(lnorm_conf_t &conf,
         if (src_mdw.is_dense() && c_is_last_physical && ndims < 4
                 && sg_size > 1
                 // f64 for ref impl only
-                && (conf.data_type != data_type::f64)) {
+                && utils::one_of(data_type::f64, conf.src_dt, conf.dst_dt)) {
             conf.vectorize_calc_stats = true;
             conf.sub_group_size = sg_size;
             int vector_size = 8;
@@ -132,7 +134,7 @@ static status_t init_conf_common(lnorm_conf_t &conf,
         if (src_mdw.is_dense() && c_is_last_physical
                 && sg_size > 1
                 // f64 for ref impl only
-                && (conf.data_type != data_type::f64)) {
+                && utils::one_of(data_type::f64, conf.src_dt, conf.dst_dt)) {
             conf.vectorize_bwd = true;
             conf.sub_group_size = sg_size;
             conf.vect_dt_n = 8;
@@ -175,7 +177,8 @@ static status_t init_conf_common(lnorm_conf_t &conf,
                             && (c_block == sg_size || src_mdw.matches_tag(ab)))
                         || (ndims == 3 && src_mdw.matches_tag(abc)
                                 && dims[0] == 1))
-                && (conf.data_type != data_type::f64); //f64 for ref impl only
+                // f64 for ref impl only
+                && utils::one_of(data_type::f64, conf.src_dt, conf.dst_dt);
         if (conf.vectorize_bwd_scaleshift) {
             // Use partial reduction in order to increase number of used threads
             conf.vector_size_scaleshift = c_block == sg_size ? 8 : 1;
@@ -228,6 +231,12 @@ static status_t init_conf_common(lnorm_conf_t &conf,
     conf.use_scale = pd->use_scale();
     conf.use_shift = pd->use_shift();
 
+    if (conf.use_scale || conf.use_shift) {
+        memory_desc_wrapper weights_mdw(
+                pd->is_fwd() ? pd->weights_md() : pd->diff_weights_md());
+        conf.weights_data_type = weights_mdw.data_type();
+    }
+
     conf.calculate_stats = !pd->stats_are_src();
     conf.save_stats = pd->is_training();
     conf.eps = pd->desc()->layer_norm_epsilon;
@@ -237,7 +246,8 @@ static status_t init_conf_common(lnorm_conf_t &conf,
 
 static status_t init_kernel_ctx_common(
         compute::kernel_ctx_t &kernel_ctx, const lnorm_conf_t &conf) {
-    kernel_ctx.set_data_type(conf.data_type);
+    kernel_ctx.set_data_type(conf.is_fwd ? conf.src_dt : conf.dst_dt);
+    def_data_type(kernel_ctx, conf.weights_data_type, "WEI");
 
     kernel_ctx.define_int("C", conf.norm_axis);
     kernel_ctx.define_int("NDIMS", conf.ndims);
@@ -298,6 +308,8 @@ status_t ref_layer_normalization_fwd_t::execute_forward(
     auto &scale = CTX_IN_STORAGE(DNNL_ARG_SCALE);
     auto &shift = CTX_IN_STORAGE(DNNL_ARG_SHIFT);
     auto &dst = CTX_OUT_STORAGE(DNNL_ARG_DST);
+    auto &src_scale = CTX_IN_STORAGE(DNNL_ARG_ATTR_SCALES | DNNL_ARG_SRC);
+    auto &dst_scale = CTX_IN_STORAGE(DNNL_ARG_ATTR_SCALES | DNNL_ARG_DST);
 
     compute::kernel_arg_list_t arg_list;
     arg_list.set(0, src);
@@ -307,6 +319,8 @@ status_t ref_layer_normalization_fwd_t::execute_forward(
     arg_list.set(4, scale);
     arg_list.set(5, shift);
     arg_list.set(6, conf.eps);
+    arg_list.set(7, src_scale);
+    arg_list.set(8, dst_scale);
 
     auto nd_range_kernel = conf.dispatch.nd_range();
 

@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2022-2023 Intel Corporation
+* Copyright 2022-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -54,7 +54,7 @@ inline status_t init_tag(format_tag_t &tag, memory_desc_t &md,
         tag = mdw.matches_one_of_tag(tag_value);
     }
 
-    if (tag != tag_value) return status::unimplemented;
+    VDISPATCH_CONV_IC(tag == tag_value, VERBOSE_UNSUPPORTED_TAG);
 
     return status::success;
 }
@@ -658,7 +658,7 @@ status_t brg_blocking_t::get_brgemm_ur(
                             : 0;
                     brgattr.max_top_vpad = max_vpad;
                     brgattr.max_bottom_vpad = max_vpad;
-                    brgattr.fpmath_mode = attr->fpmath_mode_;
+                    brgattr.fpmath_mode = attr->fpmath_.mode_;
                     CHECK(brgemm_desc_set_attr(&brg, brgattr));
 
                     brg.with_sum = with_sum;
@@ -1118,7 +1118,7 @@ status_t brg_blocking_t::calc_blocks() {
         }
     }
     *this = best_brgb;
-    if (sp_block <= 0) return status::unimplemented;
+    VDISPATCH_CONV_IC(sp_block > 0, VERBOSE_BLOCKING_FAIL);
 
     iw_block = is_block = sp_block;
     iw_tail = iw % iw_block;
@@ -1438,8 +1438,8 @@ status_t init_jcp(jit_brgemm_conv_conf_t &jcp, cpu_isa_t isa,
     jcp.stride_h = (ndims == 3) ? 1 : cd.strides[ndims - 4];
     jcp.stride_w = cd.strides[ndims - 3];
 
-    if (everyone_is(1, jcp.stride_d, jcp.stride_h, jcp.stride_w))
-        return status::unimplemented;
+    VDISPATCH_CONV_IC(!everyone_is(1, jcp.stride_d, jcp.stride_h, jcp.stride_w),
+            "skipping implementation as it does not support unit strides");
 
     jcp.has_uneven_iw = jcp.iw % jcp.stride_w != 0;
     const bool has_uneven_spatial = jcp.id % jcp.stride_d != 0
@@ -1451,8 +1451,8 @@ status_t init_jcp(jit_brgemm_conv_conf_t &jcp, cpu_isa_t isa,
     jcp.dilate_h = (ndims == 3) ? 0 : cd.dilates[ndims - 4];
     jcp.dilate_w = cd.dilates[ndims - 3];
 
-    if (!everyone_is(0, jcp.dilate_d, jcp.dilate_h, jcp.dilate_w))
-        return status::unimplemented;
+    VDISPATCH_CONV_IC(everyone_is(0, jcp.dilate_d, jcp.dilate_h, jcp.dilate_w),
+            "skipping implementation since non-zero dilations are detected");
 
     jcp.is = jcp.id * jcp.ih * jcp.iw;
 
@@ -1489,9 +1489,10 @@ status_t init_jcp(jit_brgemm_conv_conf_t &jcp, cpu_isa_t isa,
     jcp.simd_w = isa_max_vlen(isa) / jcp.src_dsz;
     jcp.acc_simd_w = isa_max_vlen(isa) / jcp.acc_dsz;
     jcp.is_bf32 = everyone_is(f32, jcp.src_dt, jcp.wei_dt)
-            && attr.fpmath_mode_ == fpmath_mode::bf16 && isa == avx512_core_amx;
+            && one_of(attr.fpmath_.mode_, fpmath_mode::bf16, fpmath_mode::any)
+            && isa == avx512_core_amx;
 
-    if (jcp.is_bf32) return status::unimplemented;
+    VDISPATCH_CONV_IC(!jcp.is_bf32, VERBOSE_UNSUPPORTED_DT);
 
     brg_blocking_t::last_oc_block_size
             = (jcp.wei_dt == f16 && isa == avx512_core_fp16)
@@ -1509,7 +1510,9 @@ status_t init_jcp(jit_brgemm_conv_conf_t &jcp, cpu_isa_t isa,
                             && !jcp.is_1x1)
             // Enable the shapes not supported in direct convs
             && IMPLICATION(with_groups, is_groups_ok(jcp));
-    if (is_grouped_small_oc) return status::unimplemented;
+    VDISPATCH_CONV_IC(!is_grouped_small_oc,
+            "skipping implementation as it does not support grouped "
+            "convolutions with small oc");
 
     // Dispatch the shapes to VNNI for better performance
     // TODO: optimize the perf of 3d shape with small oc and large spatial
@@ -1521,34 +1524,53 @@ status_t init_jcp(jit_brgemm_conv_conf_t &jcp, cpu_isa_t isa,
     const auto is_3d_small_oc = is_amx(jcp.isa) && jcp.ndims == 5
             && jcp.oc * jcp.ic <= 32 && jcp.id >= 128 && jcp.ih >= 128
             && jcp.iw >= 128;
-    if (is_small_shape || is_3d_small_oc) return status::unimplemented;
+    VDISPATCH_CONV_IC(!(is_small_shape || is_3d_small_oc),
+            "skipping implementation as it does not support small 3d shapes "
+            "with small oc");
+
+    // TODO: optimize 2d/3d shapes with small iw for f32
+    const auto is_small_iw = jcp.iw < 64;
+    const auto is_2d_or_3d = jcp.ih > 1 || jcp.id > 1;
+    const bool is_f32
+            = utils::everyone_is(f32, jcp.src_dt, jcp.wei_dt, jcp.dst_dt);
+    VDISPATCH_CONV_IC(!(is_f32 && is_small_iw && is_2d_or_3d),
+            "skipping implementation due to performance reason for 2d/3d "
+            "shapes with small iw");
+
+    // Disable 2 shapes that cause performance regression
+    const auto is_regression_shape = jcp.id == 1 && jcp.od == 1
+            && ((jcp.ic == 128 && jcp.oc == 256 && jcp.ih == 101 && jcp.oh == 49
+                        && jcp.iw == 85 && jcp.ow == 41)
+                    || (jcp.ic == 3 && jcp.oc == 128 && jcp.ih == 207
+                            && jcp.oh == 101 && jcp.iw == 175 && jcp.ow == 85));
+    VDISPATCH_CONV_IC(!(is_f32 && is_regression_shape),
+            "implementation skipped due to low performance");
 
     const bool is_signed_input = jcp.src_dt == s8;
     jcp.s8s8_compensation_required = is_signed_input && !isa_has_s8s8(jcp.isa);
     jcp.has_int8_vnni = isa_has_int8_vnni(jcp.isa);
 
-    if (!IMPLICATION(jcp.wei_dt == s8,
-                is_superset(jcp.isa, avx512_core)
-                        || one_of(jcp.isa, avx2_vnni, avx2_vnni_2)))
-        return status::unimplemented;
+    VDISPATCH_CONV_IC(
+            IMPLICATION(jcp.wei_dt == s8,
+                    is_superset(jcp.isa, avx512_core)
+                            || one_of(jcp.isa, avx2_vnni, avx2_vnni_2)),
+            "unsupported isa for current datatype combination");
 
-    if (!IMPLICATION(jcp.wei_dt == bf16,
-                is_superset(jcp.isa, avx512_core_bf16)
-                        || is_superset(jcp.isa, avx2_vnni_2)))
-        return status::unimplemented;
+    VDISPATCH_CONV_IC(IMPLICATION(jcp.wei_dt == bf16,
+                              is_superset(jcp.isa, avx512_core_bf16)
+                                      || is_superset(jcp.isa, avx2_vnni_2)),
+            "unsupported isa for current datatype combination");
 
-    if (!IMPLICATION(jcp.wei_dt == f16,
-                is_superset(jcp.isa, avx512_core_fp16)
-                        || is_superset(jcp.isa, avx2_vnni_2)))
-        return status::unimplemented;
+    VDISPATCH_CONV_IC(IMPLICATION(jcp.wei_dt == f16,
+                              is_superset(jcp.isa, avx512_core_fp16)
+                                      || is_superset(jcp.isa, avx2_vnni_2)),
+            "unsupported isa for current datatype combination");
 
-    const bool is_f32
-            = utils::everyone_is(f32, jcp.src_dt, jcp.wei_dt, jcp.dst_dt);
-    if (!IMPLICATION(is_f32, one_of(isa, avx512_core, avx2)))
-        return status::unimplemented;
+    VDISPATCH_CONV_IC(IMPLICATION(is_f32, one_of(isa, avx512_core, avx2)),
+            "unsupported isa for current datatype combination");
 
-    if (!post_ops_ok(jcp, attr, diff_src_d, is_deconv))
-        return status::unimplemented;
+    VDISPATCH_CONV_IC(post_ops_ok(jcp, attr, diff_src_d, is_deconv),
+            VERBOSE_UNSUPPORTED_POSTOP);
 
     jcp.amx_h = 16;
     jcp.amx_w = 64 / jcp.src_dsz;
@@ -1584,7 +1606,7 @@ status_t init_jcp(jit_brgemm_conv_conf_t &jcp, cpu_isa_t isa,
             && IMPLICATION(jcp.dst_zero_point,
                     attr.zero_points_.common(
                             is_deconv ? DNNL_ARG_DST : DNNL_ARG_DIFF_SRC));
-    if (!params_ok) return status::unimplemented;
+    VDISPATCH_CONV_IC(params_ok, VERBOSE_UNSUPPORTED_ZP_CFG);
 
     jcp.nthr = nthreads;
     jcp.copy_block_only = false;
@@ -1837,6 +1859,7 @@ status_t init_conf(jit_brgemm_conv_conf_t &jcp, cpu_isa_t isa,
 
     using namespace prop_kind;
 
+    // disabling verbose dispatch messages for unsupported isa for better readability
     if (!mayiuse(isa)) return status::unimplemented;
 
     CHECK(init_jcp(jcp, isa, cd, diff_dst_md, weights_md, diff_src_md, bias_md,
@@ -1943,8 +1966,9 @@ status_t init_conf(jit_brgemm_conv_conf_t &jcp, cpu_isa_t isa,
     // ============ end blocking ===========================================
     jcp.max_vpad = 0;
 
-    if (jcp.iw_block == 0 || jcp.oc_block == 0 || jcp.ic_block == 0)
-        return status::unimplemented;
+    VDISPATCH_CONV_IC(
+            !(jcp.iw_block == 0 || jcp.oc_block == 0 || jcp.ic_block == 0),
+            VERBOSE_BLOCKING_FAIL);
 
     jcp.gemm_batch_size = jcp.nb_oc_blocking
             * nstl::max(jcp.kd_block * jcp.kh_block * jcp.kw_block,
@@ -1993,10 +2017,11 @@ status_t init_conf(jit_brgemm_conv_conf_t &jcp, cpu_isa_t isa,
     jcp.req_cal_comp_pad = jcp.src_zero_point || jcp.s8s8_compensation_required;
 
     // Dispatch the shapes to VNNI for better performance
-    if (jcp.req_cal_comp_pad && jcp.src_zero_point && is_amx(jcp.isa)
-            && jcp.ngroups * jcp.ic * jcp.id * jcp.ih * jcp.iw < 4096
-            && jcp.ic <= 4 && jcp.oc <= 64 && jcp.mb <= 64)
-        return status::unimplemented;
+    VDISPATCH_CONV_IC(
+            !(jcp.req_cal_comp_pad && jcp.src_zero_point && is_amx(jcp.isa)
+                    && jcp.ngroups * jcp.ic * jcp.id * jcp.ih * jcp.iw < 4096
+                    && jcp.ic <= 4 && jcp.oc <= 64 && jcp.mb <= 64),
+            "heuristic to skip amx implementation for given data dimensions");
 
     if (jcp.req_cal_comp_pad) {
         const auto comp_buffer_iw = jcp.exec_type == exec_trans ? jcp.iw : 1;

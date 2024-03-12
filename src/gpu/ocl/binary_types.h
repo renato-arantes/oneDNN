@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2022-2023 Intel Corporation
+* Copyright 2022-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -18,6 +18,7 @@
 #define GPU_OCL_BINARY_TYPES_H
 #include "gpu/ocl/ocl_post_ops.h"
 #include "gpu/ocl/ocl_types.h"
+#include "gpu/ocl/ocl_utils.h"
 
 #undef DST_OFF
 #define DST_OFF(x0, x1, x2, x3, x4, x5) OFF_MD(DST, x0, x1, x2, x3, x4, x5)
@@ -35,6 +36,50 @@
 #else
 #define SRC0_TO_FLOAT CONVERT_FLOAT_T
 #endif
+
+#if SRC0_DT_BF8
+#define SRC0_BLOCK_READ(src) \
+    as_char(intel_sub_group_block_read_uc((const __global uchar *)(src)))
+#define SRC0_BLOCK_READ2(src) \
+    as_char2(intel_sub_group_block_read_uc2((const __global uchar *)(src)))
+#define SRC0_BLOCK_READ4(src) \
+    as_char4(intel_sub_group_block_read_uc4((const __global uchar *)(src)))
+#define SRC0_BLOCK_READ8(src) \
+    as_char8(intel_sub_group_block_read_uc8((const __global uchar *)(src)))
+#endif // SRC_DT_BF8
+
+#if SRC1_DT_BF8
+#define SRC1_BLOCK_READ(src) \
+    as_char(intel_sub_group_block_read_uc((const __global uchar *)(src)))
+#define SRC1_BLOCK_READ2(src) \
+    as_char2(intel_sub_group_block_read_uc2((const __global uchar *)(src)))
+#define SRC1_BLOCK_READ4(src) \
+    as_char4(intel_sub_group_block_read_uc4((const __global uchar *)(src)))
+#define SRC1_BLOCK_READ8(src) \
+    as_char8(intel_sub_group_block_read_uc8((const __global uchar *)(src)))
+#endif // SRC_DT_BF8
+
+#if SRC0_DT_HF8
+#define SRC0_BLOCK_READ(src) \
+    as_char(intel_sub_group_block_read_uc((const __global uchar *)(src)))
+#define SRC0_BLOCK_READ2(src) \
+    as_char2(intel_sub_group_block_read_uc2((const __global uchar *)(src)))
+#define SRC0_BLOCK_READ4(src) \
+    as_char4(intel_sub_group_block_read_uc4((const __global uchar *)(src)))
+#define SRC0_BLOCK_READ8(src) \
+    as_char8(intel_sub_group_block_read_uc8((const __global uchar *)(src)))
+#endif // SRC_DT_HF8
+
+#if SRC1_DT_HF8
+#define SRC1_BLOCK_READ(src) \
+    as_char(intel_sub_group_block_read_uc((const __global uchar *)(src)))
+#define SRC1_BLOCK_READ2(src) \
+    as_char2(intel_sub_group_block_read_uc2((const __global uchar *)(src)))
+#define SRC1_BLOCK_READ4(src) \
+    as_char4(intel_sub_group_block_read_uc4((const __global uchar *)(src)))
+#define SRC1_BLOCK_READ8(src) \
+    as_char8(intel_sub_group_block_read_uc8((const __global uchar *)(src)))
+#endif // SRC_DT_HF8
 
 #if SRC0_DT_S8
 #define SRC0_BLOCK_READ(src) \
@@ -168,6 +213,25 @@
     as_ushort8(intel_sub_group_block_read_us8((const __global ushort *)(src)))
 #endif // SRC1_DT_BF16
 
+#if DST_DT_BF8 || DST_DT_HF8
+#define DST_BLOCK_READ(src) \
+    as_char(intel_sub_group_block_read_uc((const __global uchar *)(src)))
+#define DST_BLOCK_READ2(src) \
+    as_char2(intel_sub_group_block_read_uc2((const __global uchar *)(src)))
+#define DST_BLOCK_READ4(src) \
+    as_char4(intel_sub_group_block_read_uc4((const __global uchar *)(src)))
+#define DST_BLOCK_READ8(src) \
+    as_char8(intel_sub_group_block_read_uc8((const __global uchar *)(src)))
+#define DST_BLOCK_WRITE(dst, val) \
+    intel_sub_group_block_write_uc((__global uchar *)(dst), as_uchar(val))
+#define DST_BLOCK_WRITE2(dst, val) \
+    intel_sub_group_block_write_uc2((__global uchar *)(dst), as_uchar2(val))
+#define DST_BLOCK_WRITE4(dst, val) \
+    intel_sub_group_block_write_uc4((__global uchar *)(dst), as_uchar4(val))
+#define DST_BLOCK_WRITE8(dst, val) \
+    intel_sub_group_block_write_uc8((__global uchar *)(dst), as_uchar8(val))
+#endif // DST_DT_HF8 || DST_DT_BF8
+
 #if DST_DT_S8
 #define DST_BLOCK_READ(src) \
     as_char(intel_sub_group_block_read_uc((const __global uchar *)(src)))
@@ -292,35 +356,43 @@
 #define ELEM_DATA_T float8
 #endif
 
-ELEM_DATA_T get_eltwise_op(ELEM_DATA_T src0, ELEM_DATA_T src1) {
-    ELEM_DATA_T d = 0;
-#if IS_ADD
-    d = src0 + src1;
-#elif IS_MUL
-    d = src0 * src1;
-#elif IS_MAX
-    d = max(src0, src1);
-#elif IS_MIN
-    d = min(src0, src1);
-#elif IS_DIV
-    d = src0 / src1;
-#elif IS_SUB
-    d = src0 - src1;
-#elif IS_GE
-    d = (src0 >= src1) ? 1.0f : 0.0f;
-#elif IS_GT
-    d = (src0 > src1) ? 1.0f : 0.0f;
-#elif IS_LE
-    d = (src0 <= src1) ? 1.0f : 0.0f;
-#elif IS_LT
-    d = (src0 < src1) ? 1.0f : 0.0f;
-#elif IS_EQ
-    d = (src0 == src1) ? 1.0f : 0.0f;
-#elif IS_NE
-    d = (src0 != src1) ? 1.0f : 0.0f;
-#endif
-    return d;
-}
+#define DEF_binary_op(dt, special_dt) \
+    dt __attribute__((overloadable)) binary_op(int alg, dt src0, dt src1) { \
+        switch (alg) { \
+            case (BINARY_ADD): return src0 + src1; \
+            case (BINARY_MUL): return src0 * src1; \
+            case (BINARY_MAX): return max(src0, src1); \
+            case (BINARY_MIN): return min(src0, src1); \
+            case (BINARY_DIV): return src0 / src1; \
+            case (BINARY_SUB): return src0 - src1; \
+            case (BINARY_GE): \
+                return (src0 >= src1) ? SPECIAL(special_dt, one) \
+                                      : SPECIAL(special_dt, zero); \
+            case (BINARY_GT): \
+                return (src0 > src1) ? SPECIAL(special_dt, one) \
+                                     : SPECIAL(special_dt, zero); \
+            case (BINARY_LE): \
+                return (src0 <= src1) ? SPECIAL(special_dt, one) \
+                                      : SPECIAL(special_dt, zero); \
+            case (BINARY_LT): \
+                return (src0 < src1) ? SPECIAL(special_dt, one) \
+                                     : SPECIAL(special_dt, zero); \
+            case (BINARY_EQ): \
+                return (src0 == src1) ? SPECIAL(special_dt, one) \
+                                      : SPECIAL(special_dt, zero); \
+            case (BINARY_NE): \
+                return (src0 != src1) ? SPECIAL(special_dt, one) \
+                                      : SPECIAL(special_dt, zero); \
+        } \
+        DEBUG_PRINT("Invalid binary op: %d\n", alg); \
+        return SPECIAL(special_dt, max); \
+    }
+
+DEF_binary_op(float, float);
+DEF_binary_op(float2, float);
+DEF_binary_op(float4, float);
+DEF_binary_op(float8, float);
+#undef DEF_binary_op
 
 #define READ_DATA(size, name, source_ptr, dest_ptr, scale) \
     { \

@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2020-2023 Intel Corporation
+* Copyright 2020-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -59,15 +59,17 @@ struct jit_brgemm_kernel_t : public jit_generator {
             static constexpr bool preserve_gpr = true;
             static constexpr bool preserve_vmm = true;
             static constexpr bool use_exact_tail_scalar_bcast = false;
-            const auto dst_md_wrapper = memory_desc_wrapper(brg.dst_md);
+            const auto dst_md_wrapper = memory_desc_wrapper(brg.dst_md());
 
             static const bcast_set_t enabled_bcast_strategy
                     = {broadcasting_strategy_t::scalar,
                             broadcasting_strategy_t::per_oc,
                             broadcasting_strategy_t::per_oc_spatial,
+                            broadcasting_strategy_t::per_mb,
                             broadcasting_strategy_t::per_mb_spatial,
                             broadcasting_strategy_t::per_mb_w,
                             broadcasting_strategy_t::per_w,
+                            broadcasting_strategy_t::batch,
                             broadcasting_strategy_t::no_broadcast};
             const binary_injector::rhs_arg_static_params_t rhs_sp {
                     static_cast<size_t>(vmm_tmp(0).getIdx()), this->r14,
@@ -79,11 +81,11 @@ struct jit_brgemm_kernel_t : public jit_generator {
                     this->param1, enabled_bcast_strategy, rhs_sp};
 
             postops_injector_ = utils::make_unique<po_injector_t>(
-                    this, brg.attr->post_ops_, bsp);
+                    this, brg.attr()->post_ops_, bsp);
 
             with_binary_non_scalar_bcast_ = binary_injector::
                     any_binary_postop_rhs_non_scalar_broadcast(
-                            brg.attr->post_ops_, dst_md_wrapper);
+                            brg.attr()->post_ops_, dst_md_wrapper);
         }
         if (brg.is_bf16_emu)
             bf16_emu_ = utils::make_unique<bf16_emulation_t>(this,
@@ -560,8 +562,7 @@ jit_brgemm_kernel_t<isa, Wmm>::vmm_lower_mask(const Vmm_lower_t vmm_lower_in,
 template <cpu_isa_t isa, typename Wmm>
 void jit_brgemm_kernel_t<isa, Wmm>::maybe_set_avx_mask(bool is_ld_tail) {
     if (IMPLICATION(is_ld_tail, isa_has_masks(brg.isa_impl))) return;
-    mov(reg_tmp_gpr, avx_tail_mask_);
-    vmovups(vmm_tail_mask(), ptr[reg_tmp_gpr]);
+    vmovups(vmm_tail_mask(), ptr[rip + avx_tail_mask_]);
 }
 
 template <cpu_isa_t isa, typename Wmm>
@@ -1035,7 +1036,7 @@ void jit_brgemm_kernel_t<isa, Wmm>::apply_post_ops(
                         mov(reg_ptr_sum_scale,
                                 reinterpret_cast<size_t>(p_sum_scale));
                     } else {
-                        mov(reg_ptr_sum_scale, sum_zp_scale_data_);
+                        lea(reg_ptr_sum_scale, ptr[rip + sum_zp_scale_data_]);
                     }
                 }
 
@@ -1197,8 +1198,7 @@ void jit_brgemm_kernel_t<isa, Wmm>::store_accumulators_apply_post_ops(
         for (int bd = 0; bd < bd_block; bd++) {
             for (int ld = 0; ld < ld_block2; ld++) {
                 auto vmm = accm(ld_block2, bd, ld);
-                saturate_f32(vmm, vmm_lbound, vmm_ubound, brg.dt_d);
-                uni_vcvtps2dq(vmm, vmm);
+                saturate_cvt_f32(vmm, vmm_lbound, vmm_ubound, brg.dt_d);
             }
         }
         // below call is not required as s32 doesn't use vmm_lbound
@@ -1358,8 +1358,7 @@ void jit_brgemm_kernel_t<isa, Wmm>::store_accumulators_without_post_ops(
         for (int bd = 0; bd < bd_block; bd++) {
             for (int ld = 0; ld < ld_block2; ld++) {
                 auto vmm = accm(ld_block2, bd, ld);
-                saturate_f32(vmm, vmm_lbound, vmm_ubound, brg.dt_d);
-                uni_vcvtps2dq(vmm, vmm);
+                saturate_cvt_f32(vmm, vmm_lbound, vmm_ubound, brg.dt_d);
             }
         }
         // below call is not required as s32 doesn't use vmm_lbound
@@ -1749,7 +1748,7 @@ void jit_brgemm_kernel_t<isa, Wmm>::dot_product(Vmm v1, Vmm v2, Vmm v3) {
     else if (brg.is_bf16)
         vdpbf16ps(v1, v2, v3);
     else if (brg.is_int8) {
-        if (brg.isa_impl == avx2_vnni_2 && brg.dt_a == data_type::s8)
+        if (brg.dt_a == data_type::s8 && isa_has_s8s8(brg.isa_impl))
             vpdpbssd(v1, v3, v2);
         else if (brg.has_int8_vnni)
             vpdpbusd(v1, v3, v2,
@@ -2525,9 +2524,8 @@ brgemm_attr_t::brgemm_attr_t()
     , static_offsets(nullptr) {}
 
 template <cpu_isa_t isa, typename Wmm>
-brgemm_kernel_common_t<isa, Wmm>::brgemm_kernel_common_t(const brgemm_t abrd) {
-    brgemm_kernel_ = new jit_brgemm_kernel_t<isa, Wmm>(abrd);
-}
+brgemm_kernel_common_t<isa, Wmm>::brgemm_kernel_common_t(const brgemm_t &abrd)
+    : brgemm_kernel_(new jit_brgemm_kernel_t<isa, Wmm>(abrd)) {}
 
 template <cpu_isa_t isa, typename Wmm>
 status_t brgemm_kernel_common_t<isa, Wmm>::create_kernel() {

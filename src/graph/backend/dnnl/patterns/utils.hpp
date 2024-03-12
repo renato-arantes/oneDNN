@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2020-2023 Intel Corporation
+* Copyright 2020-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -33,6 +33,7 @@ namespace pattern {
 
 template <int64_t N>
 bool check_zps_values(op_t *op) {
+    if (op->has_attr(op_attr::zps) == false) return true;
     auto zps = op->get_attr<std::vector<int64_t>>(op_attr::zps);
     return std::all_of(
             zps.begin(), zps.end(), [](int64_t i) { return i == N; });
@@ -104,6 +105,21 @@ bool check_producer_input_num(op_t *op) {
 inline bool check_qtype_equal_to_per_tensor(op_t *op) {
     std::string qtype = op->get_attr<std::string>(op_attr::qtype);
     return qtype == "per_tensor";
+}
+
+inline bool check_begin_norm_axis_attr(const op_t *op) {
+    const logical_tensor_t &src_lt
+            = op->get_input_value(0)->get_logical_tensor();
+    const auto src_lt_wrapper = logical_tensor_wrapper_t(src_lt);
+    const auto ndims = src_lt_wrapper.ndims();
+
+    if (op->has_attr(op_attr::begin_norm_axis)) {
+        const auto begin_norm_axis
+                = op->get_attr<int64_t>(op_attr::begin_norm_axis);
+        if (ndims == DNNL_GRAPH_UNKNOWN_NDIMS) return begin_norm_axis == -1;
+        return begin_norm_axis == -1 || begin_norm_axis == ndims - 1;
+    }
+    return true;
 }
 
 inline const std::vector<op_kind_t> &get_unary_ops() {
@@ -210,6 +226,21 @@ inline bool check_if_constant_weight(op_t *op) {
     }
 }
 
+inline bool is_int8_quantization(const op_t *op) {
+    const op_kind_t kind = op->get_kind();
+    if (kind == graph::op_kind::Quantize) {
+        const auto &out = op->get_output_value(0)->get_logical_tensor();
+        return graph::utils::one_of(
+                out.data_type, graph::data_type::s8, graph::data_type::u8);
+    } else if (kind == graph::op_kind::Dequantize) {
+        const auto &in = op->get_input_value(0)->get_logical_tensor();
+        return graph::utils::one_of(
+                in.data_type, graph::data_type::s8, graph::data_type::u8);
+    } else {
+        return false;
+    }
+}
+
 // Optional BiasAdd after operator like Conv/ConvTranspose/Matmul. If
 // `maybe_typecase` is true, there will also be an optional TypeCast before the
 // 2nd input of BiasAdd.
@@ -245,6 +276,7 @@ inline graph::utils::pm::repetition_t *post_quantized_add(
         graph::utils::pm::pb_node_t *input, bool check_zps = false) {
     graph::utils::pm::pb_op_t *pdequant_add
             = pgraph->append_op(graph::op_kind::Dequantize);
+    pdequant_add->append_decision_function(is_int8_quantization);
     if (check_zps) pdequant_add->append_decision_function(check_zps_values<0>);
     graph::utils::pm::pb_op_t *padd = pgraph->append_op(graph::op_kind::Add,
             graph::utils::pm::in_edges_t {
@@ -287,6 +319,7 @@ inline graph::utils::pm::pb_node_t *optional_smooth_quant(
     graph::utils::pm::pb_op_t *quant_out
             = p_curr_graph->append_op(graph::op_kind::Quantize,
                     graph::utils::pm::in_edges_t {in_edge(0, opt, 0)});
+    quant_out->append_decision_function(is_int8_quantization);
     if (optional_qout) {
         p_curr_graph->create_input_port(0, opt, 0);
         p_curr_graph->create_output_port(0, quant_out, 0);

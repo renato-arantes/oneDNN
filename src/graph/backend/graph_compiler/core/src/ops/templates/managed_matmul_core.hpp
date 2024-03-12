@@ -1,5 +1,5 @@
 /*******************************************************************************
- * Copyright 2022-2023 Intel Corporation
+ * Copyright 2022-2024 Intel Corporation
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -39,6 +39,13 @@ struct managed_matmul_core_config_t {
 class gen_managed_matmul_core_t
   : public body_generator_t<managed_matmul_core_config_t> {
 public:
+  // for specific shapes, dtypes and num_threads (refer to
+  // ops::managed_matmul_core_op_t for exact value), we dispatch to avx instead
+  // of amx.
+  int64_t dispatch_avx_ = 0;
+
+  int split_iim_ = -1;
+
   // inner most block
   int iim_block_;
   int iin_block_;
@@ -106,17 +113,6 @@ public:
     const expr &k_s = expr(), bool is_dynamic = false,
     const expr &N_block_size_expr = expr()) const;
 
-  void single_thread_reorder_matmul_call(context_ptr ctx,
-    const logical_tensor_t &ta, const logical_tensor_t &tb,
-    const logical_tensor_t &tc, const managed_matmul_core_config_t &config,
-    const expr &M, const expr &N, const expr &K, const expr &m_idx,
-    const expr &n_idx, const expr &k_idx, const expr &A, expr &B, const expr &C,
-    int dtype_block, fusion_anchor_mgr_t *fusion, const expr &m_s,
-    const expr &n_s, std::vector<int> &M_anchor_info,
-    std::vector<int> &N_anchor_info, std::vector<int> &K_anchor_info,
-    bool is_partial = false, const expr &k_s = expr(),
-    bool is_dynamic = false) const;
-
   void dynamic_single_thread_matmul_call(
     const managed_matmul_core_config_t &config,
     const std::vector<expr> &buffer_args, const expr &m_s, const expr &n_s,
@@ -144,6 +140,9 @@ public:
   void schedule_loops(context_ptr ctx,
     const managed_matmul_core_config_t &config, stmt body,
     std::vector<for_loop> &fors) const override;
+
+  int suggest_aligned_iim_block(
+    const size_t plain_M, const size_t default_block, bool is_f32);
 };
 } // namespace ops
 } // namespace gc

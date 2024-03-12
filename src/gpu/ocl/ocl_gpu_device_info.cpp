@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2019-2023 Intel Corporation
+* Copyright 2019-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -17,6 +17,8 @@
 #include "gpu/ocl/ocl_gpu_device_info.hpp"
 #include "gpu/ocl/ocl_gpu_engine.hpp"
 #include "gpu/ocl/ocl_gpu_hw_info.hpp"
+
+#include <CL/cl_ext.h>
 
 namespace dnnl {
 namespace impl {
@@ -147,6 +149,19 @@ status_t ocl_gpu_device_info_t::init_attributes(engine_t *engine) {
     OCL_CHECK(err);
     max_wg_size_ = max_wg_size;
 
+#ifdef cl_intel_unified_shared_memory
+    cl_device_unified_shared_memory_capabilities_intel
+            system_memory_capabilities_intel
+            = 0;
+    err = clGetDeviceInfo(device,
+            CL_DEVICE_SHARED_SYSTEM_MEM_CAPABILITIES_INTEL,
+            sizeof(cl_device_unified_shared_memory_capabilities_intel),
+            &system_memory_capabilities_intel, nullptr);
+    OCL_CHECK(err);
+    mayiuse_system_memory_allocators_ = system_memory_capabilities_intel
+            & CL_UNIFIED_SHARED_MEMORY_ACCESS_INTEL;
+#endif
+
     return status::success;
 }
 
@@ -172,7 +187,19 @@ std::string ocl_gpu_device_info_t::get_cl_ext_options() const {
                     device_ext_t::intel_dot_accumulate))
             opts += std::string("-D") + ext2cl_str(ext) + " ";
     }
-    if (!opts.empty()) { opts[opts.size() - 1] = '\0'; }
+
+#ifdef DNNL_DEV_MODE
+    // Preferably this would be in `kernel_ctx::set_default_options()`, but
+    // warnings are emitted for the automatic down conversions of double
+    // literals to float. This behavior is desirable to avoid duplicate
+    // implementations, so -Werror is disabled when fp64 support is not
+    // available instead.
+    bool enabled_werror = gpu_utils::dev_getenv(
+            "enable_ocl_werror", has(device_ext_t::khr_fp64));
+
+    if (enabled_werror) opts += "-Werror ";
+#endif
+
     return opts;
 }
 

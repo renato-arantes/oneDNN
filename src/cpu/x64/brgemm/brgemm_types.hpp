@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2020-2023 Intel Corporation
+* Copyright 2020-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -160,8 +160,8 @@ struct DNNL_API brgemm_attr_t {
     // and there is no unrolling by batchsize in kernel
     bool var_bs {false};
     bool postops_only {false};
-    // Grouping in batch. Used by brdgmm
-    int bs_group {0};
+    // Hint for bs_group value in brgemm_t
+    int hint_bs_group {0};
 
     int hint_bd_block {0};
     int hint_ld_block {0};
@@ -187,6 +187,10 @@ struct DNNL_API brgemm_attr_t {
 };
 
 struct brgemm_t {
+    brgemm_t() {}
+    brgemm_t(const brgemm_t &other);
+    DNNL_API ~brgemm_t();
+
     // Note: new added parameters must be taken into account in the brgemm
     // comparison function
     int bcast_dim = 0; // M;
@@ -215,7 +219,7 @@ struct brgemm_t {
     dim_t stride_b = 0;
 
     brgemm_layout_t layout = brgemm_layout_undef;
-    brgemm_batch_kind_t type;
+    brgemm_batch_kind_t type = brgemm_batch_kind_t::brgemm_addr;
     bool is_dgmm = false; // set to true in brdgmm_desc_init
     bool with_sum = false;
     bool req_cal_comp_pads = false;
@@ -223,7 +227,7 @@ struct brgemm_t {
 
     float sum_scale = 0.0f;
     int32_t sum_zp = 0;
-    impl::data_type_t sum_dt;
+    impl::data_type_t sum_dt = data_type::undef;
     bool with_eltwise = false;
     bool with_binary = false;
     bool with_scales = false;
@@ -234,6 +238,8 @@ struct brgemm_t {
 
     int is_oc_scale = 0;
     bool with_dst_scales = false;
+    // Grouping in batch used by brdgmm kernel
+    int bs_group {0};
 
     brgemm_attr_t brgattr;
 
@@ -273,7 +279,7 @@ struct brgemm_t {
     bool req_s8s8_compensation = false;
     bool with_weights_scale_adjust = false;
     brgemm_kernel_innermost_loop_t innermost_loop = brgemm_ld_loop_innermost;
-    int is_M_tail;
+    int is_M_tail = false;
     bool interleave_tilestores_ = false;
     brgemm_prf_t prfA, prfB, prfC;
     bool is_runtime_lda = false;
@@ -284,8 +290,10 @@ struct brgemm_t {
     static constexpr int MAX_VPAD = 100;
     static constexpr int AMX_TILES_NUM = 8;
 
-    const primitive_attr_t *attr = nullptr;
-    const memory_desc_t *dst_md = nullptr;
+    void set_attr(const primitive_attr_t *ppdattr);
+    void set_dst_md(const memory_desc_t *pdst_md);
+    const primitive_attr_t *attr() const { return attr_; };
+    const memory_desc_t *dst_md() const { return dst_md_; };
 
     bool is_row_major() const {
         assert(layout != brgemm_layout_undef);
@@ -361,7 +369,7 @@ struct brgemm_t {
 
     bool is_b_data_layout_vnni() {
         // True in general, only exception is f16 with avx512_core_fp16.
-        // We also return `true` for bf32 (brgattr.fpmath_mode_ = bf16),
+        // We also return `true` for bf32 (brgattr.fpmath_.mode_ = bf16),
         // because the data transformation to vnni layout is internal
         // and transparent to user.
         return !(dt_b == data_type::f16 && isa_impl == avx512_core_fp16);
@@ -370,6 +378,19 @@ struct brgemm_t {
 
     bool operator==(const brgemm_t &rhs) const;
     bool operator<(const brgemm_t &rhs) const;
+
+private:
+    primitive_attr_t *attr_ {nullptr};
+    memory_desc_t *dst_md_ {nullptr};
+    void set_attr_null() { attr_ = nullptr; };
+    void set_dst_md_null() { dst_md_ = nullptr; };
+
+    void cleanup_attr();
+    void cleanup_dst_md();
+
+    // The default assignment operator is intended to be used in custom copy
+    // constructor only to avoid copying field-by-field
+    brgemm_t &operator=(const brgemm_t &) = default;
 };
 
 struct brgemm_dynamic_values_t {
@@ -445,7 +466,7 @@ struct brgemm_kernel_t {
 
 template <cpu_isa_t isa, typename Vmm>
 struct brgemm_kernel_common_t : public brgemm_kernel_t {
-    brgemm_kernel_common_t(const brgemm_t abrd);
+    brgemm_kernel_common_t(const brgemm_t &abrd);
     ~brgemm_kernel_common_t();
 
     status_t create_kernel();
@@ -459,7 +480,7 @@ private:
 };
 
 struct brgemm_amx_uker_t : public brgemm_kernel_t {
-    brgemm_amx_uker_t(const brgemm_t abrd);
+    brgemm_amx_uker_t(const brgemm_t &abrd);
     ~brgemm_amx_uker_t();
 
     status_t create_kernel();
@@ -474,7 +495,7 @@ private:
 
 template <cpu_isa_t isa, typename Vmm>
 struct brdgmm_kernel_t : public brgemm_kernel_t {
-    brdgmm_kernel_t(const brgemm_t abrd);
+    brdgmm_kernel_t(const brgemm_t &abrd);
     ~brdgmm_kernel_t();
 
     status_t create_kernel();

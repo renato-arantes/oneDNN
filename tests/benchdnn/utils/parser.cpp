@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2019-2023 Intel Corporation
+* Copyright 2019-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -279,6 +279,43 @@ attr_t::post_ops_t parse_attr_post_ops_func(const std::string &s) {
 
     return v;
 }
+
+attr_t::deterministic_t parse_attr_deterministic_func(const std::string &s) {
+    attr_t::deterministic_t v;
+    if (s.empty()) return v;
+
+    v.enabled = str2bool(s.c_str());
+    return v;
+}
+
+attr_t::fpmath_mode_t parse_attr_fpmath_mode_func(const std::string &s) {
+    attr_t::fpmath_mode_t v;
+    if (s.empty()) return v;
+
+    size_t start_pos = 0;
+    auto subs = get_substr(s, start_pos, ':');
+    v.mode = str2fpmath_mode(subs.c_str());
+    if (start_pos == std::string::npos) return v;
+    if (start_pos >= s.size()) {
+        BENCHDNN_PRINT(0, "%s \'%s\'\n",
+                "Error: dangling symbol at the end of input", s.c_str());
+        SAFE_V(FAIL);
+    }
+
+    if (start_pos != std::string::npos) {
+        subs = get_substr(s, start_pos, '\0');
+        v.apply_to_int = str2bool(subs.c_str());
+
+        if (start_pos != std::string::npos) {
+            BENCHDNN_PRINT(0, "%s \'%s\'\n",
+                    "Error: dangling symbol at the end of input", s.c_str());
+            SAFE_V(FAIL);
+        }
+    }
+
+    return v;
+}
+
 } // namespace parser_utils
 
 // vector types
@@ -447,14 +484,16 @@ bool parse_attr_scratchpad_mode(
             str2scratchpad_mode, str, option_name, help);
 }
 
-bool parse_attr_fpmath_mode(std::vector<dnnl_fpmath_mode_t> &fpmath_mode,
-        const std::vector<dnnl_fpmath_mode_t> &def_fpmath_mode, const char *str,
-        const std::string &option_name /* = "attr-fpmath"*/) {
+bool parse_attr_fpmath_mode(std::vector<attr_t::fpmath_mode_t> &fpmath_mode,
+        const std::vector<attr_t::fpmath_mode_t> &def_fpmath_mode,
+        const char *str, const std::string &option_name /* = "attr-fpmath"*/) {
     static const std::string help
-            = "MODE    (Default: `strict`)\n    Specifies fpmath_mode "
-              "attribute. `MODE` values can be `strict` or `bf16`.\n";
-    return parse_vector_option(fpmath_mode, def_fpmath_mode, str2fpmath_mode,
-            str, option_name, help);
+            = "MODE[:APPLY_TO_INT]    (Default: `strict[:false]`)\n    "
+              "Specifies "
+              "fpmath_mode attribute. `MODE` values can be `strict` or "
+              "`bf16`. `APPLY_TO_INT` values can be `true` or `false`.\n";
+    return parse_vector_option(fpmath_mode, def_fpmath_mode,
+            parser_utils::parse_attr_fpmath_mode_func, str, option_name, help);
 }
 
 bool parse_attr_acc_mode(std::vector<dnnl_accumulation_mode_t> &acc_mode,
@@ -467,6 +506,19 @@ bool parse_attr_acc_mode(std::vector<dnnl_accumulation_mode_t> &acc_mode,
               "`f32`, `f16` or `s32`.\n";
     return parse_vector_option(acc_mode, def_acc_mode, str2accumulation_mode,
             str, option_name, help);
+}
+
+bool parse_attr_deterministic(
+        std::vector<attr_t::deterministic_t> &deterministic,
+        const std::vector<attr_t::deterministic_t> &def_deterministic,
+        const char *str,
+        const std::string &option_name /* = "attr-deterministic"*/) {
+    static const std::string help
+            = "MODE    (Default: `false`)\n    Specifies deterministic mode "
+              "attribute. `MODE` values can be `true`, or `false`.\n";
+    return parse_vector_option(deterministic, def_deterministic,
+            parser_utils::parse_attr_deterministic_func, str, option_name,
+            help);
 }
 
 bool parse_axis(std::vector<int> &axis, const std::vector<int> &def_axis,
@@ -516,11 +568,11 @@ bool parse_strides(std::vector<vdims_t> &strides,
         const std::vector<vdims_t> &def_strides, const char *str,
         const std::string &option_name /* = "strides"*/) {
     static const std::string help
-            = "DIMS_SRC:DIMS_WEI:DIMS_DST    (Default: not specified)\n    "
-              "Specifies strides `DIMS_ARG` for correspondent `ARG`.\n    If "
-              "correspondent `DIMS_ARG` is empty, it does not take an "
-              "effect.\n    More details at "
-            + doc_url + "driver_matmul.md\n";
+            = "DIMS_SRC[:DIMS_WEI]:DIMS_DST    (Default: not specified)\n    "
+              "Specifies strides `DIMS_ARG` for correspondent supported "
+              "`ARG`.\n    If correspondent `DIMS_ARG` is empty, it does not "
+              "take an effect.\n    More details at "
+            + doc_url + "driver_" + driver_name + ".md\n";
     auto str2strides = [&](const char *str) -> vdims_t {
         vdims_t strides(STRIDES_SIZE);
         parse_multivector_str(
@@ -772,20 +824,45 @@ static bool parse_engine(
     return true;
 }
 
-static bool parse_fast_ref_gpu(
-        const char *str, const std::string &option_name = "fast-ref-gpu") {
+static bool parse_fast_ref(
+        const char *str, const std::string &option_name = "fast-ref") {
     static const std::string help
             = "BOOL    (Default: `true`)\n    Instructs the driver to use "
               "faster reference path when doing correctness testing for "
               "`--engine=gpu`.\n    When set to `true`, the library best fit "
               "CPU implementation is used to compute the reference path.\n";
     bool parsed = parse_single_value_option(
-            fast_ref_gpu, true, str2bool, str, option_name, help);
+            fast_ref, default_fast_ref, str2bool, str, option_name, help);
 #if DNNL_CPU_RUNTIME == DNNL_RUNTIME_NONE
-    if (parsed && fast_ref_gpu) {
-        fast_ref_gpu = false;
+    if (parsed && fast_ref) {
+        fast_ref = false;
         fprintf(stderr,
-                "%s driver: WARNING: option `fast_ref_gpu` is not supported "
+                "%s driver: WARNING: option `fast_ref` is not supported "
+                "for GPU only configurations.\n",
+                driver_name.c_str());
+    }
+#endif
+    return parsed;
+}
+
+// TODO: remove
+static bool parse_fast_ref_gpu(
+        const char *str, const std::string &option_name = "fast-ref-gpu") {
+    bool parsed = parse_single_value_option(fast_ref, default_fast_ref,
+            str2bool, str, option_name, std::string());
+
+    static bool msg_printed = false;
+    if (parsed && !msg_printed) {
+        BENCHDNN_PRINT(0, "%s\n",
+                "Warning: \'--fast-ref-gpu\' is deprecated. Use \'--fast-ref\' "
+                "instead.");
+        msg_printed = true;
+    }
+#if DNNL_CPU_RUNTIME == DNNL_RUNTIME_NONE
+    if (parsed && fast_ref) {
+        fast_ref = false;
+        fprintf(stderr,
+                "%s driver: WARNING: option `fast_ref` is not supported "
                 "for GPU only configurations.\n",
                 driver_name.c_str());
     }
@@ -957,6 +1034,7 @@ static bool parse_mode(
               "    * `C` for correctness testing.\n"
               "    * `P` for performance testing.\n"
               "    * `F` for fast performance testing (GPU only).\n"
+              "    * `B` for bitwise (numerical determinism) testing.\n"
               "    * `CP` for both correctness and performance testing.\n"
               "    More details at "
             + doc_url + "benchdnn_general_info.md\n";
@@ -966,7 +1044,7 @@ static bool parse_mode(
         if (_str.size() > 2) {
             BENCHDNN_PRINT(
                     0, "%s\n%s", "Error: mode value is invalid.", help.c_str());
-            exit(2);
+            SAFE_V(FAIL);
         } else if (_str.size() == 2) {
             for (size_t i = 0; i < _str.size(); i++) {
                 switch (_str[i]) {
@@ -977,7 +1055,7 @@ static bool parse_mode(
                     default:
                         BENCHDNN_PRINT(0, "%s\n%s",
                                 "Error: mode value is invalid.", help.c_str());
-                        exit(2);
+                        SAFE_V(FAIL);
                 }
             }
             mode = bench_mode_t::corr_perf;
@@ -1000,10 +1078,12 @@ static bool parse_mode(
                     bench_mode_modifier = mode_modifier_t::par_create
                             | mode_modifier_t::no_host_memory;
                     break;
+                case 'b':
+                case 'B': mode = bench_mode_t::bitwise; break;
                 default:
                     BENCHDNN_PRINT(0, "%s\n%s", "Error: mode value is invalid.",
                             help.c_str());
-                    exit(2);
+                    SAFE_V(FAIL);
             }
         }
 
@@ -1146,10 +1226,11 @@ bool parse_bench_settings(const char *str) {
     bool parsed = parse_allow_enum_tags_only(str)
             || parse_attr_same_pd_check(str) || parse_canonical(str)
             || parse_cold_cache(str) || parse_cpu_isa_hints(str)
-            || parse_engine(str) || parse_fast_ref_gpu(str)
-            || parse_fix_times_per_prb(str) || parse_max_ms_per_prb(str)
-            || parse_num_streams(str) || parse_repeats_per_prb(str)
-            || parse_mem_check(str) || parse_memory_kind(str) || parse_mode(str)
+            || parse_engine(str) || parse_fast_ref(str)
+            || parse_fast_ref_gpu(str) || parse_fix_times_per_prb(str)
+            || parse_max_ms_per_prb(str) || parse_num_streams(str)
+            || parse_repeats_per_prb(str) || parse_mem_check(str)
+            || parse_memory_kind(str) || parse_mode(str)
             || parse_mode_modifier(str) || parse_skip_impl(str)
             || parse_start(str) || parse_stream_kind(str) || parse_verbose(str);
 

@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2021-2023 Intel Corporation
+* Copyright 2021-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -310,7 +310,7 @@ status_t brgemm_convolution_fwd_t<isa, use_inversion>::pd_t::add_brg_descriptor(
         brgattr.max_top_vpad = jcp_.max_vpad;
         brgattr.max_bottom_vpad = jcp_.max_vpad;
     }
-    brgattr.fpmath_mode = attr()->fpmath_mode_;
+    brgattr.fpmath_mode = attr()->fpmath_.mode_;
     brgattr.K_koef = (float)bs / KW;
 
     CHECK(brgemm_desc_set_attr(&brg, brgattr));
@@ -418,19 +418,27 @@ status_t brgemm_convolution_fwd_t<isa, use_inversion>::pd_t::init(
 
     using skip_mask_t = primitive_attr_t::skip_mask_t;
     auto skip_mask = skip_mask_t::post_ops | skip_mask_t::sum_dt
-            | skip_mask_t::zero_points_runtime;
+            | skip_mask_t::zero_points_runtime | skip_mask_t::fpmath_mode;
     if (is_int8) skip_mask |= skip_mask_t::scales_runtime;
 
-    bool ok = is_fwd() && set_default_alg_kind(alg_kind::convolution_direct)
-            && IMPLICATION(is_int8,
-                    one_of(bias_md_.data_type, data_type::undef, f32, s32, s8,
-                            u8))
-            && IMPLICATION(!is_int8,
-                    one_of(bias_md_.data_type, data_type::undef, f32, src_type))
-            && attr()->has_default_values(skip_mask, dst_type)
-            && attr()->post_ops_.check_sum_consistency(dst_type, is_int8)
-            && !has_zero_dim_memory() && zero_points_ok() && arg_scales_ok();
-    if (!ok) return status::unimplemented;
+    VDISPATCH_CONV(is_fwd(), VERBOSE_BAD_PROPKIND);
+    VDISPATCH_CONV(IMPLICATION(is_int8,
+                           one_of(bias_md_.data_type, data_type::undef, f32,
+                                   s32, s8, u8)),
+            VERBOSE_UNSUPPORTED_BIAS_CFG);
+    VDISPATCH_CONV(IMPLICATION(!is_int8,
+                           one_of(bias_md_.data_type, data_type::undef, f32,
+                                   src_type)),
+            VERBOSE_UNSUPPORTED_BIAS_CFG);
+    VDISPATCH_CONV(set_default_alg_kind(alg_kind::convolution_direct),
+            VERBOSE_BAD_ALGORITHM);
+    VDISPATCH_CONV(!has_zero_dim_memory(), VERBOSE_EMPTY_TENSOR, "");
+    VDISPATCH_CONV(attr()->has_default_values(skip_mask, dst_type),
+            VERBOSE_UNSUPPORTED_ATTR);
+    VDISPATCH_CONV(attr()->post_ops_.check_sum_consistency(dst_type, is_int8),
+            VERBOSE_UNSUPPORTED_POSTOP);
+    VDISPATCH_CONV(zero_points_ok(), VERBOSE_UNSUPPORTED_ZP_CFG);
+    VDISPATCH_CONV(arg_scales_ok(), VERBOSE_UNSUPPORTED_SCALES_CFG);
 
     CHECK(brgemm_convolution_utils::init_conf(jcp_, use_inversion, isa, *desc(),
             src_md_, weights_md_, dst_md_, bias_md_, attr_,
@@ -949,6 +957,20 @@ status_t brgemm_convolution_fwd_t<isa, use_inversion>::init(engine_t *engine) {
         CHECK(copy_to_pbuffer_->create_kernel());
     }
 
+    // JIT to precompute scales
+    const bool is_jit_supported = mayiuse(avx512_core);
+    const auto attr = pd()->attr();
+    if (is_jit_supported && req_copy_scales(attr, jcp.scale_adjust_factor)) {
+        const auto &attr_scales = attr->scales_;
+        int wei_scale_mask = attr_scales.get(DNNL_ARG_WEIGHTS).mask_;
+        if (wei_scale_mask != 0) {
+            CHECK(safe_ptr_assign(jit_scale_precompute_,
+                    new jit_avx512_core_scale_precompute_t(
+                            jcp.scale_adjust_factor)));
+            CHECK(jit_scale_precompute_->create_kernel());
+        }
+    }
+
     if (jcp.is_relo_whi()) {
         jit_conv_conf_t ajcp;
         ajcp.is_relo = true;
@@ -1272,9 +1294,11 @@ status_t brgemm_convolution_fwd_t<isa, use_inversion>::execute(
     DEFINE_ARG_SCALES_BUFFER(wei_scales, DNNL_ARG_WEIGHTS);
     DEFINE_ARG_SCALES_BUFFER(dst_scales, DNNL_ARG_DST);
 
-    const float *oscales = precompute_scales(ctx.get_scratchpad_grantor(),
-            src_scales, wei_scales, _pd->OC(), _pd->attr(),
-            jcp.scale_adjust_factor);
+    const memory_tracking::grantor_t scratchpad = ctx.get_scratchpad_grantor();
+
+    const float *oscales = scale_utils::precompute_scales(scratchpad,
+            src_scales, wei_scales, pd()->OC(), pd()->attr(),
+            jit_scale_precompute_.get(), jcp.scale_adjust_factor);
 
     brgemm_exec_ctx_t brgemm_ctx(ctx, _pd);
 
@@ -1296,7 +1320,6 @@ status_t brgemm_convolution_fwd_t<isa, use_inversion>::execute(
                     + (jcp.s8s8_compensation_required ? s8s8_comp_offset : 0)
             : nullptr;
 
-    const memory_tracking::grantor_t scratchpad = ctx.get_scratchpad_grantor();
     brgemm_batch_element_t *const __restrict brg_batch_global
             = brgemm_convolution_utils::uses_batch_elements(
                       jcp.brg_type, jcp.exec_type)

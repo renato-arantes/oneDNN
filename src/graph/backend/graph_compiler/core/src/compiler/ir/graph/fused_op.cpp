@@ -1,5 +1,5 @@
 /*******************************************************************************
- * Copyright 2020-2023 Intel Corporation
+ * Copyright 2020-2024 Intel Corporation
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -46,6 +46,7 @@
 #include <ops/fusible/binary_elemwise.hpp>
 #include <ops/fusible/memory_movement.hpp>
 #include <ops/fusible/padding.hpp>
+#include <ops/fusible/pooling.hpp>
 #include <ops/fusible/reduce.hpp>
 #include <ops/fusible/shape_of_tensor.hpp>
 #include <ops/fusible/ternary_elemwise.hpp>
@@ -495,6 +496,13 @@ void create_query_function_by_graph(general_fused_params_t &gp,
                     op_ins[0].tensor_, op_outs[0].format_, op_ins[0].format_,
                     op_outs[0].size_, dummy_kernel};
             bld.push_evaluate(call_op_dynamic_query_function(op, args));
+        } else if (op->isa<pooling_op_t>()) {
+            add_global_table_var(gp, table_name, table_ptr, table_var);
+            initialize_dispatch_table_with_op(ctx, op, table_ptr);
+            std::vector<expr> args = {table_var, op_outs[0].tensor_,
+                    op_ins[0].tensor_, op_outs[0].format_, op_ins[0].format_,
+                    op_outs[0].size_, dummy_kernel};
+            bld.push_evaluate(call_op_dynamic_query_function(op, args));
         } else if (op->isa<binary_elementwise_op_impl_t>()) {
             if (need_inner_query(gp, op, main_idx)) {
                 add_global_table_var(gp, table_name, table_ptr, table_var);
@@ -710,9 +718,6 @@ ir_module_ptr mixed_fuse_op_t::get_func(context_ptr ctx) {
                 "partition size is expected for 1, but got "
                         << parti_list_.size())
         func = parti_list_[0]->func_;
-        // push return to the end of body
-        auto ret = builder::make_returns_unattached(true);
-        func->body_.checked_as<stmts>()->seq_.emplace_back(ret);
         func->name_ = op_name_;
         func->decl_->name_ = op_name_;
         func->name_ += "_" + std::to_string(logical_op_id_);
@@ -981,7 +986,8 @@ ir_module_ptr mixed_fuse_op_t::get_dynamic_query_func(const context_ptr &ctx) {
 }
 
 void mixed_fuse_op_t::create_internal_dispatch_funcs(const context_ptr &ctx,
-        ir_module_ptr &mod, const std::shared_ptr<const bool> &use_mtp) {
+        ir_module_ptr &mod,
+        const std::shared_ptr<const thread_pool_mode_t> &use_mtp) {
     // todo: currently we only support one op with internal func query.
     for (auto &op : sub_graph_.ops_) {
         if (op->need_dynamic_internal_query()) {
@@ -1053,13 +1059,14 @@ struct inplace_recursion_context_t {
         // if the tensor is used more than once, we simply skip it for the sake
         // of correctness. We can obviously do better than this.
         auto producer = tsr->producer_owner_;
+        bool good_op = tsr->uses_.size() <= 1UL;
         if (producer->isa<input_op>()) {
             // we define that input tensor can in-place reuse itself.
-            ret.at(tsr_2_in_index_.find(tsr)->second) = FREE_INPLACE;
+            ret.at(tsr_2_in_index_.find(tsr)->second)
+                    = good_op ? FREE_INPLACE : NO_INPLACE;
             depth_--;
             return &ret;
         }
-        bool good_op = tsr->uses_.size() <= 1UL;
         bool is_binary = producer->isa<binary_elementwise_op_t>();
         // if it is an broadcast op, we cannot in-place reuse the broadcast
         // input
@@ -1132,48 +1139,41 @@ mixed_fuse_op_t::get_inplace_map() {
     auto out_ops = sub_graph_.get_output_ops();
     size_t out_idx = 0;
     for (auto &out : out_ops) {
-        // if the output buffer is already reused while fusion, we cannot reuse
-        // an input buffer for this output
-        bool already_reused
-                = out->attrs_.get_or_else("buffer_already_reused", false);
         for (auto &outtsr : out->get_inputs()) {
-            if (!already_reused) {
-                std::vector<tensor_inplace_info_t> can_inplace;
-                auto *rec_ret = ctx.call(outtsr);
-                if (!rec_ret) {
-                    SC_MODULE_WARN << "Max recursion count reached for tensor "
-                                      "inplace optimization "
-                                      "for fused op";
-                    return {};
-                }
-                for (size_t i = 0; i < rec_ret->size(); i++) {
-                    if ((*rec_ret)[i]
-                            == inplace_recursion_context_t::
-                                    ZERO_OFFSET_INPLACE) {
-                        // zero offset means that the output->input dependency
-                        // chain contains elementwise ops. We need to ensure
-                        // that each memory position of the output strictly
-                        // depend on the same memory position of the input
-                        if (utils::get_sizeof_type(
-                                    index_2_tsr.at(i)->details_.dtype_)
-                                == utils::get_sizeof_type(
-                                        outtsr->details_.dtype_)) {
-                            can_inplace.emplace_back(
-                                    tensor_inplace_info_t {static_cast<int>(i),
-                                            inplace_kind::ZERO_OFFSET});
-                        }
-                    } else if ((*rec_ret)[i]
-                            == inplace_recursion_context_t::FREE_INPLACE) {
-                        can_inplace.emplace_back(tensor_inplace_info_t {
-                                static_cast<int>(i), inplace_kind::FREE});
+            std::vector<tensor_inplace_info_t> can_inplace;
+            auto *rec_ret = ctx.call(outtsr);
+            if (!rec_ret) {
+                SC_MODULE_WARN << "Max recursion count reached for tensor "
+                                  "inplace optimization "
+                                  "for fused op";
+                return {};
+            }
+            for (size_t i = 0; i < rec_ret->size(); i++) {
+                if ((*rec_ret)[i]
+                        == inplace_recursion_context_t::ZERO_OFFSET_INPLACE) {
+                    // zero offset means that the output->input dependency
+                    // chain contains elementwise ops. We need to ensure
+                    // that each memory position of the output strictly
+                    // depend on the same memory position of the input
+                    if (utils::get_sizeof_type(
+                                index_2_tsr.at(i)->details_.dtype_)
+                            == utils::get_sizeof_type(
+                                    outtsr->details_.dtype_)) {
+                        can_inplace.emplace_back(
+                                tensor_inplace_info_t {static_cast<int>(i),
+                                        inplace_kind::ZERO_OFFSET});
                     }
-                }
-                if (!can_inplace.empty()) {
-                    ret.emplace_back(out_idx, std::move(can_inplace));
+                } else if ((*rec_ret)[i]
+                        == inplace_recursion_context_t::FREE_INPLACE) {
+                    can_inplace.emplace_back(tensor_inplace_info_t {
+                            static_cast<int>(i), inplace_kind::FREE});
                 }
             }
-            out_idx++;
+            if (!can_inplace.empty()) {
+                ret.emplace_back(out_idx, std::move(can_inplace));
+            }
         }
+        out_idx++;
     }
     return ret;
 }

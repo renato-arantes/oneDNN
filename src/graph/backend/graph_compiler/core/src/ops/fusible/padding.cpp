@@ -1,5 +1,5 @@
 /*******************************************************************************
- * Copyright 2022-2023 Intel Corporation
+ * Copyright 2022-2024 Intel Corporation
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -22,6 +22,7 @@
 #include <compiler/ir/graph/fusible_op.hpp>
 #include <compiler/ir/graph/fusible_op_utils.hpp>
 #include <compiler/ir/transform/constant_fold.hpp>
+#include <compiler/ir/transform/dyn_tsr_transform.hpp>
 #include <runtime/dynamic_dispatch/ops/runtime_op_info.hpp>
 
 namespace dnnl {
@@ -252,6 +253,7 @@ void padding_op_t::compute_block(context_ptr ctx,
                         ? expr(step)
                         : expr(1),
                 std::move(body), true, for_type::NORMAL);
+        bind_loop_axis(get_inputs()[0], cur, i, true);
     }
 
     bld->emit(cur);
@@ -338,7 +340,8 @@ stmt padding_op_t::get_zero_out_stmt(
         auto is_4d_out = ndims == 4;
 
         for (size_t i = real_padding_axis.back() + 1; i < ndims; i++) {
-            c *= get_expr_as_int(out->dims_[i]);
+            c *= range_list.empty() ? get_expr_as_int(out->dims_[i])
+                                    : get_expr_as_int(range[i].second);
         }
 
         // input plain format must be NCHW in conv_fwd_core
@@ -356,7 +359,7 @@ stmt padding_op_t::get_zero_out_stmt(
                                : expr(int(input_plain_dims[plain_ndims_ - 1]
                                        + pads_begin[1] + pads_end[1]));
 
-        for_loop ln, lk;
+        for_loop ln, lk, lp;
         builder::ir_builder_t bld;
         bld.push_scope();
         _named_for_(ln, pad_n, 0, N, 1, for_type::PARALLEL) {
@@ -372,8 +375,11 @@ stmt padding_op_t::get_zero_out_stmt(
                     builtin::brgemm_init(
                             ptr, ph1_ * ow, c, c, out_dtype, padding_value);
                 }
-
-                _for_(p1, 0, ih) {
+            }
+        }
+        _named_for_(ln, pad_n, 0, N, 1, for_type::PARALLEL) {
+            _named_for_(lk, pad_k, 0, K) {
+                _named_for_(lp, p1, 0, ih) {
                     if (pw1_ > 0) {
                         builtin::brgemm_init(
                                 is_4d_out ? (is_channel_last
@@ -408,7 +414,10 @@ stmt padding_op_t::get_zero_out_stmt(
                                 pw2_, c, c, out_dtype, padding_value);
                     }
                 }
-
+            }
+        }
+        _named_for_(ln, pad_n, 0, N, 1, for_type::PARALLEL) {
+            _named_for_(lk, pad_k, 0, K) {
                 if (ph2_ > 0) {
                     builtin::brgemm_init(
                             is_4d_out ? (is_channel_last
@@ -418,7 +427,7 @@ stmt padding_op_t::get_zero_out_stmt(
                                                     {pad_n, pad_k, ph1_ + ih,
                                                             0}))
                                       : builder::tensor_ptr(out_tptr,
-                                              {pad_n, pad_k, ph1_ + ih, 0}),
+                                              {pad_n, pad_k, ph1_ + ih, 0, 0}),
                             ph2_ * ow, c, c, out_dtype, padding_value);
                 }
             }
@@ -445,6 +454,25 @@ std::vector<expr> padding_op_t::get_padding_offsets_exprs() {
         offsets[real_padding_axis[i]] = (int)pads_begin[i];
     }
     return offsets;
+}
+
+void padding_op_t::calculate_dynamic_shape_expression() {
+    auto &g = get_owner_graph();
+    auto padding_axis = get_real_padding_axis();
+    auto data_dims = info_.inputs_[0]->details_.get_plain_dims();
+    auto out_dims = get_outputs()[0]->details_.get_plain_dims();
+    auto expr_pads_begin = g.dims_to_expr(attrs_.get<sc_dims>("pads_begin"));
+    auto expr_pads_end = g.dims_to_expr(attrs_.get<sc_dims>("pads_end"));
+    for (size_t i = 0; i < padding_axis.size(); i++) {
+        if (is_dynamic_dim(data_dims[padding_axis[i]])
+                && out_dims[padding_axis[i]] != data_dims[padding_axis[i]]) {
+            auto var_in = g.dim_to_expr(data_dims[padding_axis[i]]);
+            auto var_out = g.dim_to_expr(out_dims[padding_axis[i]]);
+            expr_c cal_expr = do_cast_and_fold(
+                    var_in + expr_pads_begin[i] + expr_pads_end[i]);
+            var_out->attr_->set(attr_keys::cal_expression, cal_expr);
+        }
+    }
 }
 
 OP_REGISTER(padding_op_t, padding)

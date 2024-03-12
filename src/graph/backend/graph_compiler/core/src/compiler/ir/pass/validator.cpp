@@ -1,5 +1,5 @@
 /*******************************************************************************
- * Copyright 2020-2023 Intel Corporation
+ * Copyright 2020-2024 Intel Corporation
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -247,7 +247,8 @@ void validate_impl_t::check_indexing(const std::vector<expr> &idxvec,
         cnt += 1;
         auto cate = get_type_category_nothrow(idx->dtype_);
         COMPILE_ASSERT_POS(idx->dtype_ != datatypes::boolean
-                        && (cate == CATE_INT || cate == CATE_UINT),
+                        && (cate == CATE_INT || cate == CATE_UINT
+                                || idx->dtype_ == sc_data_type_t::u32(16)),
                 "The " << cnt << "-th index of the indexing expr has type "
                        << idx->dtype_ << ". Expecting an integer: " << v);
         COMPILE_ASSERT_POS(idx->dtype_ == idxtype,
@@ -372,6 +373,7 @@ void validate_impl_t::view(intrin_call_c v) {
                     "reduce expects 1 argument, "
                     "got " << v);
             break;
+        case intrin_type::fnmadd:
         case intrin_type::fmadd:
             validate_type(v);
             COMPILE_ASSERT_POS(v->args_.size() == 3,
@@ -417,19 +419,31 @@ void validate_impl_t::view(intrin_call_c v) {
             break;
         case intrin_type::insert:
             validate_type(v);
-            COMPILE_ASSERT_POS(v->args_.size() == 2,
-                    "The intrinsics take two parameters. Got " << v);
-            COMPILE_ASSERT_POS(
-                    v->intrin_attrs_->get_or_null<int>("insert_imm") != nullptr,
-                    "Must specify intrin_attrs_.");
+            if (v->args_.size() == 2) {
+                COMPILE_ASSERT_POS(
+                        v->intrin_attrs_->get_or_null<int>("insert_imm")
+                                != nullptr,
+                        "Must specify intrin_attrs_.");
+            } else {
+                COMPILE_ASSERT_POS(v->args_.size() == 3,
+                        "The intrinsics take 2 or 3 parameters. Got " << v);
+                COMPILE_ASSERT_POS(v->args_[2]->dtype_ == datatypes::u16,
+                        "The args row and col should be type u32. Got " << v);
+            }
             break;
         case intrin_type::extract:
             validate_type(v);
-            COMPILE_ASSERT_POS(v->args_.size() == 1,
-                    "The intrinsics take one parameter. Got " << v);
-            COMPILE_ASSERT_POS(v->intrin_attrs_->get_or_null<int>("extract_imm")
-                            != nullptr,
-                    "Must specify intrin_attrs_.");
+            if (v->args_.size() == 1) {
+                COMPILE_ASSERT_POS(
+                        v->intrin_attrs_->get_or_null<int>("extract_imm")
+                                != nullptr,
+                        "Must specify intrin_attrs_.");
+            } else {
+                COMPILE_ASSERT_POS(v->args_.size() == 2,
+                        "The intrinsics take 1 or 2 parameters. Got " << v);
+                COMPILE_ASSERT_POS(v->args_[1]->dtype_ == datatypes::u16,
+                        "The args row and col should be type u32. Got " << v);
+            }
             break;
         case intrin_type::gather:
             validate_type(v);

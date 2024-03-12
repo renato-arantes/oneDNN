@@ -1,5 +1,5 @@
 /*******************************************************************************
- * Copyright 2022-2023 Intel Corporation
+ * Copyright 2022-2024 Intel Corporation
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -79,6 +79,19 @@ managed_matmul_core_op_t::managed_matmul_core_op_t(
     }
     // record padded_K of input A for matmul_core
     attrs_["temp.padded_A_K"] = std::make_shared<VConst>();
+
+    auto num_threads = runtime_config_t::get().get_num_threads();
+    sc_dim M = A_dims.front(); // A is always 2D
+    sc_dim K = A_dims.back(); // A is always 2D
+    sc_dim N = B_dims.back(); // B is always 2D
+    bool is_int8 = info_.inputs_[0]->details_.dtype_ == datatypes::u8
+            || info_.inputs_[0]->details_.dtype_ == datatypes::s8;
+    if (!is_dynamic() && M <= 2 && K >= 4096
+            && N >= 4096 // TODO(niuxiaoguang): K, N shapes are from gpt-j-6B
+            // and llama on SPR. Change them when necessary.
+            && num_threads <= 32 && is_int8) {
+        attrs_["dispatch_avx"] = true;
+    }
 }
 
 std::vector<int> managed_matmul_core_op_t::query_prefetch(
@@ -244,35 +257,32 @@ void managed_matmul_core_op_t::query_format(context_ptr ctx,
                             if (treat_as_static) { iik_block = iik_block_; }
                         }
                         if (A_dims.size() == 2) {
-                            if (!dynamic && is_A_vnni_low_fp
-                                    && A_format == sc_data_format_t::NK()) {
-                                in_formats.push_back({sc_data_format_t::NK()});
+                            if (constant_A
+                                    || (!dynamic && A_format.is_blocking()
+                                            && p2bmp_a.at(0).size() > 1
+                                            && p2bmp_a.at(1).size() > 1)
+                                    || A_isp || (!dynamic && M % iim_block)
+                                    || (!dynamic && K % iik_block)
+                                    || (!dynamic && is_A_vnni_low_fp
+                                            && A_format
+                                                    == sc_data_format_t::
+                                                            NK())) {
+                                ret_A_format = sc_data_format_t::MKmk(
+                                        iim_block, iik_block);
                             } else {
-                                if (constant_A
-                                        || (!dynamic && A_format.is_blocking()
-                                                && p2bmp_a.at(0).size() > 1
-                                                && p2bmp_a.at(1).size() > 1)
-                                        || A_isp || (!dynamic && M % iim_block)
-                                        || (!dynamic && K % iik_block)) {
-                                    ret_A_format = sc_data_format_t::MKmk(
-                                            iim_block, iik_block);
-                                } else {
-                                    ret_A_format = sc_data_format_t::MK();
-                                }
-                                if (dynamic && A_format.is_blocking()
-                                        && p2bmp_a.at(0).size() > 1
-                                        && p2bmp_a.at(1).size() > 1) {
-                                    ret_A_format = A_format;
-                                    iim_block = transposed_a
-                                            ? A_format.blocks_[1]
-                                            : A_format.blocks_[0];
-                                    iik_block = transposed_a
-                                            ? A_format.blocks_[0]
-                                            : A_format.blocks_[1];
-                                }
-                                if (!dynamic) {
-                                    in_formats.push_back({ret_A_format});
-                                }
+                                ret_A_format = sc_data_format_t::MK();
+                            }
+                            if (dynamic && A_format.is_blocking()
+                                    && p2bmp_a.at(0).size() > 1
+                                    && p2bmp_a.at(1).size() > 1) {
+                                ret_A_format = A_format;
+                                iim_block = transposed_a ? A_format.blocks_[1]
+                                                         : A_format.blocks_[0];
+                                iik_block = transposed_a ? A_format.blocks_[0]
+                                                         : A_format.blocks_[1];
+                            }
+                            if (!dynamic) {
+                                in_formats.push_back({ret_A_format});
                             }
                         } else {
                             COMPILE_ASSERT(0,
@@ -287,26 +297,7 @@ void managed_matmul_core_op_t::query_format(context_ptr ctx,
                             } else if (is_B_vnni_low_fp) {
                                 // do vnni reorder in template for
                                 // transposed matmul
-                                bool special_b
-                                        = B_format == sc_data_format_t::NK();
-                                bool shape_small = (M <= 512 && K < 4096
-                                        && N * K <= 4096 * 4096);
-                                if (!dynamic
-                                        && ((B_format == sc_data_format_t::MK()
-                                                    && attrs_.get_or_else(
-                                                            "transposed"
-                                                            "_a",
-                                                            false))
-                                                || (special_b
-                                                        && attrs_.get_or_else(
-                                                                "transposed"
-                                                                "_b",
-                                                                false)
-                                                        && shape_small))) {
-                                    // do pre-op fusion for NK -> NKkn2k
-                                    // only when shapes are small.
-                                    ret_B_format = B_format;
-                                } else {
+                                if (!dynamic) {
                                     ret_B_format = sc_data_format_t::NKkn2k(
                                             iik_block, iin_block);
                                 }
@@ -332,7 +323,12 @@ void managed_matmul_core_op_t::query_format(context_ptr ctx,
                                     "managed_matmul_core only supports 2d "
                                     "yet");
                         }
-                        if (constant_B || dynamic || M % iim_block
+                        if (M == iim_block && M >= 32 && N % iin_block == 0
+                                && !dynamic) {
+                            out_formats.push_back(
+                                    {sc_data_format_t::get_plain_by_dims(
+                                            C_dims.size())});
+                        } else if (constant_B || dynamic || M % iim_block
                                 || N % iin_block) {
                             ret_C_format = sc_data_format_t(
                                     sc_data_format_kind_t::
@@ -445,6 +441,8 @@ ir_module_ptr managed_matmul_core_op_t::get_internal_func(
         const context_ptr &ctx) {
     assert(is_dynamic());
     if (!need_dynamic_internal_query()) { return nullptr; }
+    // query binding axis
+    query_binding_axis(get_owner_graph());
     auto ret = std::make_shared<ir_module_t>(ctx);
     auto gen_ptr = create_generator();
     std::vector<expr> ins;
@@ -513,8 +511,8 @@ sc_op_ptr managed_matmul_core_op_t::do_compensations(
             && info_.inputs_[0]->details_.dtype_ == datatypes::s8
             && (!ctx->machine_.brgemm_use_amx_
                     || (ctx->machine_.brgemm_use_amx_
-                            && !ctx->machine_.cpu_flags_.fAVX512AMXINT8));
-
+                            && !ctx->machine_.cpu_flags_.fAVX512AMXINT8)
+                    || attrs_.get_or_else("dispatch_avx", false));
     auto cur_node = shared_from_this();
 
     auto data_com = get_data_compensation(mgr);
@@ -826,11 +824,11 @@ bool managed_matmul_core_op_t::need_dynamic_internal_query_impl() const {
     return is_dynamic();
 }
 
-void managed_matmul_core_op_t::infer_binding_axis(bound_axis_map &bdax_map) {
+void managed_matmul_core_op_t::infer_binding_axis(binding_axis_map &bdax_map) {
     infer_matmul_binding_axis(this, bdax_map);
 }
 void managed_matmul_core_op_t::pre_infer_binding_axis(
-        bound_axis_map &bdax_map) {
+        binding_axis_map &bdax_map) {
     pre_matmul_binding_axis(this, bdax_map);
 }
 

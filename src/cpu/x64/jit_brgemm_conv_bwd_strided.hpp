@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2022-2023 Intel Corporation
+* Copyright 2022-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -29,6 +29,7 @@
 #include "cpu/x64/amx_tile_configure.hpp"
 #include "cpu/x64/brgemm/brgemm.hpp"
 #include "cpu/x64/brgemm/brgemm_containers.hpp"
+#include "cpu/x64/jit_avx512_core_scale_precompute.hpp"
 #include "cpu/x64/jit_brgemm_conv_bwd_copy_kernel.hpp"
 #include "cpu/x64/jit_brgemm_conv_bwd_trans_kernel.hpp"
 #include "cpu/x64/jit_brgemm_conv_comp_pad_kernel.hpp"
@@ -109,7 +110,24 @@ private:
             , brg_batch(brg_batch_)
             , c_buffer(c_buffer_)
             , out_buffer(out_buffer_)
-            , wsp_tile(wsp_tile_) {}
+            , wsp_tile(wsp_tile_)
+            , cur_brg_idx(-1)
+            , g(0)
+            , n(0)
+            , icb(0)
+            , id(0)
+            , idb(0)
+            , ih(0)
+            , ihb(0)
+            , iwb(0)
+            , occ(0)
+            , sw(0)
+            , oscales(nullptr)
+            , dst_scales(nullptr)
+            , src_zp_vals(0)
+            , src_zp_comp_ptr(nullptr)
+            , dst_zp_vals(nullptr)
+            , s8s8_comp_ptr(nullptr) {}
 
         brgemm_bwd_exec_ctx_t &brgemm_ctx;
         int ithr;
@@ -117,13 +135,13 @@ private:
         char *c_buffer;
         char *out_buffer;
         char *wsp_tile;
-        int cur_brg_idx = -1;
+        int cur_brg_idx;
         int g, n, icb;
         int id, idb, ih, ihb, iwb;
         int occ;
         int sw;
-        const float *oscales {nullptr};
-        const float *dst_scales {nullptr};
+        const float *oscales;
+        const float *dst_scales;
         int32_t src_zp_vals;
         int32_t *src_zp_comp_ptr;
         int32_t *dst_zp_vals;
@@ -200,6 +218,7 @@ private:
                     jit_avx512_core_brgemm_conv_bwd_copy_kernel_t<Vmm>>
             copy_to_output_buffer_;
     std::unique_ptr<jit_generator> comp_vpad_pbuffer_;
+    std::unique_ptr<jit_avx512_core_scale_precompute_t> jit_scale_precompute_;
 
     size_t acc_dsz, bia_dsz, src_dsz, wei_dsz, dst_dsz;
 

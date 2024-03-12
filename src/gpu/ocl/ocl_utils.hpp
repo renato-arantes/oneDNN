@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2019-2023 Intel Corporation
+* Copyright 2019-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -17,23 +17,15 @@
 #ifndef GPU_OCL_OCL_UTILS_HPP
 #define GPU_OCL_OCL_UTILS_HPP
 
-#include <cinttypes>
-#include <memory>
-#include <sstream>
 #include <string.h>
 #include <string>
 #include <utility>
 #include <vector>
 #include <CL/cl.h>
-#include <initializer_list>
-#include <type_traits>
 #include <unordered_map>
-#include <unordered_set>
 
 #include "common/c_types_map.hpp"
 #include "common/cpp_compat.hpp"
-#include "common/internal_defs.hpp"
-#include "common/utils.hpp"
 #include "common/verbose.hpp"
 #include "gpu/compute/kernel_arg_list.hpp"
 #include "gpu/compute/utils.hpp"
@@ -41,12 +33,9 @@
 namespace dnnl {
 namespace impl {
 namespace gpu {
-
-namespace compute {
-class kernel_t;
-}
-
 namespace ocl {
+
+std::string get_kernel_name(cl_kernel kernel);
 
 inline status_t convert_to_dnnl(cl_int cl_status) {
     switch (cl_status) {
@@ -168,7 +157,7 @@ inline const char *convert_cl_int_to_str(cl_int cl_status) {
         CL_STATUS_CASE(CL_INVALID_BUFFER_SIZE);
         CL_STATUS_CASE(CL_INVALID_MIP_LEVEL);
         CL_STATUS_CASE(CL_INVALID_GLOBAL_WORK_SIZE);
-
+#undef CL_STATUS_CASE
         default: return "unknown macro name";
     }
 }
@@ -348,8 +337,8 @@ private:
 
 // Constructs an OpenCL wrapper object (providing RAII support)
 template <typename T>
-ocl_wrapper_t<T> make_ocl_wrapper(T t) {
-    return ocl_wrapper_t<T>(t);
+ocl_wrapper_t<T> make_ocl_wrapper(T t, bool retain = false) {
+    return ocl_wrapper_t<T>(t, retain);
 }
 
 template <typename F>
@@ -456,6 +445,13 @@ status_t clone_kernel(cl_kernel kernel, cl_kernel *cloned_kernel);
 
 status_t create_ocl_program(gpu::ocl::ocl_wrapper_t<cl_program> &ocl_program,
         cl_device_id dev, cl_context ctx, const gpu::compute::binary_t &binary);
+
+status_t get_device_uuid(
+        gpu::compute::device_uuid_t &uuid, cl_device_id ocl_dev);
+
+status_t get_ocl_devices(std::vector<cl_device_id> *devices,
+        std::vector<ocl_wrapper_t<cl_device_id>> *sub_devices,
+        cl_device_type device_type);
 
 } // namespace ocl
 } // namespace gpu

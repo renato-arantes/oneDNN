@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2019-2023 Intel Corporation
+* Copyright 2019-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -29,9 +29,7 @@
 #include "dnnl_common.hpp"
 #include "dnnl_memory.hpp"
 
-#include "binary/binary.hpp"
 #include "matmul/matmul.hpp"
-#include "prelu/prelu.hpp"
 
 namespace matmul {
 
@@ -68,8 +66,8 @@ benchdnn_dnnl_wrapper_t<dnnl_memory_desc_t> create_md(const prb_t *prb,
             }
         } else
 #endif
-            return dnn_mem_t::init_md(prb->ndims, src_rt_dims.data(),
-                    prb->src_dt(), prb->stag, prb->strides[STRIDES_SRC]);
+            return dnn_mem_t::init_md(prb->ndims, src_rt_dims.data(), dt,
+                    prb->stag, prb->strides[STRIDES_SRC]);
     }
 
     if (kind == WEI) {
@@ -96,8 +94,8 @@ benchdnn_dnnl_wrapper_t<dnnl_memory_desc_t> create_md(const prb_t *prb,
             }
         } else
 #endif
-            return dnn_mem_t::init_md(prb->ndims, weights_rt_dims.data(),
-                    prb->wei_dt(), prb->wtag, prb->strides[STRIDES_WEI]);
+            return dnn_mem_t::init_md(prb->ndims, weights_rt_dims.data(), dt,
+                    prb->wtag, prb->strides[STRIDES_WEI]);
     }
 
     if (kind == DST) {
@@ -113,16 +111,21 @@ benchdnn_dnnl_wrapper_t<dnnl_memory_desc_t> create_md(const prb_t *prb,
 dnnl_status_t init_pd(init_pd_args_t<prb_t> &init_pd_args) {
     const prb_t *prb = init_pd_args.prb;
     res_t *res = init_pd_args.res;
+    bool force_f32_dt = init_pd_args.force_f32_dt;
 
-    auto src_d = create_md(prb, SRC);
-    auto wei_d = create_md(prb, WEI);
-    auto dst_d = create_md(prb, DST);
+    auto src_d = create_md(
+            prb, SRC, force_f32_dt ? dnnl_f32 : dnnl_data_type_undef);
+    auto wei_d = create_md(
+            prb, WEI, force_f32_dt ? dnnl_f32 : dnnl_data_type_undef);
+    auto dst_d = create_md(
+            prb, DST, force_f32_dt ? dnnl_f32 : dnnl_data_type_undef);
 
     benchdnn_dnnl_wrapper_t<dnnl_memory_desc_t> bia_d {};
     if (prb->bia_dt != dnnl_data_type_undef) {
         auto bia_dims = get_runtime_dims(
                 prb->bia_dims(), prb->bias_runtime_dim_mask());
-        bia_d = dnn_mem_t::init_md(prb->ndims, bia_dims.data(), prb->bia_dt,
+        bia_d = dnn_mem_t::init_md(prb->ndims, bia_dims.data(),
+                force_f32_dt ? dnnl_f32 : prb->bia_dt,
                 prb->dst_runtime_dim_mask() != 0 ? tag::abx : tag::any);
     }
 
@@ -130,12 +133,27 @@ dnnl_status_t init_pd(init_pd_args_t<prb_t> &init_pd_args) {
     attr_args.prepare_post_ops_mds(prb->attr, prb->ndims, prb->dst_dims.data());
     // Overload PER_OC wei_mask definition for batched case
     auto wei_scale = prb->attr.scales.get(DNNL_ARG_WEIGHTS);
-    if (wei_scale.policy == policy_t::PER_OC) {
+    if (wei_scale.policy == policy_t::PER_OC
+            || wei_scale.policy == policy_t::PER_OCIC) {
+        const auto &dst_rt_dims
+                = get_runtime_dims(prb->dst_dims, prb->dst_runtime_dim_mask());
+        int wei_mask = 1 << (dst_rt_dims.size() - 1);
+        if (wei_scale.policy == policy_t::PER_OCIC)
+            wei_mask += 1 << (dst_rt_dims.size() - 2);
+        attr_args.prepare_scales(prb->attr, DNNL_ARG_WEIGHTS, wei_mask);
+    }
+    // Overload PER_OC wei_mask definition for batched case
+    auto wei_zp = prb->attr.zero_points.get(DNNL_ARG_WEIGHTS);
+    if (wei_zp.policy == policy_t::PER_OC
+            || wei_zp.policy == policy_t::PER_OCIC) {
         const auto &dst_rt_dims
                 = get_runtime_dims(prb->dst_dims, prb->dst_runtime_dim_mask());
         int wei_mask = (1 << (dst_rt_dims.size() - 1));
-        attr_args.prepare_scales(prb->attr, DNNL_ARG_WEIGHTS, wei_mask);
+        if (wei_zp.policy == policy_t::PER_OCIC)
+            wei_mask += 1 << (dst_rt_dims.size() - 2);
+        attr_args.prepare_zero_points(prb->attr, DNNL_ARG_WEIGHTS, wei_mask);
     }
+
     auto dnnl_attr = make_benchdnn_dnnl_wrapper(
             create_dnnl_attr(prb->attr, attr_args));
 
@@ -147,9 +165,14 @@ dnnl_status_t init_pd(init_pd_args_t<prb_t> &init_pd_args) {
     return dnnl_success;
 }
 
-int init_prim_ref(
-        benchdnn_dnnl_wrapper_t<dnnl_primitive_t> &prim_ref, const prb_t *prb) {
-    if (!(has_bench_mode_bit(mode_bit_t::corr) && is_gpu() && fast_ref_gpu))
+int init_prim_ref(benchdnn_dnnl_wrapper_t<dnnl_primitive_t> &prim_ref,
+        const prb_t *prb, res_t *res) {
+    if (!(has_bench_mode_bit(mode_bit_t::corr) && fast_ref)) return OK;
+    // Create prim_ref if only original prim was successfully created.
+    if (res->state != INITIALIZED) return OK;
+
+    // f32 cases should go through reference no matter what.
+    if (is_cpu() && (prb->src_dt() == dnnl_f32 && prb->wei_dt() == dnnl_f32))
         return OK;
 
 #ifdef DNNL_EXPERIMENTAL_SPARSE
@@ -162,36 +185,55 @@ int init_prim_ref(
 
     // Create a new copy of prb to avoid potentially corrupting the test by
     // modifying prb in place.
-    const auto cpu_bia_dt = prb->bia_dt == dnnl_data_type_undef
-            ? dnnl_data_type_undef
-            : dnnl_f32;
-    const auto cpu_bia_mask
-            = prb->bia_dt == dnnl_data_type_undef ? 0 : prb->bia_mask;
     auto cpu_attr = prb->attr;
     update_cpu_ref_attrs(cpu_attr);
-    prb_t prb_cpu {*prb, {dnnl_f32}, tag::abx, tag::abx, tag::abx,
-            {vdims_t(STRIDES_SIZE)}, cpu_bia_dt, cpu_bia_mask, {0, 0, 0},
-#ifdef DNNL_EXPERIMENTAL_SPARSE
-            sparse_options_t(),
-#endif
-            cpu_attr, prb->ctx_init, prb->ctx_exe};
-
-    init_pd_args_t<prb_t> init_pd_args(
-            /* res = */ nullptr, get_cpu_engine(), &prb_cpu, prb->dir,
-            /* hint = */ nullptr, /* src_md = */ nullptr);
-    init_pd(init_pd_args);
-
-    benchdnn_dnnl_wrapper_t<dnnl_primitive_desc_t> pdw;
-    fetch_impl(pdw, init_pd_args, /* res = */ nullptr,
-            /* is_service_prim = */ true);
-
+    std::vector<std::vector<dnnl_data_type_t>> prim_ref_dt {
+            prb->dt, {dnnl_f32}};
+    // If there's no bias, undef data type should be used for prim_ref as well.
+    dnnl_data_type_t cpu_bia_dt
+            = prb->bia_dt == dnnl_data_type_undef ? prb->bia_dt : dnnl_f32;
+    std::vector<dnnl_data_type_t> prim_ref_bia_dt {prb->bia_dt, cpu_bia_dt};
+    if (is_cpu()) {
+        prim_ref_dt.erase(prim_ref_dt.begin());
+        prim_ref_bia_dt.erase(prim_ref_bia_dt.begin());
+    }
     dnnl_primitive_t prim_ref_ {};
-    if (pdw) {
-        if (query_impl_info(pdw) == "ref:any") return OK;
-        DNN_SAFE(dnnl_primitive_create(&prim_ref_, pdw), WARN);
+
+    for_(const auto &prim_ref_dt_i : prim_ref_dt)
+    for (const auto &prim_ref_bia_dt_i : prim_ref_bia_dt) {
+        prb_t prb_cpu {*prb, prim_ref_dt_i, tag::any, tag::any, tag::any,
+                {vdims_t(STRIDES_SIZE)}, prim_ref_bia_dt_i, prb->bia_mask,
+                {0, 0, 0},
+#ifdef DNNL_EXPERIMENTAL_SPARSE
+                sparse_options_t(),
+#endif
+                cpu_attr, prb->ctx_init, prb->ctx_exe};
+
+        init_pd_args_t<prb_t> init_pd_args(
+                /* res = */ nullptr, get_cpu_engine(), &prb_cpu, prb->dir,
+                /* hint = */ nullptr, /* src_md = */ nullptr);
+        init_pd(init_pd_args);
+
+        benchdnn_dnnl_wrapper_t<dnnl_primitive_desc_t> pdw;
+        fetch_impl(pdw, init_pd_args, /* res = */ nullptr,
+                /* is_service_prim = */ true);
+
+        // Prim desc wasn't created - try the next set...
+        if (!pdw) continue;
+        // Reference impl was fetched - try the next set...
+        if (query_impl_info(pdw) == "ref:any") continue;
+
+        auto st = dnnl_primitive_create(&prim_ref_, pdw);
+        // Primitive wan't created - try the next set...
+        if (st != dnnl_success) continue;
+
         BENCHDNN_PRINT(5, "CPU reference oneDNN implementation: %s\n",
                 query_impl_info(pdw).c_str());
+        res->prim_ref_repro = prb_cpu.str();
+        prim_ref.reset(prim_ref_);
+        return OK;
     }
+
     prim_ref.reset(prim_ref_);
     return OK;
 }
@@ -317,6 +359,11 @@ int fill_data(data_kind_t kind, const prb_t *prb, const cfg_t &cfg,
     const auto nelems = mem_dt.nelems();
     if (nelems == 0) return OK;
 
+    // Refer to modes documentation for filling principles.
+    if (has_bench_mode_bit(mode_bit_t::bitwise)) {
+        return fill_random_real(mem_dt, mem_fp, res);
+    }
+
 #ifdef DNNL_EXPERIMENTAL_SPARSE
     auto src_encoding = prb->sparse_options.get_encoding(DNNL_ARG_SRC);
     auto wei_encoding = prb->sparse_options.get_encoding(DNNL_ARG_WEIGHTS);
@@ -438,6 +485,15 @@ void skip_unimplemented_prb(const prb_t *prb, res_t *res) {
             return;
         }
 
+        // GPU does not support grouped scales or zero-points.
+        if (prb->attr.zero_points.get(DNNL_ARG_WEIGHTS).policy
+                        == policy_t::PER_OCIC
+                || prb->attr.scales.get(DNNL_ARG_WEIGHTS).policy
+                        == policy_t::PER_OCIC) {
+            res->state = SKIPPED, res->reason = CASE_NOT_SUPPORTED;
+            return;
+        }
+
         // GPU supports only default sum_dt argument.
         const auto &po = prb->attr.post_ops;
         const int sum_idx = po.find(attr_t::post_ops_t::kind_t::SUM);
@@ -474,12 +530,21 @@ void skip_unimplemented_prb(const prb_t *prb, res_t *res) {
             return;
         }
 
-        // GPU doesn't support f8_e5m2/f8_e4m3.
-        const bool is_xf8 = (prb->src_dt() == dnnl_f8_e5m2
-                                    || prb->src_dt() == dnnl_f8_e4m3)
-                && (prb->wei_dt() == dnnl_f8_e5m2
-                        || prb->wei_dt() == dnnl_f8_e4m3);
-        if (is_xf8) {
+        // Weights decompression is supported through ref on pre-XeHPG
+        // platforms with limited post-ops support.
+        if (prb->weights_decompression()
+                && (!prb->attr.zero_points.is_def()
+                        || !prb->attr.scales.is_def())) {
+            res->state = SKIPPED, res->reason = CASE_NOT_SUPPORTED;
+            return;
+        }
+
+        // GPU supports fp8 through ref only for f8_e4m3 on all platformas and
+        // for f8_e5m2 pre-XeHPC with limited post-op support.
+        if (((prb->src_dt() == dnnl_f8_e4m3 || prb->dst_dt() == dnnl_f8_e4m3)
+                    || (prb->src_dt() == dnnl_f8_e5m2
+                            || prb->dst_dt() == dnnl_f8_e5m2))
+                && (!po.is_def() || !prb->attr.scales.is_def())) {
             res->state = SKIPPED, res->reason = CASE_NOT_SUPPORTED;
             return;
         }
@@ -497,9 +562,28 @@ void skip_invalid_prb(const prb_t *prb, res_t *res) {
 #endif
 
     // Zero-points for non-integral data type does not make sense
-    if (!prb->attr.zero_points.is_def() && prb->wei_dt() != dnnl_s8) {
+    if (!prb->attr.zero_points.is_def()
+            && (prb->wei_dt() != dnnl_s8 && prb->wei_dt() != dnnl_u8
+                    && prb->wei_dt() != dnnl_s4 && prb->wei_dt() != dnnl_u4)) {
         res->state = SKIPPED, res->reason = INVALID_CASE;
         return;
+    }
+
+    // Weights decompression requires IC to be divisible by groups
+    // for both scales and zero points
+    if (!prb->attr.scales.get(DNNL_ARG_WEIGHTS).is_def()) {
+        const auto &groups = prb->attr.scales.get(DNNL_ARG_WEIGHTS).groups;
+        if (!groups.empty() && (prb->k % groups[0] || groups.size() > 2)) {
+            res->state = SKIPPED, res->reason = INVALID_CASE;
+            return;
+        }
+    }
+    if (!prb->attr.zero_points.get(DNNL_ARG_WEIGHTS).is_def()) {
+        const auto &groups = prb->attr.zero_points.get(DNNL_ARG_WEIGHTS).groups;
+        if (!groups.empty() && (prb->k % groups[0] || groups.size() > 2)) {
+            res->state = SKIPPED, res->reason = INVALID_CASE;
+            return;
+        }
     }
 
     auto src_rt_mask = prb->src_runtime_dim_mask();
@@ -565,7 +649,7 @@ std::vector<int> supported_exec_args(dir_t dir) {
 };
 
 int init_ref_memory_args(dnn_mem_map_t &ref_mem_map, dnn_mem_map_t &mem_map,
-        dnnl_primitive_t prim, const prb_t *prb, res_t *res, dir_t dir,
+        dnnl_primitive_t prim, const prb_t *prb, res_t *res,
         dnnl_primitive_t prim_ref) {
     if (has_bench_mode_modifier(mode_modifier_t::no_host_memory)) return OK;
 
@@ -576,6 +660,11 @@ int init_ref_memory_args(dnn_mem_map_t &ref_mem_map, dnn_mem_map_t &mem_map,
 
     for (auto &entry : mem_map) {
         const int exec_arg = entry.first;
+        // The function targets regular exec_args that are positive.
+        // Negative args are used by bitwise and are broken in the `default`
+        // branch due to `&` always returns `true`.
+        if (exec_arg <= 0) continue;
+
         auto &mem = entry.second; // `mem` is modified by filler (reorder).
 
 #ifdef DNNL_EXPERIMENTAL_SPARSE
@@ -602,8 +691,14 @@ int init_ref_memory_args(dnn_mem_map_t &ref_mem_map, dnn_mem_map_t &mem_map,
             }
         } else
 #endif
-            ref_mem_map.emplace(exec_arg,
-                    dnn_mem_t(mem.md_, dnnl_f32, tag::abx, ref_engine));
+        {
+            // Scratchpad memory relates to a primitive. If reference needs it,
+            // use switch below to define a memory desc for it.
+            if (exec_arg != DNNL_ARG_SCRATCHPAD) {
+                ref_mem_map.emplace(exec_arg,
+                        dnn_mem_t(mem.md_, dnnl_f32, tag::abx, ref_engine));
+            }
+        }
         auto &ref_mem = ref_mem_map[exec_arg];
 
         switch (exec_arg) {
@@ -621,34 +716,18 @@ int init_ref_memory_args(dnn_mem_map_t &ref_mem_map, dnn_mem_map_t &mem_map,
                 const int sum_idx = po.find(attr_t::post_ops_t::SUM);
                 if (sum_idx >= 0) {
                     SAFE(fill_data(DST, prb, cfg, mem, ref_mem, res), WARN);
+                    // Bitwise mode for sum requires a copy due to data for
+                    // post-op will be overwritten and it must be refreshed.
+                    if (has_bench_mode_bit(mode_bit_t::bitwise)) {
+                        SAFE(mem_map.at(-exec_arg).reorder(ref_mem), WARN);
+                    }
                 }
             } break;
-            default: { // Process all attributes here
-                int post_ops_range = DNNL_ARG_ATTR_MULTIPLE_POST_OP(31)
-                        - DNNL_ARG_ATTR_MULTIPLE_POST_OP(0);
-                bool is_post_ops_arg = (exec_arg & post_ops_range);
-                bool is_scales_arg = (exec_arg & DNNL_ARG_ATTR_SCALES);
-                bool is_zero_point_arg = (exec_arg & DNNL_ARG_ATTR_ZERO_POINTS);
-
-                if (is_post_ops_arg) {
-                    if (exec_arg & DNNL_ARG_SRC_1)
-                        SAFE(binary::fill_mem(exec_arg, mem, ref_mem,
-                                     /* only_positive = */ false,
-                                     /* only_integer = */ true),
-                                WARN);
-                    else if (exec_arg & DNNL_ARG_WEIGHTS)
-                        SAFE(prelu::fill_data(WEI, mem, ref_mem), WARN);
-                } else if (is_scales_arg) {
-                    int local_exec_arg = exec_arg ^ DNNL_ARG_ATTR_SCALES;
-                    SAFE(fill_scales(prb->attr, local_exec_arg, mem, ref_mem),
-                            WARN);
-                } else if (is_zero_point_arg) {
-                    int local_exec_arg = exec_arg ^ DNNL_ARG_ATTR_ZERO_POINTS;
-                    SAFE(fill_zero_points(
-                                 prb->attr, local_exec_arg, mem, ref_mem),
-                            WARN);
-                }
-            } break;
+            default:
+                SAFE(init_ref_memory_args_default_case(
+                             exec_arg, mem, ref_mem, prb->attr, res),
+                        WARN);
+                break;
         }
 
         update_ref_mem_map_from_prim(prim_ref, mem, ref_mem_map, exec_arg,
@@ -666,7 +745,7 @@ int createit(std::vector<benchdnn_dnnl_wrapper_t<dnnl_primitive_t>> &v_prim,
     v_prim.resize(2); // regular + cpu_ref
     SAFE(init_prim(prb->ctx_init, v_prim[0], init_pd, prb, res), WARN);
     // Use CPU prim as the reference in GPU testing to reduce testing time.
-    SAFE(init_prim_ref(v_prim[1], prb), WARN);
+    SAFE(init_prim_ref(v_prim[1], prb, res), WARN);
     return OK;
 }
 
@@ -685,17 +764,16 @@ int doit(const std::vector<benchdnn_dnnl_wrapper_t<dnnl_primitive_t>> &v_prim,
 
     dnn_mem_map_t mem_map, ref_mem_map;
     init_memory_args<prb_t>(mem_map, prb, prim, supported_exec_args(prb->dir));
-    TIME_FILL(SAFE(init_ref_memory_args(ref_mem_map, mem_map, prim, prb, res,
-                           prb->dir, prim_ref),
+    TIME_FILL(SAFE(init_ref_memory_args(
+                           ref_mem_map, mem_map, prim, prb, res, prim_ref),
             WARN));
 
     args_t args(mem_map), ref_args(ref_mem_map);
 
     SAFE(execute_and_wait(prim, args, res), WARN);
 
-    if (has_bench_mode_bit(mode_bit_t::corr)) {
-        check_correctness(prb, {DST}, args, ref_args, setup_cmp, res, prim_ref);
-    }
+    check_correctness(prb, {DST}, args, ref_args, setup_cmp, res, prim_ref);
+    SAFE(check_bitwise(prim, {DST}, args, prb->attr, prb->inplace, res), WARN);
 
     return measure_perf(prb->ctx_exe, res, prim, args);
 }

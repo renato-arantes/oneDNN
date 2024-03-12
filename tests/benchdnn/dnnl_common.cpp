@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2017-2023 Intel Corporation
+* Copyright 2017-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -46,6 +46,7 @@
 #include "dnnl_memory.hpp"
 
 #include "utils/cold_cache.hpp"
+#include "utils/fill.hpp"
 #include "utils/stream_kind.hpp"
 
 extern "C" dnnl_status_t dnnl_impl_notify_profiling_complete(
@@ -543,7 +544,7 @@ int measure_perf(const thr_ctx_t &ctx, res_t *res, perf_function_t &perf_func,
             int arg = args.arg(i);
             const auto &m = args.dnn_mem(i);
             mem_map[j].emplace(arg, dnn_mem_t(m.md_, engine));
-            mem_map[j].at(arg).reorder(m);
+            SAFE(mem_map[j].at(arg).reorder(m), WARN);
         }
         v_args[j] = args_t(mem_map[j]);
         execute_unmap_args(v_args[j], dnnl_args[j]);
@@ -911,18 +912,18 @@ static int get_gpu_ram_sizes(size_t &ram_size, size_t &max_alloc_size) {
     return OK;
 }
 
-int get_cpu_cache_size(size_t &cache_size) {
+int get_cpu_cache_size(cpu_cache_args_t &cache_args) {
 #if DNNL_CPU_RUNTIME != DNNL_RUNTIME_NONE
     using namespace dnnl::impl::cpu::platform;
-    static const auto L2_size = get_per_core_cache_size(2);
-    static const auto L3_size = get_per_core_cache_size(3);
-    static const auto num_cores = get_num_cores();
-    static const auto total_cache_size = (L2_size + L3_size) * num_cores;
+    cache_args.L2_size = get_per_core_cache_size(2);
+    cache_args.L3_size = get_per_core_cache_size(3);
+    cache_args.num_cores = get_num_cores();
+    cache_args.total_socket_size
+            = (cache_args.L2_size + cache_args.L3_size) * cache_args.num_cores;
 #else
     // If functions are not available, just use 150 MiB.
-    static const auto total_cache_size = 150 * 1024 * 1024;
+    cache_args.total_socket_size = 150 * 1024 * 1024;
 #endif
-    cache_size = total_cache_size;
     return OK;
 }
 
@@ -958,11 +959,9 @@ int get_gpu_cache_size(size_t &cache_size) {
 }
 
 struct check_mem_size_args_t {
-    check_mem_size_args_t(const_dnnl_primitive_desc_t pd, bool want_input,
-            bool add_ref_size = false)
+    check_mem_size_args_t(const_dnnl_primitive_desc_t pd, bool want_input)
         : pd(pd)
         , want_input(want_input)
-        , add_ref_size(add_ref_size)
         , is_scratchpad(false)
         , total_size_device(0)
         , total_size_cpu(0)
@@ -971,7 +970,6 @@ struct check_mem_size_args_t {
     // Input args.
     const_dnnl_primitive_desc_t pd;
     bool want_input;
-    bool add_ref_size;
     bool is_scratchpad;
 
     // Output args:
@@ -1007,13 +1005,17 @@ static int check_total_size(
     assert(benchdnn_device_limit > 0 && benchdnn_cpu_limit > 0);
 
     auto GB = [](double bytes) { return bytes / powf(2, 30); };
+    auto dir_c_str = [&res]() {
+        return (res->mem_check_dir & FLAG_FWD) ? "FWD" : "BWD";
+    };
 
     if (is_gpu()) {
         const bool fits_device_ram = check_mem_size_args.total_size_device
                 <= benchdnn_device_limit;
         if (!fits_device_ram) {
-            BENCHDNN_PRINT(2, "%s\n",
-                    "benchdnn: not enough device RAM for a problem.");
+            BENCHDNN_PRINT(2,
+                    "[CHECK_MEM][%s]: Not enough device RAM for a problem.\n",
+                    dir_c_str());
             res->state = SKIPPED;
             res->reason = NOT_ENOUGH_RAM;
         }
@@ -1024,9 +1026,9 @@ static int check_total_size(
                     const bool fit = s < gpu_max_alloc_capacity;
                     if (!fit) {
                         BENCHDNN_PRINT(2,
-                                "benchdnn: allocation of size %g GB doesn't "
-                                "fit allocation limit of %g GB.\n",
-                                GB(s), GB(gpu_max_alloc_capacity));
+                                "[CHECK_MEM][%s]: Allocation of size %g GB "
+                                "doesn't fit allocation limit of %g GB.\n",
+                                dir_c_str(), GB(s), GB(gpu_max_alloc_capacity));
                     }
                     return fit;
                 });
@@ -1036,9 +1038,9 @@ static int check_total_size(
         }
 
         BENCHDNN_PRINT((!fits_device_ram ? 2 : 6),
-                "Requested: %g GB, benchdnn device limit: %g GB, device RAM "
-                "capacity: %g GB, gpu_max_alloc: %g GB\n",
-                GB(check_mem_size_args.total_size_device),
+                "[CHECK_MEM][%s]: Requested: %g GB; benchdnn_device_limit: %g "
+                "GB; device_RAM_capacity: %g GB; gpu_max_alloc: %g GB;\n",
+                dir_c_str(), GB(check_mem_size_args.total_size_device),
                 GB(benchdnn_device_limit), GB(gpu_device_capacity),
                 GB(gpu_max_alloc_capacity));
     }
@@ -1048,8 +1050,9 @@ static int check_total_size(
     bool fits_cpu_ram = total_size_cpu <= benchdnn_cpu_limit;
 
     if (!fits_cpu_ram) {
-        BENCHDNN_PRINT(
-                2, "%s\n", "benchdnn: not enough CPU RAM for a problem.");
+        BENCHDNN_PRINT(2,
+                "[CHECK_MEM][%s]: Not enough CPU RAM for a problem.\n",
+                dir_c_str());
         // Try to catch a huge scratchpad size requested by the library.
         // Use following logic:
         //     scratch_size
@@ -1060,11 +1063,11 @@ static int check_total_size(
         static constexpr float scratch_trh = 0.75f;
         if (check_mem_size_args.scratchpad_size
                 > scratch_trh * total_size_cpu) {
-            BENCHDNN_PRINT(2, "%s `%ld` %s `%ld`.\n",
-                    "benchdnn: CPU scratchpad size",
-                    (long)check_mem_size_args.scratchpad_size,
-                    "exceeded a given threshold",
-                    (long)(scratch_trh * total_size_cpu));
+            BENCHDNN_PRINT(2,
+                    "[CHECK_MEM][%s]: CPU scratchpad size `%zu` exceeded a "
+                    "given threshold `%zu`.\n",
+                    dir_c_str(), check_mem_size_args.scratchpad_size,
+                    (size_t)(scratch_trh * total_size_cpu));
             res->state = FAILED;
         } else {
             res->state = SKIPPED;
@@ -1073,12 +1076,11 @@ static int check_total_size(
     }
 
     BENCHDNN_PRINT((!fits_cpu_ram ? 2 : 6),
-            "Requested: %g GB, benchdnn CPU limit: %g GB, CPU RAM capacity: %g "
-            "GB\n",
-            GB(total_size_cpu), GB(benchdnn_cpu_limit),
+            "[CHECK_MEM][%s]: Requested: %g GB; benchdnn_CPU_limit: %g GB; "
+            "CPU_RAM_capacity: %g GB;\n",
+            dir_c_str(), GB(total_size_cpu), GB(benchdnn_cpu_limit),
             GB(cpu_device_capacity));
 
-    res->mem_check_done = true;
     return res->state == FAILED ? FAIL : OK;
 }
 
@@ -1110,19 +1112,28 @@ void add_md_size(const_dnnl_memory_desc_t md,
     if (check_mem_size_args.is_scratchpad) {
         check_mem_size_args.scratchpad_size += mem_size;
     } else {
-        if (!check_mem_size_args.add_ref_size) return;
-
+        const bool is_corr = has_bench_mode_bit(mode_bit_t::corr);
+        const bool is_bitwise = has_bench_mode_bit(mode_bit_t::bitwise);
         // Reference memories are always tag::abx fp32, hence need re-creating
         // memory descriptor and take its size.
         auto ref_md = dnn_mem_t::init_md(
                 query_md_ndims(md), query_md_dims(md), dnnl_f32, tag::abx);
         const auto ref_md_size = dnnl_memory_desc_get_size(ref_md);
-        check_mem_size_args.total_size_cpu += ref_md_size; // Reference memory.
+        // A memory copy for ref_compute, happens only in correctness.
+        check_mem_size_args.total_size_cpu += is_corr * ref_md_size;
 
-        // Correctness pass allocates additional tag::abx f32 memory.
-        const bool compare_mem_factor = !check_mem_size_args.want_input
-                && check_mem_size_args.add_ref_size;
+        // Comparison function allocates an additional tag::abx f32 memory.
+        // This allocation holds for correctness and bitwise modes.
+        const bool compare_mem_factor
+                = !check_mem_size_args.want_input && (is_corr || is_bitwise);
         check_mem_size_args.total_size_cpu += compare_mem_factor * ref_md_size;
+
+        // Bitwise comparison allocates an additional tag::abx f32 memory from
+        // the first run to compare results against it.
+        const bool bitwise_compare_mem_factor
+                = !check_mem_size_args.want_input && is_bitwise;
+        check_mem_size_args.total_size_cpu
+                += bitwise_compare_mem_factor * ref_md_size;
     }
 }
 
@@ -1180,7 +1191,7 @@ static void get_memory_bytes(check_mem_size_args_t &check_mem_size_args) {
 int check_mem_size(const_dnnl_memory_desc_t md, res_t *res) {
     if (!mem_check) return OK;
 
-    check_mem_size_args_t check_mem_size_args(nullptr, false, false);
+    check_mem_size_args_t check_mem_size_args(nullptr, false);
     const auto md_size = dnnl_memory_desc_get_size(md);
     check_mem_size_args.total_size_device = md_size;
     check_mem_size_args.sizes.push_back(md_size);
@@ -1188,14 +1199,23 @@ int check_mem_size(const_dnnl_memory_desc_t md, res_t *res) {
     return check_total_size(check_mem_size_args, res);
 }
 
-int check_mem_size(const_dnnl_primitive_desc_t const_pd, res_t *res) {
+int check_mem_size(
+        const_dnnl_primitive_desc_t const_pd, res_t *res, dir_t dir) {
+    // Skip the check if it is disabled.
     if (!mem_check) return OK;
 
-    // Add reference memory estimation for correctness only.
-    bool add_ref_size = has_bench_mode_bit(mode_bit_t::corr);
+    // Skip the check if the test object won't be executed.
+    if (!has_bench_mode_bit(mode_bit_t::exec)) return OK;
+
+    // Skip the check if it has already happened for provided `dir`. Saves from
+    // repreated run when the second test object is created to test the
+    // primitive cache, but allows to verify both objects when a double-run
+    // driver executes fwd-for-bwd first and bwd after.
+    if (res->mem_check_dir == dir) return OK;
+    res->mem_check_dir = dir;
+
     // Get input sizes.
-    check_mem_size_args_t check_mem_size_args(
-            const_pd, /* want_input = */ true, add_ref_size);
+    check_mem_size_args_t check_mem_size_args(const_pd, /* input = */ true);
     get_memory_bytes(check_mem_size_args);
 
     // Get scratchpad size.
@@ -1386,11 +1406,15 @@ float reorder_rescale_factor() {
     return factor;
 }
 
-dims_t md2dims(const_dnnl_memory_desc_t md) {
+dims_t md2dims(const_dnnl_memory_desc_t md, int mask, bool extend_by_ones) {
     auto ndims = query_md_ndims(md);
-    dims_t dims(ndims, 0);
-    for (int d = 0; d < ndims; ++d)
-        dims[d] = query_md_dims(md)[d];
+    dims_t dims;
+    for (int d = 0; d < ndims; ++d) {
+        if (mask & (1 << d))
+            dims.push_back(query_md_dims(md)[d]);
+        else if (extend_by_ones)
+            dims.push_back(1);
+    }
     return dims;
 }
 
@@ -1400,7 +1424,7 @@ dnnl_data_type_t deduce_cfg_data_type(
 
     if ((dk == SRC || dk == WEI) && dt_ == dnnl_f32) {
         // Update data type based on fpmath-mode attribute
-        switch (attr.fpmath_mode) {
+        switch (attr.fpmath_mode.mode) {
             case dnnl_fpmath_mode_strict: break;
             case dnnl_fpmath_mode_bf16: dt_ = dnnl_bf16; break;
             case dnnl_fpmath_mode_tf32: dt_ = dnnl_bf16; break;
@@ -1467,6 +1491,19 @@ int update_ref_mem_map_from_prim(dnnl_primitive_t prim_ref,
             break;
         }
 
+        const int post_ops_range = DNNL_ARG_ATTR_MULTIPLE_POST_OP(31)
+                - DNNL_ARG_ATTR_MULTIPLE_POST_OP(0);
+        const bool is_post_ops_arg = (exec_arg & post_ops_range);
+        const bool is_prelu_arg
+                = is_post_ops_arg && (exec_arg & DNNL_ARG_WEIGHTS);
+        // The library doesn't return a memory desc for prelu post-op. Prelu
+        // requires `tag::axb` format, thus, need to put a desc into ref prim.
+        if (is_prelu_arg) {
+            prim_ref_mem = dnn_mem_t(
+                    library_mem.md_, dnnl_f32, tag::axb, ref_engine);
+            break;
+        }
+
         // Rest arguments don't need special handling and should be
         // skipped as empty.
         skip_replace = true;
@@ -1479,6 +1516,147 @@ int update_ref_mem_map_from_prim(dnnl_primitive_t prim_ref,
 
     if (!is_scratchpad) SAFE(prim_ref_mem.reorder(ref_mem, swapped_dt), WARN);
     ref_mem_map[exec_arg] = std::move(prim_ref_mem);
+
+    return OK;
+}
+
+// This function provides a general filling for atributes across all drivers.
+//
+// It provides a default filling config for both binary and prelu post-op.
+// The user has an option to override it by passing `fill_cfg_map` with
+// correspondent argument and attached `fill_cfg_t` object to it.
+// Default filling configs are simple to avoid floating-point rounding effects,
+// but not cancellation effects. For latter ones, it's the user's responsibility
+// to avoid them by supplying a proper fill_cfg for a given driver/problem.
+int init_ref_memory_args_default_case(int exec_arg, dnn_mem_t &mem,
+        dnn_mem_t &ref_mem, const attr_t &attr, res_t *res,
+        const std::unordered_map<int, fill_cfg_t> &fill_cfg_map) {
+    assert(exec_arg > 0); // Negative values will produce false-positive `true`.
+
+    const int post_ops_range = DNNL_ARG_ATTR_MULTIPLE_POST_OP(31)
+            - DNNL_ARG_ATTR_MULTIPLE_POST_OP(0);
+    const bool is_post_ops_arg = (exec_arg & post_ops_range);
+    const bool is_scales_arg = (exec_arg & DNNL_ARG_ATTR_SCALES);
+    const bool is_zero_point_arg = (exec_arg & DNNL_ARG_ATTR_ZERO_POINTS);
+
+    if (is_post_ops_arg) {
+        if (exec_arg & DNNL_ARG_SRC_1) {
+            const int bin_po_idx
+                    = exec_arg / DNNL_ARG_ATTR_MULTIPLE_POST_OP_BASE - 1;
+            assert(bin_po_idx < attr.post_ops.len());
+            const auto alg = attr.post_ops.entry[bin_po_idx].kind;
+            // Binary post-op filling.
+            fill_cfg_t def_binary_cfg(mem.dt(), -16.f, 16.f, /* int = */ true,
+                    alg, "def_binary_post_op");
+            const auto it = fill_cfg_map.find(DNNL_ARG_SRC_1);
+            const bool has_external_cfg = it != fill_cfg_map.end();
+            const fill_cfg_t &binary_fill_cfg
+                    = has_external_cfg ? (*it).second : def_binary_cfg;
+            TIME_FILL(SAFE(fill_random_real(mem, ref_mem, res, binary_fill_cfg),
+                    WARN));
+        } else if (exec_arg & DNNL_ARG_WEIGHTS) {
+            // Prelu post-op filling.
+            fill_cfg_t def_prelu_fill_cfg(mem.dt(), -2.f, 2.f, /* int = */ true,
+                    attr_t::post_ops_t::kind_t::PRELU, "def_prelu_post_op");
+            const auto it = fill_cfg_map.find(DNNL_ARG_WEIGHTS);
+            const bool has_external_cfg = it != fill_cfg_map.end();
+            const fill_cfg_t &prelu_fill_cfg
+                    = has_external_cfg ? (*it).second : def_prelu_fill_cfg;
+            TIME_FILL(SAFE(
+                    fill_random_real(mem, ref_mem, res, prelu_fill_cfg), WARN));
+        }
+    } else if (is_scales_arg) {
+        int local_exec_arg = exec_arg ^ DNNL_ARG_ATTR_SCALES;
+        TIME_FILL(SAFE(fill_scales(attr, local_exec_arg, mem, ref_mem), WARN));
+    } else if (is_zero_point_arg) {
+        int local_exec_arg = exec_arg ^ DNNL_ARG_ATTR_ZERO_POINTS;
+        TIME_FILL(SAFE(
+                fill_zero_points(attr, local_exec_arg, mem, ref_mem), WARN));
+    }
+
+    return OK;
+}
+
+// This function is responsible for performing the bitwise validation:
+// * Saves the output of the first run for further comparison.
+// * Refreshes the input data when the original data was corrupted, e.g.,
+//   inplace mode or sum post-op.
+// * Performs a second run of the original primitive and its inputs.
+// * Compares both outputs on bitwise exactness.
+//
+// The function takes the following arguments:
+// * A `prim` object, the same one used for the first run.
+// * A vector of `kinds` to validate each output from the primitive. The exactly
+//   same one is used for correctness validation.
+// * `args` arguments with all memory objects used for the first run and also
+//   with stashed memories when they got overwritten during execution.
+// * `inplace` flags to help identify if data refresh is needed.
+// * `res` object to save the state of the validation result.
+//
+int check_bitwise(dnnl_primitive_t prim, const std::vector<data_kind_t> &kinds,
+        const args_t &args, const attr_t &attr, bool inplace, res_t *res) {
+    // Fast exit for any modes but bitwise.
+    if (!has_bench_mode_bit(mode_bit_t::bitwise)) return OK;
+
+    // Forward-for-backward service primitives define `kinds` as empty to skip
+    // validation. This is to avoid extra checks on higher level.
+    if (kinds.empty()) return OK;
+
+    // Collect copies of outputs.
+    dnn_mem_map_t run1_mem_map;
+    for (const auto &kind : kinds) {
+        const int arg = data_kind2exec_arg(kind);
+        assert(arg > 0);
+
+        auto &mem = args.find(arg);
+        SAFE_V(bool(mem) ? OK : FAIL);
+        // A memory used as reference for comparison, must be allocated on the
+        // CPU engine.
+        run1_mem_map.emplace(
+                arg, dnn_mem_t(mem.md_, dnnl_f32, tag::abx, get_cpu_engine()));
+        SAFE(run1_mem_map.at(arg).reorder(mem), WARN);
+    }
+
+    // Put original data into DST tensor if sum post-op is present.
+    if (query_post_ops_has_kind(prim, dnnl_sum)) {
+        const int query_arg = DNNL_ARG_DST;
+        auto &dst_mem = const_cast<dnn_mem_t &>(args.find(query_arg));
+        const auto &orig_dst_mem = args.find(-query_arg);
+        SAFE_V(bool(orig_dst_mem) && bool(dst_mem) ? OK : FAIL);
+        SAFE(dst_mem.reorder(orig_dst_mem), WARN);
+    }
+
+    // Put original data into SRC if inplace mode was specified.
+    if (inplace) {
+        const bool has_multiple_args = bool(args.find(DNNL_ARG_MULTIPLE_SRC));
+        const auto prop_kind = query_prop_kind(query_pd(prim));
+        const auto query_arg = is_fwd_prop_kind(prop_kind)
+                ? (has_multiple_args ? DNNL_ARG_MULTIPLE_SRC : DNNL_ARG_SRC)
+                : DNNL_ARG_DIFF_DST;
+        auto &in_mem = const_cast<dnn_mem_t &>(args.find(query_arg));
+        SAFE_V(bool(in_mem) ? OK : FAIL);
+        const auto &orig_in_mem = args.find(-query_arg);
+        SAFE_V(bool(orig_in_mem) ? OK : FAIL);
+        SAFE(in_mem.reorder(orig_in_mem), WARN);
+    }
+
+    // Perform a second run.
+    SAFE(execute_and_wait(prim, args, res), WARN);
+
+    // `args_t` has an interface to retrieve a memory object by the `arg`.
+    args_t run1_args(run1_mem_map);
+    compare::compare_t cmp;
+    for (const auto &kind : kinds) {
+        cmp.set_data_kind(kind);
+
+        const int arg = data_kind2exec_arg(kind);
+        assert(arg > 0);
+
+        auto &mem = args.find(arg);
+        auto &run1_mem = run1_args.find(arg);
+
+        TIME_COMPARE(cmp.compare(run1_mem, mem, attr, res));
+    }
 
     return OK;
 }

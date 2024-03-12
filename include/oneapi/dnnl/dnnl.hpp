@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2016-2023 Intel Corporation
+* Copyright 2016-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -856,6 +856,10 @@ struct memory : public handle<dnnl_memory_t> {
         s8 = dnnl_s8,
         /// 8-bit unsigned integer.
         u8 = dnnl_u8,
+        /// 4-bit signed integer.
+        s4 = dnnl_s4,
+        /// 4-bit unsigned integer.
+        u4 = dnnl_u4,
     };
 
     /// Returns size of data type in bytes.
@@ -3868,12 +3872,27 @@ struct primitive_attr : public handle<dnnl_primitive_attr_t> {
         return fpmath_mode(result);
     }
 
+    /// Returns the fpmath mode
+    ///
+    /// @param mode Specified fpmath mode.
+    /// @param apply_to_int Use floating-point arithmetic for integer primitives.
+    void get_fpmath_mode(fpmath_mode &mode, bool &apply_to_int) const {
+        dnnl_fpmath_mode_t c_mode;
+        int c_apply_to_int;
+        error::wrap_c_api(dnnl_primitive_attr_get_fpmath_mode_v2(
+                                  get(), &c_mode, &c_apply_to_int),
+                "could not get fpmath mode primitive attribute");
+        mode = fpmath_mode(c_mode);
+        apply_to_int = static_cast<bool>(c_apply_to_int);
+    }
+
     /// Sets fpmath mode.
     ///
     /// @param mode Specified fpmath mode.
-    void set_fpmath_mode(fpmath_mode mode) {
-        error::wrap_c_api(dnnl_primitive_attr_set_fpmath_mode(
-                                  get(), dnnl::convert_to_c(mode)),
+    /// @param apply_to_int Boolean. Use of floating-point arithmetic for integer primitives.
+    void set_fpmath_mode(fpmath_mode mode, bool apply_to_int = false) {
+        error::wrap_c_api(dnnl_primitive_attr_set_fpmath_mode_v2(get(),
+                                  dnnl::convert_to_c(mode), apply_to_int),
                 "could not set fpmath mode primitive attribute");
     }
 
@@ -3893,6 +3912,23 @@ struct primitive_attr : public handle<dnnl_primitive_attr_t> {
         error::wrap_c_api(dnnl_primitive_attr_set_accumulation_mode(
                                   get(), dnnl::convert_to_c(mode)),
                 "could not set accumulation mode primitive attribute");
+    }
+
+    /// Returns the deterministic attribute value
+    bool get_deterministic() const {
+        int result;
+        error::wrap_c_api(dnnl_primitive_attr_get_deterministic(get(), &result),
+                "could not get deterministic primitive attribute");
+        return static_cast<bool>(result);
+    }
+
+    /// Sets deterministic attribute value
+    ///
+    /// @param value Specified deterministic mode.
+    void set_deterministic(bool value) {
+        error::wrap_c_api(dnnl_primitive_attr_set_deterministic(
+                                  get(), static_cast<int>(value)),
+                "could not set deterministic primitive attribute");
     }
 
     /// Returns the scratchpad mode.
@@ -3931,6 +3967,31 @@ struct primitive_attr : public handle<dnnl_primitive_attr_t> {
                 "could not set scales primitive attribute");
     }
 
+    /// Sets scaling factors for primitive operations for a given memory
+    /// argument. The scaling factors must be passed at execution time
+    /// as an argument with index #DNNL_ARG_ATTR_SCALES | arg.
+    ///
+    /// @sa dnnl_primitive_attr_set_scales
+    ///
+    /// @param arg Parameter argument index as passed to the
+    ///     primitive::execute() call.
+    /// @param mask Scales correspondence mask that defines the
+    ///     correspondence between the tensor dimensions and the @p
+    ///     scales vector. The set i-th bit indicates that a dedicated
+    ///     scale is used for each index along that dimension. Set the
+    ///     mask to 0 to use a common scale for the whole output tensor.
+    /// @param groups Scaling factors correspondence groups that define the
+    ///     correspondence between the tensor dimensions and the scales array.
+    ///     The set i-th dimension indicates a number of groups of scaling
+    ///     factors used for that logical dimension in a memory indicated by @p arg.
+    void set_scales(int arg, int mask, const memory::dims &groups,
+            memory::data_type data_type = memory::data_type::f32) {
+        error::wrap_c_api(dnnl_primitive_attr_set_scales(get(), arg, mask,
+                                  (int)groups.size(), groups.data(),
+                                  memory::convert_to_c(data_type)),
+                "could not set scales primitive attribute");
+    }
+
     /// Sets zero points for primitive operations for a given memory argument.
     /// The zero points must be passed at execution time as an argument with
     /// index #DNNL_ARG_ATTR_ZERO_POINTS | arg.
@@ -3947,6 +4008,31 @@ struct primitive_attr : public handle<dnnl_primitive_attr_t> {
     void set_zero_points_mask(int arg, int mask) {
         error::wrap_c_api(
                 dnnl_primitive_attr_set_zero_points_mask(get(), arg, mask),
+                "could not set zero points primitive attribute");
+    }
+
+    /// Sets zero points for primitive operations for a given memory argument.
+    /// The zero points must be passed at execution time as an argument with
+    /// index #DNNL_ARG_ATTR_ZERO_POINTS | arg.
+    ///
+    /// @sa dnnl_primitive_attr_set_zero_points
+    ///
+    /// @param arg Parameter argument index as passed to the
+    ///     primitive::execute() call.
+    /// @param mask Zero point correspondence mask that defines the
+    ///     correspondence between the tensor dimensions and the @p
+    ///     zero_points vector. The set i-th bit indicates that a dedicated
+    ///     zero point is used for each index along that dimension. Set the
+    ///     mask to 0 to use a common zero point for the whole output tensor.
+    /// @param groups Zero point factors correspondence groups that define the
+    ///     correspondence between the tensor dimensions and the zero_points array.
+    ///     The set i-th dimension indicates a number of groups of zero point
+    ///     factors used for that logical dimension in a memory indicated by @p arg.
+    void set_zero_points(int arg, int mask, const memory::dims &groups,
+            memory::data_type data_type = memory::data_type::s32) {
+        error::wrap_c_api(dnnl_primitive_attr_set_zero_points(get(), arg, mask,
+                                  (int)groups.size(), groups.data(),
+                                  memory::convert_to_c(data_type)),
                 "could not set zero points primitive attribute");
     }
 
@@ -8142,7 +8228,8 @@ struct layer_normalization_forward : public primitive {
                 const primitive_attr &attr = default_attr(),
                 bool allow_empty = false)
             : primitive_desc(aengine, aprop_kind, src_desc, dst_desc,
-                    &stat_desc, epsilon, flags, attr, allow_empty) {}
+                    &stat_desc, memory::data_type::f32, epsilon, flags, attr,
+                    allow_empty) {}
 
         /// Constructs a primitive descriptor for a layer normalization forward
         /// propagation primitive.
@@ -8168,7 +8255,73 @@ struct layer_normalization_forward : public primitive {
                 const primitive_attr &attr = default_attr(),
                 bool allow_empty = false)
             : primitive_desc(aengine, aprop_kind, src_desc, dst_desc, nullptr,
-                    epsilon, flags, attr, allow_empty) {}
+                    memory::data_type::f32, epsilon, flags, attr, allow_empty) {
+        }
+
+        /// Constructs a primitive descriptor for a layer normalization forward
+        /// propagation primitive with a user-provided data type for the scale
+        /// and shift memory objects.
+        ///
+        /// @param aengine Engine to use.
+        /// @param aprop_kind Propagation kind. Possible values are
+        ///     #dnnl::prop_kind::forward_training, and
+        ///     #dnnl::prop_kind::forward_inference.
+        /// @param src_desc Source memory descriptor.
+        /// @param dst_desc Destination memory descriptor.
+        /// @param stat_desc Statistics memory descriptors.
+        /// @param scale_shift_data_type Data type of scale and shift memory.
+        ///     If neither scale nor shift flag are specified the parameter
+        ///     is ignored.
+        /// @param epsilon Layer normalization epsilon parameter.
+        /// @param flags Layer normalization flags (@ref
+        ///     dnnl::normalization_flags).
+        /// @param attr Primitive attributes to use. Attributes are optional
+        ///     and default to empty attributes.
+        /// @param allow_empty A flag signifying whether construction is
+        ///     allowed to fail without throwing an exception. In this case an
+        ///     empty object will be produced. This flag is optional and
+        ///     defaults to false.
+        primitive_desc(const engine &aengine, prop_kind aprop_kind,
+                const memory::desc &src_desc, const memory::desc &dst_desc,
+                const memory::desc &stat_desc,
+                memory::data_type scale_shift_data_type, float epsilon,
+                normalization_flags flags,
+                const primitive_attr &attr = default_attr(),
+                bool allow_empty = false)
+            : primitive_desc(aengine, aprop_kind, src_desc, dst_desc,
+                    &stat_desc, scale_shift_data_type, epsilon, flags, attr,
+                    allow_empty) {}
+
+        /// Constructs a primitive descriptor for a layer normalization forward
+        /// propagation primitive with a user-provided data type for the scale
+        /// and shift memory objects.
+        ///
+        /// @param aengine Engine to use.
+        /// @param aprop_kind Propagation kind. Possible values are
+        ///     #dnnl::prop_kind::forward_training, and
+        ///     #dnnl::prop_kind::forward_inference.
+        /// @param src_desc Source memory descriptor.
+        /// @param dst_desc Destination memory descriptor.
+        /// @param scale_shift_data_type Data type of scale and shift memory.
+        ///     If neither scale nor shift flag are specified the parameter
+        ///     is ignored.
+        /// @param epsilon Layer normalization epsilon parameter.
+        /// @param flags Layer normalization flags (@ref
+        ///     dnnl::normalization_flags).
+        /// @param attr Primitive attributes to use. Attributes are optional
+        ///     and default to empty attributes.
+        /// @param allow_empty A flag signifying whether construction is
+        ///     allowed to fail without throwing an exception. In this case an
+        ///     empty object will be produced. This flag is optional and
+        ///     defaults to false.
+        primitive_desc(const engine &aengine, prop_kind aprop_kind,
+                const memory::desc &src_desc, const memory::desc &dst_desc,
+                memory::data_type scale_shift_data_type, float epsilon,
+                normalization_flags flags,
+                const primitive_attr &attr = default_attr(),
+                bool allow_empty = false)
+            : primitive_desc(aengine, aprop_kind, src_desc, dst_desc, nullptr,
+                    scale_shift_data_type, epsilon, flags, attr, allow_empty) {}
 
         /// Constructs a primitive descriptor for a layer normalization
         /// forward propagation primitive from a C API primitive descriptor
@@ -8227,17 +8380,19 @@ struct layer_normalization_forward : public primitive {
 
         primitive_desc(const engine &aengine, prop_kind aprop_kind,
                 const memory::desc &src_desc, const memory::desc &dst_desc,
-                const memory::desc *stat_desc, float epsilon,
+                const memory::desc *stat_desc,
+                memory::data_type scale_shift_data_type, float epsilon,
                 normalization_flags flags, const primitive_attr &attr,
                 bool allow_empty) {
 
             dnnl_primitive_desc_t pd = nullptr;
             dnnl_status_t status
-                    = dnnl_layer_normalization_forward_primitive_desc_create(
+                    = dnnl_layer_normalization_forward_primitive_desc_create_v2(
                             &pd, aengine.get(), dnnl::convert_to_c(aprop_kind),
                             src_desc.get(), dst_desc.get(),
-                            optional_arg(stat_desc), epsilon,
-                            convert_to_c(flags), attr.get());
+                            optional_arg(stat_desc),
+                            memory::convert_to_c(scale_shift_data_type),
+                            epsilon, convert_to_c(flags), attr.get());
 
             if (!allow_empty)
                 error::wrap_c_api(status,
@@ -8305,7 +8460,8 @@ struct layer_normalization_backward : public primitive {
                 const primitive_attr &attr = default_attr(),
                 bool allow_empty = false)
             : primitive_desc(aengine, aprop_kind, diff_src_desc, diff_dst_desc,
-                    src_desc, &stat_desc, epsilon, flags, hint_fwd_pd, attr,
+                    src_desc, &stat_desc, memory::data_type::f32,
+                    memory::data_type::f32, epsilon, flags, hint_fwd_pd, attr,
                     allow_empty) {}
 
         /// Constructs a primitive descriptor for a layer normalization backward
@@ -8338,7 +8494,96 @@ struct layer_normalization_backward : public primitive {
                 const primitive_attr &attr = default_attr(),
                 bool allow_empty = false)
             : primitive_desc(aengine, aprop_kind, diff_src_desc, diff_dst_desc,
-                    src_desc, nullptr, epsilon, flags, hint_fwd_pd, attr,
+                    src_desc, nullptr, memory::data_type::f32,
+                    memory::data_type::f32, epsilon, flags, hint_fwd_pd, attr,
+                    allow_empty) {}
+
+        /// Constructs a primitive descriptor for a layer normalization backward
+        /// propagation primitive with a user-provided data type for the scale
+        /// and shift memory objects.
+        ///
+        /// @param aengine Engine to use.
+        /// @param aprop_kind Propagation kind. Possible values are
+        ///     #dnnl::prop_kind::backward_data and #dnnl::prop_kind::backward
+        ///     (diffs for all parameters are computed in this case).
+        /// @param diff_src_desc Diff source memory descriptor.
+        /// @param diff_dst_desc Diff destination memory descriptor.
+        /// @param src_desc Source memory descriptor.
+        /// @param stat_desc Statistics memory descriptors.
+        /// @param diff_scale_shift_data_type Data type of diff scale and shift
+        ///     memory. If neither scale nor shift flag are specified the
+        ///     parameter is ignored.
+        /// @param scale_shift_data_type Data type of scale and shift memory.
+        ///     If neither scale nor shift flag are specified the parameter
+        ///     is ignored.
+        /// @param epsilon Layer normalization epsilon parameter.
+        /// @param flags Layer normalization flags (@ref
+        ///     dnnl::normalization_flags).
+        /// @param attr Primitive attributes to use. Attributes are optional
+        ///     and default to empty attributes.
+        /// @param hint_fwd_pd Primitive descriptor for a layer normalization
+        ///     forward propagation primitive. It is used as a hint for
+        ///     deciding which memory format to use.
+        /// @param allow_empty A flag signifying whether construction is
+        ///     allowed to fail without throwing an exception. In this case an
+        ///     empty object will be produced. This flag is optional and
+        ///     defaults to false.
+        primitive_desc(const engine &aengine, prop_kind aprop_kind,
+                const memory::desc &diff_src_desc,
+                const memory::desc &diff_dst_desc, const memory::desc &src_desc,
+                const memory::desc &stat_desc,
+                memory::data_type diff_scale_shift_data_type,
+                memory::data_type scale_shift_data_type, float epsilon,
+                normalization_flags flags,
+                const layer_normalization_forward::primitive_desc &hint_fwd_pd,
+                const primitive_attr &attr = default_attr(),
+                bool allow_empty = false)
+            : primitive_desc(aengine, aprop_kind, diff_src_desc, diff_dst_desc,
+                    src_desc, &stat_desc, diff_scale_shift_data_type,
+                    scale_shift_data_type, epsilon, flags, hint_fwd_pd, attr,
+                    allow_empty) {}
+
+        /// Constructs a primitive descriptor for a layer normalization backward
+        /// propagation primitive with a user-provided data type for the scale
+        /// and shift memory objects.
+        ///
+        /// @param aengine Engine to use.
+        /// @param aprop_kind Propagation kind. Possible values are
+        ///     #dnnl::prop_kind::backward_data and #dnnl::prop_kind::backward
+        ///     (diffs for all parameters are computed in this case).
+        /// @param diff_src_desc Diff source memory descriptor.
+        /// @param diff_dst_desc Diff destination memory descriptor.
+        /// @param src_desc Source memory descriptor.
+        /// @param diff_scale_shift_data_type Data type of diff scale and shift
+        ///     memory. If neither scale nor shift flag are specified the
+        ///     parameter is ignored.
+        /// @param scale_shift_data_type Data type of scale and shift memory.
+        ///     If neither scale nor shift flag are specified the parameter
+        ///     is ignored.
+        /// @param epsilon Layer normalization epsilon parameter.
+        /// @param flags Layer normalization flags (@ref
+        ///     dnnl::normalization_flags).
+        /// @param attr Primitive attributes to use. Attributes are optional
+        ///     and default to empty attributes.
+        /// @param hint_fwd_pd Primitive descriptor for a layer normalization
+        ///     forward propagation primitive. It is used as a hint for
+        ///     deciding which memory format to use.
+        /// @param allow_empty A flag signifying whether construction is
+        ///     allowed to fail without throwing an exception. In this case an
+        ///     empty object will be produced. This flag is optional and
+        ///     defaults to false.
+        primitive_desc(const engine &aengine, prop_kind aprop_kind,
+                const memory::desc &diff_src_desc,
+                const memory::desc &diff_dst_desc, const memory::desc &src_desc,
+                memory::data_type diff_scale_shift_data_type,
+                memory::data_type scale_shift_data_type, float epsilon,
+                normalization_flags flags,
+                const layer_normalization_forward::primitive_desc &hint_fwd_pd,
+                const primitive_attr &attr = default_attr(),
+                bool allow_empty = false)
+            : primitive_desc(aengine, aprop_kind, diff_src_desc, diff_dst_desc,
+                    src_desc, nullptr, diff_scale_shift_data_type,
+                    scale_shift_data_type, epsilon, flags, hint_fwd_pd, attr,
                     allow_empty) {}
 
         /// Constructs a primitive descriptor for a layer normalization
@@ -8400,18 +8645,23 @@ struct layer_normalization_backward : public primitive {
         primitive_desc(const engine &aengine, prop_kind aprop_kind,
                 const memory::desc &diff_src_desc,
                 const memory::desc &diff_dst_desc, const memory::desc &src_desc,
-                const memory::desc *stat_desc, float epsilon,
+                const memory::desc *stat_desc,
+                memory::data_type diff_scale_shift_data_type,
+                memory::data_type scale_shift_data_type, float epsilon,
                 normalization_flags flags,
                 const layer_normalization_forward::primitive_desc &hint_fwd_pd,
                 const primitive_attr &attr, bool allow_empty) {
 
             dnnl_primitive_desc_t pd = nullptr;
             dnnl_status_t status
-                    = dnnl_layer_normalization_backward_primitive_desc_create(
+                    = dnnl_layer_normalization_backward_primitive_desc_create_v2(
                             &pd, aengine.get(), dnnl::convert_to_c(aprop_kind),
                             diff_src_desc.get(), diff_dst_desc.get(),
-                            src_desc.get(), optional_arg(stat_desc), epsilon,
-                            convert_to_c(flags), hint_fwd_pd.get(), attr.get());
+                            src_desc.get(), optional_arg(stat_desc),
+                            memory::convert_to_c(diff_scale_shift_data_type),
+                            memory::convert_to_c(scale_shift_data_type),
+                            epsilon, convert_to_c(flags), hint_fwd_pd.get(),
+                            attr.get());
 
             if (!allow_empty)
                 error::wrap_c_api(status,
@@ -13291,10 +13541,16 @@ enum class cpu_isa {
     avx512_core_vnni = dnnl_cpu_isa_avx512_core_vnni,
     /// @copydoc dnnl_cpu_isa_avx512_core_bf16
     avx512_core_bf16 = dnnl_cpu_isa_avx512_core_bf16,
+    /// @copydoc dnnl_cpu_isa_avx10_1_512
+    avx10_1_512 = dnnl_cpu_isa_avx10_1_512,
     /// @copydoc dnnl_cpu_isa_avx512_core_fp16
     avx512_core_fp16 = dnnl_cpu_isa_avx512_core_fp16,
+    /// @copydoc dnnl_cpu_isa_avx10_1_512_amx
+    avx10_1_512_amx = dnnl_cpu_isa_avx10_1_512_amx,
     /// @copydoc dnnl_cpu_isa_avx512_core_amx
     avx512_core_amx = dnnl_cpu_isa_avx512_core_amx,
+    /// @copydoc dnnl_cpu_isa_avx10_1_512_amx_fp16
+    avx10_1_512_amx_fp16 = dnnl_cpu_isa_avx10_1_512_amx_fp16,
     /// @copydoc dnnl_cpu_isa_avx512_core_amx_fp16
     avx512_core_amx_fp16 = dnnl_cpu_isa_avx512_core_amx_fp16,
 };

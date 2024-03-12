@@ -1,5 +1,5 @@
 /*******************************************************************************
- * Copyright 2020-2023 Intel Corporation
+ * Copyright 2020-2024 Intel Corporation
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -221,8 +221,8 @@ public:
 
         if (changed) {
             return copy_attr(*v,
-                    builder::make_indexing(
-                            ptr, newidx_c, v->dtype_.lanes_, new_mask));
+                    builder::make_indexing(ptr, newidx_c, v->dtype_.lanes_,
+                            new_mask, v->dtype_.rows_));
         } else {
             return std::move(v);
         }
@@ -292,6 +292,7 @@ public:
             case intrin_type::reduce_max:
             case intrin_type::reduce_min:
             case intrin_type::fmadd:
+            case intrin_type::fnmadd:
             case intrin_type::unpack_low:
             case intrin_type::unpack_high:
             case intrin_type::shuffle:

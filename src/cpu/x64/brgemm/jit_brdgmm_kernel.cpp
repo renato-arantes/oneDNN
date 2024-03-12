@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2021-2023 Intel Corporation
+* Copyright 2021-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -55,7 +55,7 @@ jit_brdgmm_kernel_base_t<isa, Wmm>::jit_brdgmm_kernel_base_t(
         static constexpr bool preserve_gpr = true;
         static constexpr bool preserve_vmm = false;
         static constexpr bool use_exact_tail_scalar_bcast = false;
-        const auto dst_md_wrapper = memory_desc_wrapper(brg.dst_md);
+        const auto dst_md_wrapper = memory_desc_wrapper(brg.dst_md());
         const size_t tail = tail_length();
 
         static const bcast_set_t enabled_bcast_strategy
@@ -71,11 +71,11 @@ jit_brdgmm_kernel_base_t<isa, Wmm>::jit_brdgmm_kernel_base_t(
                 this->param1, enabled_bcast_strategy, rhs_sp};
 
         postops_injector_ = utils::make_unique<po_injector_t>(
-                this, brg.attr->post_ops_, bsp);
+                this, brg.attr()->post_ops_, bsp);
 
         with_binary_non_scalar_bcast_
                 = binary_injector::any_binary_postop_rhs_non_scalar_broadcast(
-                        brg.attr->post_ops_, dst_md_wrapper);
+                        brg.attr()->post_ops_, dst_md_wrapper);
     }
     if (brg.is_bf16_emu)
         bf16_emu_ = utils::make_unique<bf16_emulation_t>(this,
@@ -157,8 +157,7 @@ template <cpu_isa_t isa, typename Wmm>
 void jit_brdgmm_kernel_base_t<isa, Wmm>::load_permute_vmm() {
     if (is_fast_vnni_int8()) {
         // load permute indices from data section
-        mov(reg_tmp, permute_index_table);
-        vmovdqu32(vmm_permute(), ptr[reg_tmp]);
+        vmovdqu32(vmm_permute(), ptr[rip + permute_index_table]);
     }
 }
 
@@ -485,8 +484,7 @@ void jit_brdgmm_kernel_base_t<isa, Wmm>::store_accumulators_apply_post_ops(
             for (int v_i = 0; v_i < v_substep; ++v_i) {
                 if (get_substep_simd(n, v_i, has_n_tail) <= 0) continue;
                 auto vmm = accm(m_blocks, n_blocks, m, n, v_i);
-                saturate_f32(vmm, vmm_lbound, vmm_ubound, brg.dt_d);
-                vcvtps2dq(vmm, vmm);
+                saturate_cvt_f32(vmm, vmm_lbound, vmm_ubound, brg.dt_d);
             }
         }
 
@@ -565,10 +563,8 @@ void jit_brdgmm_kernel_base_t<isa, Wmm>::store_accumulators_without_post_ops(
         if (substep_simd <= 0) continue;
         const bool mask_flag = substep_simd < simd_w_;
         auto vmm_acc = accm(m_blocks, n_blocks, m, n, v_i);
-        if (dt_requires_saturation) {
-            saturate_f32(vmm_acc, vmm_lbound, vmm_ubound, brg.dt_d);
-            vcvtps2dq(vmm_acc, vmm_acc);
-        }
+        if (dt_requires_saturation)
+            saturate_cvt_f32(vmm_acc, vmm_lbound, vmm_ubound, brg.dt_d);
         const auto offset = C_offset(m, n, v_i);
         if (IMPLICATION(mask_flag, isa_has_masks(brg.isa_impl))) {
             auto vmm_acc_masked = maybe_mask(vmm_acc, mask_flag, true);
@@ -837,7 +833,7 @@ void jit_brdgmm_kernel_base_t<isa, Wmm>::pad_comp_kernel(
     Label jmp_table_base;
     std::vector<Label> jmp_table_labels(max_m_unroll + 1);
     // jmp table
-    mov(reg_table_base, jmp_table_base);
+    lea(reg_table_base, ptr[rip + jmp_table_base]);
     lea(reg_table_base, ptr[reg_table_base + reg_pad * sizeof(void *)]);
     jmp(ptr[reg_table_base], T_NEAR);
     align(8);
@@ -937,7 +933,7 @@ void jit_brdgmm_kernel_base_t<isa, Wmm>::brdgmm_microkernel(int m_blocks,
         } else if (brg.is_f16) {
             vfmadd231ps(vmm_acc, vmma, vmmb);
         } else if (brg.is_int8) {
-            if (brg.isa_impl == avx2_vnni_2 && brg.dt_a == data_type::s8)
+            if (brg.dt_a == data_type::s8 && isa_has_s8s8(brg.isa_impl))
                 vpdpbssd(vmm_acc, vmma, vmmb);
             else
                 vpdpbusd(vmm_acc, vmma, vmmb,
@@ -1001,7 +997,7 @@ void jit_brdgmm_kernel_base_t<isa, Wmm>::brdgmm_microkernel(int m_blocks,
         std::vector<Label> jmp_table_labels(m_blocks);
         if (has_top_padding) {
             // jmp table
-            mov(reg_table_base, jmp_table_base);
+            lea(reg_table_base, ptr[rip + jmp_table_base]);
             lea(reg_table_base,
                     ptr[reg_table_base + reg_aux_A_vpad_top * sizeof(void *)]);
             jmp(ptr[reg_table_base], T_NEAR);
@@ -1370,9 +1366,8 @@ void jit_brdgmm_kernel_base_t<isa, Wmm>::generate() {
 }
 
 template <cpu_isa_t isa, typename Wmm>
-brdgmm_kernel_t<isa, Wmm>::brdgmm_kernel_t(const brgemm_t abrd) {
-    brgemm_kernel_ = new jit_brdgmm_kernel_base_t<isa, Wmm>(abrd);
-}
+brdgmm_kernel_t<isa, Wmm>::brdgmm_kernel_t(const brgemm_t &abrd)
+    : brgemm_kernel_(new jit_brdgmm_kernel_base_t<isa, Wmm>(abrd)) {}
 
 template <cpu_isa_t isa, typename Wmm>
 status_t brdgmm_kernel_t<isa, Wmm>::create_kernel() {

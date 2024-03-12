@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2019-2023 Intel Corporation
+* Copyright 2019-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -37,7 +37,7 @@ namespace eltwise_injector {
 struct static_params_t {
 
     static_params_t(bool save_state = true,
-            Xbyak::Reg64 p_table = Xbyak::util::rax,
+            Xbyak::Reg64 p_table = Xbyak::Reg64(Xbyak::Operand::RAX),
             Xbyak::Opmask k_mask = Xbyak::Opmask(1), bool is_fwd = true,
             bool use_dst = false, bool preserve_vmm = true,
             bool preserve_p_table = true)
@@ -93,7 +93,7 @@ struct jit_uni_eltwise_injector_f32 {
     //   code. Depends on algorithm. See `_use_dst_for_bwd` algs definition.
     jit_uni_eltwise_injector_f32(jit_generator *host, alg_kind_t alg,
             float alpha, float beta, float scale, bool save_state = true,
-            Xbyak::Reg64 p_table = Xbyak::util::rax,
+            Xbyak::Reg64 p_table = Xbyak::Reg64(Xbyak::Operand::RAX),
             Xbyak::Opmask k_mask = Xbyak::Opmask(1), bool is_fwd = true,
             bool use_dst = false, bool preserve_vmm = true,
             bool preserve_p_table = true)
@@ -108,7 +108,8 @@ struct jit_uni_eltwise_injector_f32 {
         , is_fwd_(is_fwd)
         , use_dst_(use_dst)
         , preserve_vmm_(preserve_vmm)
-        , preserve_p_table_(preserve_p_table) {
+        , preserve_p_table_(preserve_p_table)
+        , n_vregs_to_preserve_(aux_vecs_count(alg_, is_fwd_, alpha_)) {
         assert(eltwise_injector::is_supported(isa, alg_));
 
         register_table_entries();
@@ -116,7 +117,8 @@ struct jit_uni_eltwise_injector_f32 {
 
     jit_uni_eltwise_injector_f32(jit_generator *host,
             const post_ops_t::entry_t::eltwise_t &eltwise,
-            bool save_state = true, Xbyak::Reg64 p_table = Xbyak::util::rax,
+            bool save_state = true,
+            Xbyak::Reg64 p_table = Xbyak::Reg64(Xbyak::Operand::RAX),
             Xbyak::Opmask k_mask = Xbyak::Opmask(1), bool is_fwd = true,
             bool use_dst = false, bool preserve_vmm = true,
             bool preserve_p_table = true)
@@ -134,7 +136,7 @@ struct jit_uni_eltwise_injector_f32 {
         compute_vector_range({compute_idx}, vmm_aux_indices);
     }
     void prepare_table(bool gen_table = true);
-    void load_table_addr() { h->mov(p_table_, l_table_); }
+    void load_table_addr() { h->lea(p_table_, h->ptr[h->rip + l_table_]); }
 
     // This call is `static` and `public` to make a decision on the injector's
     // saving state if the caller can supply the necessary number of vmms. The
@@ -151,6 +153,7 @@ private:
 
     const bool save_state_;
     const Xbyak::Reg64 p_table_;
+    Xbyak::Reg64 reg_vmm_stack_ptr_;
     const Xbyak::Opmask k_mask_;
     const bool is_fwd_;
     const bool use_dst_;
@@ -179,7 +182,7 @@ private:
     static constexpr size_t n_vregs_ = cpu_isa_traits<isa>::n_vregs;
     static constexpr int n_mantissa_bits_ = 23;
 
-    size_t n_vregs_to_preserve_ = 0;
+    const size_t n_vregs_to_preserve_;
     size_t n_vregs_preserved_ = 0;
     bool need_vmm_mask_register_ = false;
     // Default initialization will put zeros. Putting any value to trigger a
@@ -195,7 +198,10 @@ private:
     Xbyak::Xmm xmm_tmp_;
 
     static bool need_mask_register(alg_kind_t alg, bool is_fwd, float alpha);
-    static size_t aux_gprs_count(alg_kind_t alg);
+    static size_t aux_gprs_count(alg_kind_t alg, bool is_fwd, float alpha);
+    static bool need_vmm_stack_ptr(alg_kind_t alg, bool is_fwd, float alpha);
+    static size_t op_vecs_count(alg_kind_t alg, bool is_fwd);
+    size_t get_stack_vmm_space();
 
     void compute_body(
             const injector_utils::vmm_index_set_iterator_t &start_idx_it,

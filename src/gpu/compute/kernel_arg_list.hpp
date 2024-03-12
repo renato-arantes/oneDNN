@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2019-2023 Intel Corporation
+* Copyright 2019-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -19,14 +19,13 @@
 
 #include <cassert>
 #include <cstddef>
+#include <string>
 #include <type_traits>
 
 #include "common/bfloat16.hpp"
 #include "common/float16.hpp"
 #include "common/memory_storage.hpp"
 #include "common/nstl.hpp"
-#include "common/verbose.hpp"
-#include "gpu/ocl/types_interop.h"
 
 namespace dnnl {
 namespace impl {
@@ -44,20 +43,59 @@ enum class kernel_arg_kind_t {
 enum class scalar_type_t {
     undef,
     _char,
+    _bfloat8,
     _bfloat16,
     _float,
     _half,
     _int,
+    _int4,
     _long,
     _short,
     _uchar,
     _uint,
+    _uint4,
     _ulong,
     _ushort,
     _zero_pad_mask_t,
+    _int64x2_t,
     _int64x3_t,
+    _int64x4_t,
+    _int64x5_t,
+    _int64x6_t,
     _dispatch_gws_rt_params_t,
 };
+
+inline std::string to_string(scalar_type_t type) {
+#define CASE(x) \
+    case scalar_type_t::x: return #x
+
+    switch (type) {
+        CASE(undef);
+        CASE(_char);
+        CASE(_bfloat8);
+        CASE(_bfloat16);
+        CASE(_float);
+        CASE(_half);
+        CASE(_int);
+        CASE(_int4);
+        CASE(_long);
+        CASE(_short);
+        CASE(_uchar);
+        CASE(_uint);
+        CASE(_uint4);
+        CASE(_ulong);
+        CASE(_ushort);
+        CASE(_zero_pad_mask_t);
+        CASE(_int64x2_t);
+        CASE(_int64x3_t);
+        CASE(_int64x4_t);
+        CASE(_int64x5_t);
+        CASE(_int64x6_t);
+        CASE(_dispatch_gws_rt_params_t);
+    }
+    return "unexpected";
+#undef CASE
+}
 
 template <typename T>
 struct scalar_type_traits {};
@@ -107,18 +145,6 @@ struct scalar_type_traits<int32_t> {
 template <>
 struct scalar_type_traits<int64_t> {
     static const auto type = scalar_type_t::_long;
-};
-template <>
-struct scalar_type_traits<zero_pad_mask_t> {
-    static const auto type = scalar_type_t::_zero_pad_mask_t;
-};
-template <>
-struct scalar_type_traits<int64x3_t> {
-    static const auto type = scalar_type_t::_int64x3_t;
-};
-template <>
-struct scalar_type_traits<dispatch_gws_rt_params_t> {
-    static const auto type = scalar_type_t::_dispatch_gws_rt_params_t;
 };
 
 class kernel_arg_t {
@@ -288,34 +314,6 @@ void set_scalar_arg_cvt(kernel_arg_list_t &arg_list, int index, T scalar,
         case scalar_type_t::_char: arg_list.set(index, (int8_t)scalar); break;
         default: assert(!"Cannot convert scalar to the requested type.");
     }
-}
-
-inline status_t check_scalar_arguments(const kernel_arg_list_t &arg_list,
-        const std::vector<scalar_type_t> &arg_types) {
-    // Some kernels may not support argument validation.
-    if (arg_types.empty()) return status::success;
-
-    for (int i = 0; i < arg_list.nargs(); i++) {
-        auto &arg = arg_list.get(i);
-        auto req_arg_type = arg_types[i];
-
-        if (!arg.is_global() && !arg.is_local() && !arg.is_svm_pointer()) {
-            if (req_arg_type == gpu::compute::scalar_type_t::undef) {
-                // Types of kernel arguments may not be available when zebin
-                // is used.
-                continue;
-            }
-
-            if (req_arg_type != arg.scalar_type()) {
-                VERROR(primitive, gpu,
-                        "type of a scalar kernel argument #%d is "
-                        "different from the type of the given scalar",
-                        i);
-                return status::invalid_arguments;
-            }
-        }
-    }
-    return status::success;
 }
 
 } // namespace compute

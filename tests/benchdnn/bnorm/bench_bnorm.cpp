@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2017-2023 Intel Corporation
+* Copyright 2017-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -43,24 +43,77 @@ void check_correctness(
     for_(const auto &i_dir : s.dir)
     for_(const auto &i_dt : s.dt)
     for_(const auto &i_tag : s.tag)
+    for_(const auto &i_strides : s.strides)
     for_(const auto &i_flags : s.flags)
     for_(const auto &i_mb : s.mb)
     for_(const auto &i_post_ops : s.post_ops)
     for_(const auto &i_scratchpad_mode : s.scratchpad_mode)
     for_(const auto &i_acc_mode : s.acc_mode)
+    for_(const auto &i_deterministic : s.deterministic)
     for_(const auto &i_ctx_init : s.ctx_init)
     for_(const auto &i_ctx_exe : s.ctx_exe)
     for (auto i_inplace : s.inplace) {
         auto attr = settings_t::get_attr(
-                i_post_ops, i_scratchpad_mode, i_acc_mode);
+                i_post_ops, i_scratchpad_mode, i_acc_mode, i_deterministic);
 
-        const prb_t prb(s.desc, i_mb, i_dir, i_dt, i_tag, i_flags, i_inplace,
-                attr, i_ctx_init, i_ctx_exe, s.check_alg, s.debug_check_ws);
+        const prb_t prb(s.desc, i_mb, i_dir, i_dt, i_tag, i_strides, i_flags,
+                i_inplace, attr, i_ctx_init, i_ctx_exe, s.check_alg,
+                s.debug_check_ws);
         if (s.pattern && !match_regex(prb.str(), s.pattern)) return;
 
         task_executor.submit(
                 prb, s.perf_template, createit, check_cacheit, doit);
     }
+}
+
+int verify_input(const settings_t &s, const settings_t &def) {
+    static constexpr int n_inputs = 2;
+
+    for (const auto &i_strides : s.strides) {
+        if (i_strides.size() != n_inputs) {
+            std::stringstream ss;
+            ss << vdims2str(i_strides);
+            BENCHDNN_PRINT(0,
+                    "Error: `strides` option expects two inputs in format "
+                    "`[SRC]:[DST]` (colon must present). Current input is: "
+                    "\"%s\"\n",
+                    ss.str().c_str());
+            SAFE_V(FAIL);
+        }
+        for (int i = 0; i < n_inputs; i++) {
+            if (i_strides[i].size() != static_cast<size_t>(s.desc.ndims)
+                    && !i_strides[i].empty()) {
+                std::stringstream ss;
+                ss << vdims2str(i_strides);
+                BENCHDNN_PRINT(0,
+                        "Error: number of dimensions in the `strides` option "
+                        "doesn't match the number of dimensions in the "
+                        "original "
+                        "problem. Current output is: \"%s\"\n",
+                        ss.str().c_str());
+                SAFE_V(FAIL);
+            }
+        }
+    }
+
+    for_(const auto &i_strides : s.strides)
+    for (const auto &i_tag : s.tag) {
+        const bool strided_input
+                = !i_strides[0].empty() || !i_strides[1].empty();
+        if (strided_input) {
+            const bool no_stride_with_tag = IMPLICATION(i_tag != def.tag[0],
+                    i_strides[0].empty() && i_strides[1].empty());
+
+            if (!no_stride_with_tag) {
+                BENCHDNN_PRINT(0, "%s\n",
+                        "Error: both `strides` and `tag` knobs can't be used "
+                        "with either of `src`, or `dst` tensors.");
+                SAFE_V(FAIL);
+            }
+        }
+    }
+
+    return OK;
 }
 
 static const std::string help_flags
@@ -90,6 +143,7 @@ int bench(int argc, char **argv) {
                 || parse_dir(s.dir, def.dir, argv[0])
                 || parse_dt(s.dt, def.dt, argv[0])
                 || parse_tag(s.tag, def.tag, argv[0])
+                || parse_strides(s.strides, def.strides, argv[0], "strides")
                 || parse_vector_option(s.flags, def.flags, str2flags, argv[0],
                         "flags", help_flags)
                 || parse_single_value_option(s.check_alg, def.check_alg,
@@ -102,6 +156,8 @@ int bench(int argc, char **argv) {
                 || parse_attr_post_ops(s.post_ops, argv[0])
                 || parse_attr_scratchpad_mode(
                         s.scratchpad_mode, def.scratchpad_mode, argv[0])
+                || parse_attr_deterministic(
+                        s.deterministic, def.deterministic, argv[0])
                 || parse_ctx_init(s.ctx_init, def.ctx_init, argv[0])
                 || parse_ctx_exe(s.ctx_exe, def.ctx_exe, argv[0])
                 || parse_test_pattern_match(s.pattern, argv[0])
@@ -112,6 +168,8 @@ int bench(int argc, char **argv) {
             catch_unknown_options(argv[0]);
 
             SAFE(str2desc(&s.desc, argv[0]), CRIT);
+
+            SAFE(verify_input(s, def), WARN);
             check_correctness(s, task_executor);
         }
     }

@@ -1,5 +1,5 @@
 /*******************************************************************************
- * Copyright 2020-2023 Intel Corporation
+ * Copyright 2020-2024 Intel Corporation
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -137,7 +137,8 @@ void ir_copier_impl_t::view(indexing_c v) {
     }
     expr mask;
     if (v->mask_.defined()) { mask = copy(v->mask_); }
-    returned_expr_ = builder::make_indexing(ptr, idx, v->dtype_.lanes_, mask);
+    returned_expr_ = builder::make_indexing(
+            ptr, idx, v->dtype_.lanes_, mask, v->dtype_.rows_);
 }
 
 void ir_copier_impl_t::view(tensorptr_c v) {
@@ -151,10 +152,14 @@ void ir_copier_impl_t::view(call_c v) {
     // do not copy the function AST
     std::vector<expr> args;
     args.reserve(v->args_.size());
+    auto callee = v->func_;
+    if (auto callee_expr = std::dynamic_pointer_cast<expr_base>(v->func_)) {
+        callee = copy(expr_c(callee_expr)).remove_const().impl;
+    }
     for (auto &i : v->args_) {
         args.emplace_back(copy(i));
     }
-    returned_expr_ = make_expr<call_node>(v->func_, args,
+    returned_expr_ = make_expr<call_node>(callee, args,
             std::vector<call_node::parallel_attr_t> {v->para_attr_});
 }
 

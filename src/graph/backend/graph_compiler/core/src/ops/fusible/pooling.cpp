@@ -1,5 +1,5 @@
 /*******************************************************************************
- * Copyright 2022-2023 Intel Corporation
+ * Copyright 2022-2024 Intel Corporation
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -25,7 +25,10 @@
 #include "compiler/ir/sc_data_format.hpp"
 #include "pooling.hpp"
 #include "util/bf16.hpp"
+#include <compiler/ir/transform/dyn_tsr_transform.hpp>
+#include <runtime/dynamic_dispatch/ops/runtime_op_info.hpp>
 #include <unordered_map>
+#include <util/reflection.hpp>
 
 namespace dnnl {
 namespace impl {
@@ -41,7 +44,7 @@ static inline any_map_t add_pl_type_and_in_shape(
         const any_map_t &attrs, int pl_type, const sc_dims &input_shape) {
     auto ret = attrs;
     ret[pooling_attr_key::pooling_type] = pl_type;
-    ret[pooling_attr_key::input_shape] = input_shape;
+    ret[pooling_attr_key::src_shape] = input_shape;
     return ret;
 }
 
@@ -118,13 +121,19 @@ slice_range_list infer_pool_slice_ranges(const graph_tensor_ptr &infered_tensor,
             = get_real_pooling_axis_form_tensor(infered_tensor, channel_last);
     auto &o_blocked_dims = infered_tensor->details_.get_blocking_dims();
     slice_range_list o_ranges_list;
+    auto blocking_dims_expr = infered_tensor->details_.get_blocking_dims_expr(
+            infered_tensor->producer_owner_->get_owner_graph());
     for (auto &range_list : in_range_list) {
         slice_range out_range;
         for (unsigned i = 0; i < range_list.size(); i++) {
             if (!(std::find(
                           real_pooling_axis.begin(), real_pooling_axis.end(), i)
                         == real_pooling_axis.end())) {
-                out_range.emplace_back(0, uint64_t(o_blocked_dims[i]));
+                if (is_dynamic_dim(o_blocked_dims[i])) {
+                    out_range.emplace_back(0, blocking_dims_expr[i]);
+                } else {
+                    out_range.emplace_back(0, uint64_t(o_blocked_dims[i]));
+                }
                 continue;
             }
             out_range.emplace_back(range_list[i]);
@@ -334,10 +343,10 @@ infer_status_code pooling_op_t::pre_infer_slice_ranges(
 static void compute_block_pooling(
         const std::vector<const tensor_slice *> &inputs,
         const tensor_slice &dst, pooling_type_t pooling_typ, sc_dims kernel,
-        sc_dims stride, sc_dims pads_begin,
+        sc_dims stride, const std::vector<expr> &pads_begin,
         const std::vector<int> &in_fmt_vector, const vectorized_info_t &vx_info,
         sc_data_type_t in_dtype, sc_data_type_t out_dtype, any_map_t &attrs,
-        const graph_tensor_ptr &output_tensor = nullptr, size_t wkld = 0UL) {
+        const graph_tensor_ptr &expand_gt, size_t wkld = 0UL) {
     /*** The final IR may look like below:
      * _for_(_fuseiter_i, 0, I, 1)
      *   _for_(_fuseiter_j, 0, J, 1)
@@ -399,7 +408,7 @@ static void compute_block_pooling(
             expr out_h_idx = dst.get_offset()[i];
             if (out_h_idx.isa<constant>()) out_h_idx = iter_vars[i];
             auto idx = int(stride[pads_stride_index]) * out_h_idx
-                    - int(pads_begin[pads_stride_index])
+                    - pads_begin[pads_stride_index]
                     + kernel_iter_vars[pads_stride_index];
             expr tmp_cond = builder::make_logic_and(
                     builder::make_cmp_ge(idx, 0),
@@ -573,33 +582,27 @@ static void compute_block_pooling(
                 : make_stmt<stmts_node_t>(std::vector<stmt> {cur});
         if (!body.ptr_same(cur)) add_parent_node(cur, body);
 
-        if (output_tensor != nullptr) {
-            // create output inner anchors for postop fusion
-            auto anchor_stmt = make_stmt<stmts_node_t>(std::vector<stmt> {});
-            body.static_as<stmts>()->seq_.emplace_back(anchor_stmt);
-            add_parent_node(anchor_stmt, body);
-            slice_range inner_slice = dst.get_ranges();
-            for (int j = i; j >= 0; j--) {
-                inner_slice[j].first = dst.get_offset()[j] + iter_vars[j];
-                inner_slice[j].second = ((static_cast<int>(j) == vx_info.axis)
-                                ? expr(int(vx_info.lanes))
-                                : expr(1));
-            }
-            fslice_map fsmap;
-            fsmap.get(output_tensor) = slice_range_list {inner_slice};
-            inner_anchors.emplace_back(
-                    std::make_shared<fusion_anchor_t>(anchor_stmt, fsmap));
+        // create output inner anchors for postop fusion
+        auto anchor_stmt = make_stmt<stmts_node_t>(std::vector<stmt> {});
+        body.static_as<stmts>()->seq_.emplace_back(anchor_stmt);
+        add_parent_node(anchor_stmt, body);
+        slice_range inner_slice = dst.get_ranges();
+        for (int j = i; j >= 0; j--) {
+            inner_slice[j].first = dst.get_offset()[j] + iter_vars[j];
+            inner_slice[j].second = ((static_cast<int>(j) == vx_info.axis)
+                            ? expr(int(vx_info.lanes))
+                            : expr(1));
         }
+        fslice_map fsmap;
+        fsmap.get(expand_gt) = slice_range_list {inner_slice};
+        inner_anchors.emplace_back(
+                std::make_shared<fusion_anchor_t>(anchor_stmt, fsmap));
 
         cur = make_stmt<for_loop_node_t>(std::move(iter_vars.at(i)), 0,
                 dst.get_shape()[i],
                 (i == int(iter_vars.size() - 1)) ? int(vx_info.lanes) : 1, body,
                 true, i == 0 ? for_type::PARALLEL : for_type::NORMAL);
-        if (output_tensor && output_tensor->producer_owner_
-                && dynamic_cast<pooling_op_t *>(output_tensor->producer_owner_)
-                        == nullptr) {
-            cur->attr()[stmt_attr_key::merge_loop] = true;
-        }
+        bind_loop_axis(expand_gt, cur, i, true);
         add_parent_node(body, cur);
     }
 
@@ -634,12 +637,43 @@ void pooling_op_t::compute_block(context_ptr ctx,
     auto in_dtype = info_.inputs_[0]->details_.dtype_;
     auto out_dtype = info_.outputs_[0]->details_.dtype_;
     size_t wkld = compute_fusible_workload(ctx, dst, inputs);
-
+    auto in_fmt_vector = get_ncx_formatcode_vector_form_tensor(
+            info_.inputs_[0], channel_last_);
+    std::string auto_pad = attrs_.get_or_else<std::string>(
+            pooling_attr_key::auto_pad, auto_pad_options::none);
+    auto pads_begin_expr = get_owner_graph().dims_to_expr(pads_begin_);
+    if ((is_dynamic()
+                && (auto_pad == auto_pad_options::same_upper
+                        || auto_pad == auto_pad_options::same_lower))) {
+        auto src_shapes = inputs[0]->get_shape();
+        auto dst_shapes = (*dst[0]).get_shape();
+        for (unsigned i = 0; i < inputs[0]->nslice_dims(); i++) {
+            if (in_fmt_vector[i] < 2) { continue; }
+            int plan_axis = in_fmt_vector[i];
+            if (!is_dynamic_dim(
+                        info_.inputs_[0]
+                                ->details_.get_plain_dims()[plan_axis])) {
+                continue;
+            }
+            int pads_stride_index = plan_axis - 2;
+            auto total_pad
+                    = builder::make_max((dst_shapes[i] - 1)
+                                              * int(stride_[pads_stride_index])
+                                      + int(kernel_[pads_stride_index]),
+                              src_shapes[i])
+                    - src_shapes[i];
+            if (auto_pad == auto_pad_options::same_upper) {
+                pads_begin_expr[pads_stride_index]
+                        = do_cast_and_fold(total_pad / 2);
+            } else {
+                pads_begin_expr[pads_stride_index]
+                        = do_cast_and_fold((total_pad + 1) / 2);
+            }
+        }
+    }
     compute_block_pooling(inputs, *dst[0], pooling_type_, kernel_, stride_,
-            pads_begin_,
-            get_ncx_formatcode_vector_form_tensor(
-                    info_.inputs_[0], channel_last_),
-            vx_info_, in_dtype, out_dtype, attrs_, info_.outputs_[0], wkld);
+            pads_begin_expr, in_fmt_vector, vx_info_, in_dtype, out_dtype,
+            attrs_, info_.outputs_[0], wkld);
 }
 
 void pooling_op_t::query_format(context_ptr ctx,
@@ -674,6 +708,96 @@ size_t pooling_op_t::compute_workload(const std::vector<shape_dtype_pair> &ins,
     return wkld;
 }
 
+shape_rl_vec pooling_op_t::get_dynamic_shape_relations() const {
+    shape_rl_vec ret;
+    auto &in_dims = get_inputs()[0]->details_.get_plain_dims();
+    auto &out_dims = get_outputs()[0]->details_.get_plain_dims();
+    if (is_dynamic_dim(in_dims[0])) {
+        ret.emplace_back(in_dims[0], out_dims[0]);
+    }
+    const int shape_begin_axis = channel_last_ ? 1 : 2;
+    auto n_pad_dims = in_dims.size() - 2;
+    std::string auto_pad = attrs_.get_or_else<std::string>(
+            pooling_attr_key::auto_pad, auto_pad_options::none);
+    for (unsigned i = 0; i < n_pad_dims; i++) {
+        if (is_dynamic_dim(in_dims[shape_begin_axis + i])) {
+            if (auto_pad == auto_pad_options::same_upper
+                    || auto_pad == auto_pad_options::same_lower) {
+                if (stride_[i] == 1) {
+                    ret.emplace_back(in_dims[shape_begin_axis + i],
+                            out_dims[shape_begin_axis + i]);
+                }
+            } else {
+                if (stride_[i] == 1
+                        && (kernel_[i] - (pads_begin_[i] + pads_end_[i])
+                                == 1)) {
+                    ret.emplace_back(in_dims[shape_begin_axis + i],
+                            out_dims[shape_begin_axis + i]);
+                }
+            }
+        }
+    }
+    return ret;
+}
+
+reflection::shared_general_object_t pooling_op_t::get_dynamic_runtime_info() {
+    auto ndims = info_.inputs_[0]->details_.get_plain_dims().size();
+    std::string auto_pad = attrs_.get_or_else<std::string>(
+            pooling_attr_key::auto_pad, auto_pad_options::none);
+    auto auto_pads_same = auto_pad == auto_pad_options::same_upper
+            || auto_pad == auto_pad_options::same_lower;
+    auto rounding_type_floor
+            = attrs_.get_or_else<std::string>(pooling_attr_key::rounding_type,
+                      rounding_type_options::floor)
+            == rounding_type_options::floor;
+    auto dyn_info = ndims == 5
+            ? dyn_pooling_runtime_info_t(stride_[0], stride_[1], stride_[2],
+                    pads_begin_[0], pads_begin_[1], pads_begin_[2],
+                    pads_end_[0], pads_end_[1], pads_end_[2], kernel_[0],
+                    kernel_[1], kernel_[2], rounding_type_floor, auto_pads_same)
+            : dyn_pooling_runtime_info_t(stride_[0], stride_[1], pads_begin_[0],
+                    pads_begin_[1], pads_end_[0], pads_end_[1], kernel_[0],
+                    kernel_[1], rounding_type_floor, auto_pads_same);
+    reflection::shared_general_object_t info
+            = reflection::general_object_t::make(dyn_info);
+    return info;
+}
+
+void pooling_op_t::calculate_dynamic_shape_expression() {
+    auto &g = get_owner_graph();
+    auto expr_pads_begin = g.dims_to_expr(pads_begin_);
+    auto expr_pads_end = g.dims_to_expr(pads_end_);
+    auto expr_strides = g.dims_to_expr(stride_);
+    auto expr_kernels = g.dims_to_expr(kernel_);
+    auto &data_dims = get_inputs()[0]->details_.get_plain_dims();
+    auto &out_dims = get_outputs()[0]->details_.get_plain_dims();
+    const int shape_begin_axis = channel_last_ ? 1 : 2;
+    auto n_pad_dims = data_dims.size() - 2;
+    std::string auto_pad = attrs_.get_or_else<std::string>(
+            pooling_attr_key::auto_pad, auto_pad_options::none);
+    for (unsigned i = 0; i < n_pad_dims; i++) {
+        if (is_dynamic_dim(data_dims[shape_begin_axis + i])
+                && out_dims[shape_begin_axis + i]
+                        != data_dims[shape_begin_axis + i]) {
+            auto var_in = g.dim_to_expr(data_dims[shape_begin_axis + i]);
+            auto var_out = g.dim_to_expr(out_dims[shape_begin_axis + i]);
+            expr_c cal_expr;
+            if (auto_pad == auto_pad_options::same_upper
+                    || auto_pad == auto_pad_options::same_lower) {
+                cal_expr = do_cast_and_fold(
+                        (var_in + expr_strides[i] - 1) / expr_strides[i]);
+            } else {
+                cal_expr = do_cast_and_fold(
+                        (var_in + expr_pads_begin[i] + expr_pads_end[i]
+                                - expr_kernels[i])
+                                / expr_strides[i]
+                        + 1);
+            }
+            var_out->attr_->set(attr_keys::cal_expression, cal_expr);
+        }
+    }
+}
+
 sc_dims pooling_op_t::_calculate_output_dims(
         bool rounding_floor, bool channel_last) {
     auto &input_dims = info_.inputs_[0]->details_.get_plain_dims();
@@ -688,17 +812,23 @@ sc_dims pooling_op_t::_calculate_output_dims(
 
     for (unsigned i = 0; i < n_pads_dims; i++) {
         int padding = pads_begin_[i] + pads_end_[i];
-        if (rounding_floor) {
-            output_dims[shape_begin_axis + i]
-                    = (input_dims[shape_begin_axis + i] + padding - kernel_[i])
-                            / stride_[i]
-                    + 1;
+        if (is_dynamic_dim(input_dims[shape_begin_axis + i])) {
+            output_dims[shape_begin_axis + i] = dimensions::dynamic_any;
         } else {
-            output_dims[shape_begin_axis + i]
-                    = utils::divide_and_ceil(input_dims[shape_begin_axis + i]
-                                      + padding - kernel_[i],
-                              stride_[i])
-                    + 1;
+            if (rounding_floor) {
+                output_dims[shape_begin_axis + i]
+                        = (input_dims[shape_begin_axis + i] + padding
+                                  - kernel_[i])
+                                / stride_[i]
+                        + 1;
+            } else {
+                output_dims[shape_begin_axis + i]
+                        = utils::divide_and_ceil(
+                                  input_dims[shape_begin_axis + i] + padding
+                                          - kernel_[i],
+                                  stride_[i])
+                        + 1;
+            }
         }
     }
     return output_dims;
@@ -735,12 +865,23 @@ pooling_backprop_op_t::pooling_backprop_op_t(
     check_and_set_kernel_strides_and_pooling_type(
             attrs_, n_kernel_dims, kernel_, stride_, pooling_type_);
 
+    sc_dims input_plain_shape;
     // set pads_begin_ and pads_begin_
-    COMPILE_ASSERT(attrs.has_key(pooling_attr_key::input_shape),
-            "the pooling_backprop_op_t op should have input_shape "
-            "attribute");
-    sc_dims input_plain_shape
-            = attrs.get<sc_dims>(pooling_attr_key::input_shape);
+    if (pooling_type_ == pooling_type_t::avg) {
+        COMPILE_ASSERT(
+                attrs.has_key(pooling_attr_key::src_shape) || ins.size() == 2,
+                "the pooling_backprop_op_t op should have input_shape.");
+        bool ins_has_src_shape = ins.size() == 2;
+        input_plain_shape = ins_has_src_shape
+                ? ins[1]->details_.get_plain_dims()
+                : attrs.get<sc_dims>(pooling_attr_key::src_shape);
+    } else {
+        COMPILE_ASSERT(attrs.has_key(pooling_attr_key::src_shape),
+                "the pooling_backprop_op_t op should have input_shape "
+                "attribute");
+        input_plain_shape = attrs.get<sc_dims>(pooling_attr_key::src_shape);
+    }
+
     check_and_set_pads_begin_and_pads_end(
             attrs_, input_plain_shape, pads_begin_, pads_end_, channel_last_);
 
@@ -892,7 +1033,6 @@ static void pooling_backward_fill_zero_dst(const tensor_slice &dst,
                 (i == int(dst_idx.size() - 1)) ? int(vx_info.lanes) : 1,
                 std::move(body), true, for_type::NORMAL);
     }
-    cur->attr()[stmt_attr_key::merge_loop] = false;
     bld->emit(cur);
 }
 
@@ -901,7 +1041,8 @@ static void compute_block_pooling_backward_avg(
         const tensor_slice &dst, sc_dims kernel, sc_dims stride,
         sc_dims pads_begin, const std::vector<int> &dst_fmt_vector,
         const vectorized_info_t &vx_info, sc_data_type_t in_dtype,
-        any_map_t &attrs, size_t wkld = 0UL) {
+        any_map_t &attrs, const graph_tensor_ptr &expand_gt,
+        size_t wkld = 0UL) {
     /***The final IR may look like below:
      * _for_(_fuseiter_i, 0, I, 1)
      *   _for_(_fuseiter_j, 0, J, 1)
@@ -926,8 +1067,6 @@ static void compute_block_pooling_backward_avg(
     // fill dst delta with 0
     pooling_backward_fill_zero_dst(dst, in_dtype, vx_info);
 
-    auto in_vectorized_dtype
-            = sc_data_type_t(in_dtype.type_code_, vx_info.lanes);
     // builder
     auto bld = builder::get_current_builder();
 
@@ -951,16 +1090,13 @@ static void compute_block_pooling_backward_avg(
                 std::string("_fuseiter") + fusion_create_idx()));
     }
 
-    auto kernel_size_var
-            = builder::make_var(in_vectorized_dtype, "kernel_size");
+    auto kernel_size_var = builder::make_var(in_dtype, "kernel_size");
     auto define_kernel_size_var
             = make_stmt<define_node_t>(kernel_size_var, linkage::local, expr());
 
     // the indices of output delta
     std::vector<expr> dst_delta_idx;
     std::vector<expr> conds(kernel.size());
-    auto vectorized_int
-            = sc_data_type_t(datatypes::s32.type_code_, vx_info.lanes);
 
     expr kernel_size_multi_expr = kernel_size_var;
     bool multi_first = true;
@@ -981,19 +1117,19 @@ static void compute_block_pooling_backward_avg(
             dst_delta_idx.emplace_back(idx);
             auto window_start = make_expr<intrin_call_node>(intrin_type::max,
                     std::vector<expr> {make_expr<constant_node>(
-                                               int64_t(0), vectorized_int),
+                                               int64_t(0), datatypes::s32),
                             int(stride[pads_stride_index])
                                             * make_expr<cast_node>(
-                                                    vectorized_int,
+                                                    datatypes::s32,
                                                     iter_vars[i])
                                     - int(pads_begin[pads_stride_index])},
                     any_map_t());
             auto window_end = make_expr<intrin_call_node>(intrin_type::min,
-                    std::vector<expr> {make_expr<cast_node>(vectorized_int,
+                    std::vector<expr> {make_expr<cast_node>(datatypes::s32,
                                                dst.get_shape()[i]),
                             int(stride[pads_stride_index])
                                             * make_expr<cast_node>(
-                                                    vectorized_int,
+                                                    datatypes::s32,
                                                     iter_vars[i])
                                     - int(pads_begin[pads_stride_index])
                                     + int(kernel[pads_stride_index])},
@@ -1025,10 +1161,8 @@ static void compute_block_pooling_backward_avg(
                     kernel_size_var, kernel_size_multi_expr);
         } else {
             kernel_size_asnode = make_stmt<assign_node_t>(kernel_size_var,
-                    make_expr<constant_node>(
-                            float(kernel_size), in_vectorized_dtype));
+                    make_expr<constant_node>(float(kernel_size), in_dtype));
         }
-
     } else {
         COMPILE_ASSERT(0, "unsupported in_dtype.");
     }
@@ -1038,10 +1172,15 @@ static void compute_block_pooling_backward_avg(
     for (int i = kernel_iter_vars.size() - 1; i >= 0; i--) {
         stmt else_stmt, then_stmt;
         if (i == int(kernel_iter_vars.size() - 1)) {
+            expr kernel_size = kernel_size_var;
+            if (vx_info.lanes > 1) {
+                kernel_size = builder::make_broadcast(
+                        kernel_size_var, vx_info.lanes);
+            }
+
             then_stmt = make_stmt<assign_node_t>(indexed_dst_delta,
                     builder::make_add(indexed_dst_delta,
-                            builder::make_div(
-                                    indexed_src_delta, kernel_size_var)));
+                            builder::make_div(indexed_src_delta, kernel_size)));
         } else {
             then_stmt = cur;
         }
@@ -1076,9 +1215,9 @@ static void compute_block_pooling_backward_avg(
                 std::move(body), true, for_type::NORMAL);
 
         cur->attr()[op_traits::workload_computable_t::workload_number] = wkld;
+        bind_loop_axis(expand_gt, cur, i, true);
     }
 
-    if (cur.isa<for_loop>()) cur->attr()[stmt_attr_key::merge_loop] = false;
     cur = make_stmt<stmts_node_t>(
             std::vector<stmt> {define_kernel_size_var, std::move(cur)});
 
@@ -1090,7 +1229,8 @@ static void compute_block_pooling_backward_max(
         const tensor_slice &dst, sc_dims kernel, sc_dims stride,
         sc_dims pads_begin, const std::vector<int> &dst_fmt_vector,
         const vectorized_info_t &vx_info, sc_data_type_t in_dtype,
-        any_map_t &attrs, size_t wkld = 0UL) {
+        any_map_t &attrs, const graph_tensor_ptr &expand_gt,
+        size_t wkld = 0UL) {
     /***The final IR may look like below:
      * _for_(_fuseiter_i, 0, I, 1)
      *   _for_(_fuseiter_j, 0, J, 1)
@@ -1276,9 +1416,9 @@ static void compute_block_pooling_backward_max(
                 for_type::NORMAL);
 
         cur->attr()[op_traits::workload_computable_t::workload_number] = wkld;
+        bind_loop_axis(expand_gt, cur, i, true);
     }
 
-    if (cur.isa<for_loop>()) cur->attr()[stmt_attr_key::merge_loop] = false;
     std::vector<stmt> func_body = defines_of_max;
     func_body.emplace_back(std::move(cur));
     cur = make_stmt<stmts_node_t>(std::move(func_body));
@@ -1322,13 +1462,13 @@ void pooling_backprop_op_t::compute_block(context_ptr ctx,
                 pads_begin_,
                 get_ncx_formatcode_vector_form_tensor(
                         info_.inputs_[0], channel_last_),
-                vx_info_, in_dtype, attrs_);
+                vx_info_, in_dtype, attrs_, get_inputs()[0]);
     } else {
         compute_block_pooling_backward_max(inputs, *dst[0], kernel_, stride_,
                 pads_begin_,
                 get_ncx_formatcode_vector_form_tensor(
                         info_.inputs_[1], channel_last_),
-                vx_info_, in_dtype, attrs_);
+                vx_info_, in_dtype, attrs_, get_inputs()[1]);
     }
 }
 

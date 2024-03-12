@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2019-2023 Intel Corporation
+* Copyright 2019-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -15,6 +15,7 @@
 *******************************************************************************/
 
 #include "common/c_types_map.hpp"
+#include "common/convolution_pd.hpp"
 #include "common/memory.hpp"
 #include "common/memory_tracking.hpp"
 #include "common/nstl.hpp"
@@ -64,10 +65,13 @@ _jit_uni_x8s8s32x_fwd_kernel<isa, Vmm>::_jit_uni_x8s8s32x_fwd_kernel(
         static constexpr bool preserve_gpr = true;
         static constexpr bool preserve_vmm = false;
         static constexpr size_t helper_vmm_idx = 15;
-        const size_t oc_block_tail = jcp.oc_block % isa_simd_width_;
-        const size_t tail_size = oc_block_tail
-                ? oc_block_tail
-                : jcp.oc_without_padding % isa_simd_width_;
+        const size_t block_tail
+                = (jcp.is_depthwise ? jcp.ch_block : jcp.oc_block)
+                % isa_simd_width_;
+        const size_t tail_size = block_tail
+                ? block_tail
+                : (jcp.is_depthwise ? jcp.ngroups : jcp.oc_without_padding)
+                        % isa_simd_width_;
 
         const rhs_arg_static_params_t rhs_arg_static_params {helper_vmm_idx,
                 r13, r14, r15, preserve_gpr, preserve_vmm,
@@ -1252,12 +1256,14 @@ status_t jit_uni_x8s8s32x_fwd_kernel<isa>::init_conf(jit_conv_conf_t &jcp,
     const bool is_avx2 = isa == avx2;
     assert(is_1d || is_2d || is_3d);
 
-    if (!(mayiuse(isa)
-                && one_of(src_d.data_type(), data_type::u8, data_type::s8)
-                && weights_d.data_type() == data_type::s8
-                && one_of(dst_d.data_type(), data_type::f32, data_type::s32,
-                        data_type::s8, data_type::u8)))
-        return status::unimplemented;
+    // disabling verbose dispatch messages for unsupported isa for better readability
+    if (!mayiuse(isa)) return status::unimplemented;
+
+    const bool dt_ok = one_of(src_d.data_type(), data_type::u8, data_type::s8)
+            && weights_d.data_type() == data_type::s8
+            && one_of(dst_d.data_type(), data_type::f32, data_type::s32,
+                    data_type::s8, data_type::u8);
+    VDISPATCH_CONV_IC(dt_ok, VERBOSE_UNSUPPORTED_DT_CFG);
 
     jcp = zero<decltype(jcp)>();
     jcp.nthr = nthreads;
@@ -1320,10 +1326,12 @@ status_t jit_uni_x8s8s32x_fwd_kernel<isa>::init_conf(jit_conv_conf_t &jcp,
             = zp.common(DNNL_ARG_SRC); // otherwise, it's per-channel
     assert(IMPLICATION(jcp.src_zero_point, jcp.zp_src_is_common));
 
-    if ((jcp.dst_zero_point || jcp.src_zero_point) && jcp.is_fused_conv)
-        return status::unimplemented;
+    VDISPATCH_CONV_IC(
+            !((jcp.dst_zero_point || jcp.src_zero_point) && jcp.is_fused_conv),
+            "fused depthwise convolution does not support zero-point");
 
-    if (is_3d && jcp.is_depthwise) return status::unimplemented;
+    VDISPATCH_CONV_IC(!(is_3d && jcp.is_depthwise),
+            "unsupported depthwise implementation for 3D convolution");
 
     if (jcp.is_depthwise) {
         jcp.ch_block = is_avx2 ? 8 : 4;
@@ -1347,8 +1355,9 @@ status_t jit_uni_x8s8s32x_fwd_kernel<isa>::init_conf(jit_conv_conf_t &jcp,
              * - Otherwise return unimplemented */
             jcp.oc_block = jcp.ic_block = 4;
         }
-        if (jcp.ic % jcp.ic_block != 0 || jcp.oc % jcp.oc_block != 0)
-            return status::unimplemented;
+        VDISPATCH_CONV_IC(
+                !(jcp.ic % jcp.ic_block != 0 || jcp.oc % jcp.oc_block != 0),
+                VERBOSE_BLOCKING_FAIL);
     }
 
     jcp.is_resrc_depthwise = true && jcp.is_depthwise && jcp.stride_w < jcp.kw
@@ -1421,7 +1430,7 @@ status_t jit_uni_x8s8s32x_fwd_kernel<isa>::init_conf(jit_conv_conf_t &jcp,
         return weights_md == want_wei_md;
     };
 
-    if (!set_or_check_wei_format()) return status::unimplemented;
+    VDISPATCH_CONV_IC(set_or_check_wei_format(), VERBOSE_UNSUPPORTED_TAG);
     format_tag_t dat_tag = utils::pick(
             ndims - 3, format_tag::nwc, format_tag::nhwc, format_tag::ndhwc);
 
@@ -1431,7 +1440,7 @@ status_t jit_uni_x8s8s32x_fwd_kernel<isa>::init_conf(jit_conv_conf_t &jcp,
     } else {
         jcp.src_tag = src_d.matches_one_of_tag(dat_tag);
     }
-    if (jcp.src_tag != dat_tag) return status::unimplemented;
+    VDISPATCH_CONV_IC(jcp.src_tag == dat_tag, VERBOSE_UNSUPPORTED_TAG);
 
     if (dst_d.format_kind() == format_kind::any) {
         CHECK(memory_desc_init_by_tag(dst_md, dat_tag));
@@ -1439,7 +1448,7 @@ status_t jit_uni_x8s8s32x_fwd_kernel<isa>::init_conf(jit_conv_conf_t &jcp,
     } else {
         jcp.dst_tag = dst_d.matches_one_of_tag(dat_tag);
     }
-    if (jcp.dst_tag != dat_tag) return status::unimplemented;
+    VDISPATCH_CONV_IC(jcp.dst_tag == dat_tag, VERBOSE_UNSUPPORTED_TAG);
 
     if (jcp.with_bias) {
         if (bias_d.format_kind() == format_kind::any)
@@ -1467,7 +1476,7 @@ status_t jit_uni_x8s8s32x_fwd_kernel<isa>::init_conf(jit_conv_conf_t &jcp,
 
     const bool post_ops_ok_ = post_ops_ok(post_ops_ok_args_t(isa,
             {eltwise, binary, sum}, jcp.post_ops, &dst_d, false, false, false));
-    if (!post_ops_ok_) return status::unimplemented;
+    VDISPATCH_CONV_IC(post_ops_ok_, VERBOSE_UNSUPPORTED_POSTOP);
 
     jcp.typesize_in = types::data_type_size(src_d.data_type());
     jcp.typesize_out = types::data_type_size(dst_d.data_type());
@@ -1510,7 +1519,7 @@ status_t jit_uni_x8s8s32x_fwd_kernel<isa>::init_conf(jit_conv_conf_t &jcp,
         return float(work_amount) / rnd_up(work_amount, nthr);
     };
 
-    auto get_ow_block = [jcp, get_thr_eff](int ur_w, int nthr) {
+    auto get_ow_block = [&jcp, get_thr_eff](int ur_w, int nthr) {
         int res_ow_block = jcp.ow;
         float best_thr_eff = get_thr_eff(1, nthr);
         float thr_eff;
@@ -1584,7 +1593,7 @@ status_t jit_uni_x8s8s32x_fwd_kernel<isa>::init_conf(jit_conv_conf_t &jcp,
 
     bool args_ok = true && jcp.oc % jcp.oc_block == 0
             && IMPLICATION(!jcp.is_1stconv, jcp.ic % jcp.ic_block == 0);
-    if (!args_ok) return status::unimplemented;
+    VDISPATCH_CONV_IC(args_ok, VERBOSE_BLOCKING_FAIL);
 
     pick_loop_order(jcp);
 

@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2022-2023 Intel Corporation
+* Copyright 2022-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -15,6 +15,7 @@
 *******************************************************************************/
 
 #include "common/c_types_map.hpp"
+#include "common/convolution_pd.hpp"
 #include "common/dnnl_thread.hpp"
 #include "common/nstl.hpp"
 #include "common/type_helpers.hpp"
@@ -81,8 +82,8 @@ status_t brgemm_convolution_bwd_strided_t<isa, is_deconv>::pd_t::init(
         return status::unimplemented;
 
     using skip_mask_t = primitive_attr_t::skip_mask_t;
-    auto skip_mask = is_deconv ? (skip_mask_t::post_ops | skip_mask_t::sum_dt)
-                               : skip_mask_t::none;
+    auto skip_mask = skip_mask_t::fpmath_mode;
+    if (is_deconv) skip_mask |= skip_mask_t::post_ops | skip_mask_t::sum_dt;
     if (is_int8 && is_deconv)
         skip_mask |= skip_mask_t::scales_runtime
                 | skip_mask_t::zero_points_runtime;
@@ -102,20 +103,24 @@ status_t brgemm_convolution_bwd_strided_t<isa, is_deconv>::pd_t::init(
                     with_bias(), one_of(bias_md_.data_type, f32, s32, s8, u8))
             && is_deconv /* only deconv uses int8 */;
 
-    const bool ok = is_bwd_d()
-            && set_default_alg_kind(alg_kind::convolution_direct)
-            && impl_supports_datatype(diff_src_type)
-            && impl_supports_datatype(wei_type)
-            && impl_supports_datatype(diff_dst_type)
-            && one_of(true, is_f32_supported, is_xf16_supported,
-                    is_int8_supported)
-            && attr()->has_default_values(skip_mask, diff_src_type)
-            && IMPLICATION(is_deconv,
-                    attr()->post_ops_.check_sum_consistency(
-                            diff_src_type, is_int8_supported))
-            && !has_zero_dim_memory();
-
-    if (!ok) return status::unimplemented;
+    VDISPATCH_CONV(is_bwd_d(), VERBOSE_BAD_PROPKIND);
+    VDISPATCH_CONV(
+            impl_supports_datatype(diff_src_type), VERBOSE_UNSUPPORTED_DT);
+    VDISPATCH_CONV(impl_supports_datatype(wei_type), VERBOSE_UNSUPPORTED_DT);
+    VDISPATCH_CONV(
+            impl_supports_datatype(diff_dst_type), VERBOSE_UNSUPPORTED_DT);
+    VDISPATCH_CONV(one_of(true, is_f32_supported, is_xf16_supported,
+                           is_int8_supported),
+            VERBOSE_UNSUPPORTED_DT);
+    VDISPATCH_CONV(set_default_alg_kind(alg_kind::convolution_direct),
+            VERBOSE_BAD_ALGORITHM);
+    VDISPATCH_CONV(!has_zero_dim_memory(), VERBOSE_EMPTY_TENSOR, "");
+    VDISPATCH_CONV(attr()->has_default_values(skip_mask, diff_src_type),
+            VERBOSE_UNSUPPORTED_ATTR);
+    VDISPATCH_CONV(IMPLICATION(is_deconv,
+                           attr()->post_ops_.check_sum_consistency(
+                                   diff_src_type, is_int8_supported)),
+            VERBOSE_UNSUPPORTED_POSTOP);
 
     const auto is_amx = brgemm_convolution_bwd_utils::is_amx(isa);
 
@@ -614,6 +619,20 @@ status_t brgemm_convolution_bwd_strided_t<isa, is_deconv>::init(
         CHECK(comp_vpad_pbuffer_->create_kernel());
     }
 
+    // JIT to precompute scales
+    const bool is_jit_supported = mayiuse(avx512_core);
+    const auto attr = _pd->attr();
+    if (is_jit_supported && req_copy_scales(attr, jcp.scale_adjust_factor)) {
+        const auto &attr_scales = attr->scales_;
+        int wei_scale_mask = attr_scales.get(DNNL_ARG_WEIGHTS).mask_;
+        if (wei_scale_mask != 0) {
+            CHECK(safe_ptr_assign(jit_scale_precompute_,
+                    new jit_avx512_core_scale_precompute_t(
+                            jcp.scale_adjust_factor)));
+            CHECK(jit_scale_precompute_->create_kernel());
+        }
+    }
+
     const auto ow_block = jcp.owp;
     const auto oh_block = jcp.ohp;
     const auto od_block = jcp.odp;
@@ -654,9 +673,11 @@ status_t brgemm_convolution_bwd_strided_t<isa, is_deconv>::execute(
     DEFINE_ARG_SCALES_BUFFER(wei_scales, DNNL_ARG_WEIGHTS);
     DEFINE_ARG_SCALES_BUFFER(dst_scales, DNNL_ARG_DST);
 
-    const float *oscales = precompute_scales(ctx.get_scratchpad_grantor(),
-            src_scales, wei_scales, _pd->IC(), _pd->attr(),
-            jcp.scale_adjust_factor);
+    const memory_tracking::grantor_t scratchpad = ctx.get_scratchpad_grantor();
+
+    const float *oscales = scale_utils::precompute_scales(scratchpad,
+            src_scales, wei_scales, pd()->IC(), pd()->attr(),
+            jit_scale_precompute_.get(), jcp.scale_adjust_factor);
 
     brgemm_bwd_exec_ctx_t brgemm_ctx(ctx, _pd);
 
@@ -681,7 +702,6 @@ status_t brgemm_convolution_bwd_strided_t<isa, is_deconv>::execute(
                     + (jcp.s8s8_compensation_required ? s8s8_comp_offset : 0)
             : nullptr;
 
-    const memory_tracking::grantor_t scratchpad = ctx.get_scratchpad_grantor();
     brgemm_batch_element_t *const __restrict brg_batch_global
             = (jcp.brg_type == brgemm_strd && jcp.exec_type != exec_vpad)
             ? nullptr

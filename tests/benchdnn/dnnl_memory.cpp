@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2019-2023 Intel Corporation
+* Copyright 2019-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -37,6 +37,7 @@
 #include "dnn_types.hpp"
 #include "dnnl_common.hpp"
 #include "dnnl_memory.hpp"
+#include "utils/cold_cache.hpp"
 #include "utils/dnnl_query.hpp"
 #include "utils/parallel.hpp"
 
@@ -93,7 +94,8 @@ dnn_mem_t::dnn_mem_t(const dnn_mem_t &rhs, dnnl_data_type_t dt,
     if (active_) {
         int status = reorder(rhs);
         if (status != OK) {
-            BENCHDNN_PRINT(0, "%s\n", "Reorder in memory constructor failed.");
+            BENCHDNN_PRINT(
+                    0, "%s\n", "Error: reorder in memory constructor failed.");
         }
     }
 }
@@ -210,6 +212,20 @@ float dnn_mem_t::get_elem(int64_t idx, int buffer_index) const {
         case dnnl_f8_e4m3:
             elem = static_cast<dnnl::impl::float8_e4m3_t *>(data)[idx];
             break;
+        case dnnl_s4: {
+            auto half = idx % 2 ? dnnl::impl::int4_extract_t::high_half
+                                : dnnl::impl::int4_extract_t::low_half;
+            elem = static_cast<float>(dnnl::impl::int4_t::extract(
+                    static_cast<uint8_t *>(data)[idx / 2], half));
+            break;
+        }
+        case dnnl_u4: {
+            auto half = idx % 2 ? dnnl::impl::int4_extract_t::high_half
+                                : dnnl::impl::int4_extract_t::low_half;
+            elem = static_cast<float>(dnnl::impl::uint4_t::extract(
+                    static_cast<uint8_t *>(data)[idx / 2], half));
+            break;
+        }
         default: assert(!"bad data type");
     }
     return elem;
@@ -232,6 +248,22 @@ void dnn_mem_t::set_elem(int64_t idx, float value, int buffer_index) const {
         case dnnl_f8_e4m3:
             ((dnnl::impl::float8_e4m3_t *)data)[idx] = value;
             break;
+        case dnnl_s4: {
+            using type = dnnl::impl::int4_t;
+            auto half = idx % 2 ? dnnl::impl::int4_extract_t::high_half
+                                : dnnl::impl::int4_extract_t::low_half;
+            uint8_t dst_val = ((uint8_t *)data)[idx / 2];
+            ((type *)data)[idx / 2] = type(value).insert(dst_val, half);
+            break;
+        }
+        case dnnl_u4: {
+            using type = dnnl::impl::uint4_t;
+            auto half = idx % 2 ? dnnl::impl::int4_extract_t::high_half
+                                : dnnl::impl::int4_extract_t::low_half;
+            uint8_t dst_val = ((uint8_t *)data)[idx / 2];
+            ((type *)data)[idx / 2] = type(value).insert(dst_val, half);
+            break;
+        }
         default: assert(!"bad data type");
     }
 }
@@ -676,7 +708,11 @@ int dnn_mem_t::initialize(
             // Do not fill a memory if its size is zero. Moreover, memset
             // expects defined pointer, nullptr is not allowed.
             if (sz != 0) {
-                if (has_bench_mode_modifier(mode_modifier_t::no_host_memory)) {
+                // Avoid costy data reorders for cold cache mode when
+                // initializing cold cache buffers.
+                // TODO: consider enabling broadly for perf mode.
+                if (has_bench_mode_modifier(mode_modifier_t::no_host_memory)
+                        || cold_cache_mode != default_cold_cache_mode) {
                     // Fill memory directly with 0x3F3F3F3F (0.747059f) number.
                     this->memset(dnnl_mem_default_perf_test_value, sz);
                 } else {
@@ -901,7 +937,8 @@ int check_zero_padding(
             CASE(dnnl_s32, int32_t);
             CASE(dnnl_s8, int8_t);
             CASE(dnnl_u8, uint8_t);
-
+            CASE(dnnl_s4, int8_t);
+            CASE(dnnl_u4, uint8_t);
         default: assert(!"bad data_type");
     };
 #undef CASE

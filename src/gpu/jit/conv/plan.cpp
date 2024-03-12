@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2022-2023 Intel Corporation
+* Copyright 2022-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -1158,9 +1158,14 @@ struct fma_context_t {
         if (a_type.is_f16() && b_type.is_f16() && c_type.is_f32()) {
             return layout.retype(type_t::f32()).make_dense();
         }
+        if (layout.type().is_bf8())
+            return layout.make_dense().retype(type_t::f16());
 
         // mad with f16 requires aligned regioning for src1/src2.
         if (a_type.is_f16()) return layout.make_dense();
+
+        if (layout.type().is_bf16() && !hw.systolic_support())
+            return layout.retype(type_t::f32()).make_dense();
 
         if (a_type.is_bf16()) {
             // bf16 mixed mode requires src1 to be converted to f32 when it's
@@ -1182,8 +1187,7 @@ struct fma_context_t {
         bool is_a = (abc == abc_kind_t::a);
         bool is_b = (abc == abc_kind_t::b);
         auto type = (is_a ? a_type : b_type);
-        int type_size = type.size();
-
+        int type_size = (layout.type().is_bf8() ? 2 : type.size());
         if (is_dpas) {
             int sdepth = 8;
             int dword_size = 4;
@@ -1208,6 +1212,7 @@ struct fma_context_t {
                     layout_t(type, 0, (int)bmnks.size(), blocks));
             auto abc_layout
                     = mapper.map_from_bmnk(abc, bmnks, fma_layout, layout);
+            if (layout.type().is_bf8()) return abc_layout.retype(type_t::f16());
             return abc_layout;
         }
 
@@ -1218,9 +1223,10 @@ struct fma_context_t {
                     std::vector<block_t> blocks;
                     int new_inner_stride = 1;
                     int nblocks = (int)layout.blocks().size();
+                    auto inner_most_block = layout.blocks()[0];
                     for (int i = nblocks - 1; i >= 0; --i) {
                         auto &b = layout.blocks()[i];
-                        if (i == nblocks - 1) {
+                        if (b.dim_idx != inner_most_block.dim_idx) {
                             new_inner_stride = b.block;
                             blocks.insert(blocks.begin(),
                                     block_t(b.dim_idx, b.block, stride_t(1)));
@@ -1231,7 +1237,8 @@ struct fma_context_t {
                     }
                     return maybe_retype_layout_for_mad(is_a,
                             layout_t(layout.type(), layout.ndims(),
-                                    layout.offset(), blocks));
+                                    layout.offset(), blocks)
+                                    .make_dense());
                 }
             }
             // XXX: type and layout.type() may be different here when using mad
@@ -1245,7 +1252,7 @@ struct fma_context_t {
             auto bmnks = get_bmnk_kinds(abc, /*with_batch=*/true);
             auto bmnk_layout = mapper.map_to_bmnk(abc, bmnks, ret);
             auto fma_layout = bmnk_layout.make_with_block(
-                    layout_t(type, 0, (int)bmnks.size(), blocks));
+                    layout_t(ret.type(), 0, (int)bmnks.size(), blocks));
             auto abc_layout = mapper.map_from_bmnk(abc, bmnks, fma_layout, ret);
             return abc_layout;
         }
@@ -1819,7 +1826,10 @@ private:
         int tmp_regs = 5;
         int bound = cfg_.regs() - tmp_regs;
         if (plan.grf_usage().total() < bound) return plan_status_t::success;
-
+        // Do not downsize grf mode at the cost of disabling below optimizations.
+        if (cfg_.exec_cfg().hw().large_grf_support() && cfg_.regs() <= 128
+                && default_regs(cfg_) != 128)
+            return plan_status_t::out_of_registers;
         plan_status_t status;
 
         status = try_apply_ab_split(plan, bound);
@@ -1955,7 +1965,7 @@ private:
         auto &src = g2s_load.reg_layout();
         auto &dst = g2s_store.reg_layout();
         reorder = create_reorder_plan(cfg_.hw(), src, dst);
-        if (reduce_mask) {
+        if (reduce_mask && !cfg_.prb().deterministic) {
             *reduce_tile = to_reduce_tensor(abs_thr_tile, reduce_mask.mask);
             auto reduce_layout = to_reduce_layout(src, reduce_mask.mask);
             *reduce = create_reduce_plan(
@@ -2010,13 +2020,23 @@ private:
 
     plan_status_t init_x_s2r_plan(abc_kind_t abc, bool has_x_slm,
             const layout_t &slm_layout, const tensor_t &thr_tile,
-            send_plan_t &load, layout_t &layout) const {
+            const tensor_t &abs_thr_tile, send_plan_t &load, layout_t &layout,
+            reduce_mask_t reduce_mask = reduce_mask_t(),
+            reduce_plan_t *reduce = nullptr,
+            tensor_t *reduce_tile = nullptr) const {
         if (!has_x_slm) return plan_status_t::success;
         auto thr_view = view_t(slm_layout).create_sub_view(thr_tile);
         auto params = get_send_params(cfg_.exec_cfg(), send_op_t::load,
                 send_address_t::slm, abc, thr_view);
         load = create_send_plan(cfg_.exec_cfg(), thr_view, params);
         layout = load.reg_layout();
+        if (reduce_mask && cfg_.prb().deterministic) {
+            *reduce_tile = to_reduce_tensor(abs_thr_tile, reduce_mask.mask);
+            auto reduce_layout = to_reduce_layout(layout, reduce_mask.mask);
+            *reduce = create_reduce_plan(
+                    cfg_.hw(), layout, reduce_layout, reduce_mask.mask);
+        }
+
         if (load.is_scattered()) {
             // Do not use SLM with scattered SLM load.
             return plan_status_t::invalid_slm_send;
@@ -2177,9 +2197,15 @@ private:
 
     plan_status_t init_x2r_plan(const slm_plan_t &slm, x2r_plan_t &plan) const {
         PLAN_CHECK(init_x_s2r_plan(abc_kind_t::a, slm.has_a(), slm.a_layout,
-                gemm_schedule_.a_thr_tile(), plan.a_load, plan.a_layout));
+                gemm_schedule_.a_thr_tile(),
+                gemm_schedule_.a_thr_tile(/*is_relative=*/false), plan.a_load,
+                plan.a_layout, reduce_mask(cfg_, abc_kind_t::a), &plan.x_reduce,
+                &plan.x_reduce_tile));
         PLAN_CHECK(init_x_s2r_plan(abc_kind_t::b, slm.has_b(), slm.b_layout,
-                gemm_schedule_.b_thr_tile(), plan.b_load, plan.b_layout));
+                gemm_schedule_.b_thr_tile(),
+                gemm_schedule_.b_thr_tile(/*is_relative=*/false), plan.b_load,
+                plan.b_layout, reduce_mask(cfg_, abc_kind_t::b), &plan.x_reduce,
+                &plan.x_reduce_tile));
         PLAN_CHECK(init_x_g2r_plan(abc_kind_t::a, slm.has_a(),
                 gemm_schedule_.a_tg_view(), gemm_schedule_.a_thr_tile(),
                 gemm_schedule_.a_thr_tile(/*is_relative=*/false), plan.a_load,

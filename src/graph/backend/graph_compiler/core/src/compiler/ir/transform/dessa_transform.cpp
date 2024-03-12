@@ -1,5 +1,5 @@
 /*******************************************************************************
- * Copyright 2022-2023 Intel Corporation
+ * Copyright 2022-2024 Intel Corporation
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -13,7 +13,9 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  *******************************************************************************/
+#include <algorithm>
 #include <map>
+#include <memory>
 #include <utility>
 #include <vector>
 #include "dessa_transform.hpp"
@@ -22,6 +24,7 @@
 #include <compiler/ir/ssa_data.hpp>
 #include <compiler/ir/ssa_visitor.hpp>
 #include <util/any_map.hpp>
+#include <util/weakptr_utils.hpp>
 
 namespace dnnl {
 namespace impl {
@@ -49,12 +52,212 @@ struct dessa_analysis_data_t {
     dessa_analysis_data_t(const stmt_base_t *parent) : parent_(parent) {}
 };
 
+// Loop phi coalesce is achieved by checking the usage of a, b, c
+// in a = phi(b, c loop) is not overlapped and there is no interference.
+// ssa_analysis_viewer_t will set to check b, c usage after a is defined
+// and check a, b usage after c is defined, so if there is interference
+// between any vars in any sub loops, all vars will not be coalesced.
+// This will coalesce all loop phi vars in reduce situations
+struct loop_phi_coalesce_data_t {
+    // check for interference after this var is defined
+    std::weak_ptr<expr_base> check_after_define_;
+    // the final coalesced var
+    std::weak_ptr<expr_base> coalesced_var_;
+    // flag for var defined inside loop
+    bool from_loop_ = false;
+    // flag for interfered phi vars
+    bool interfered_ = false;
+    // flag for checking interference
+    // when check_ is true and the var is used
+    // interfered_ will be set to true
+    bool check_ = false;
+    // flag for preserved var, a copy has been made
+    // original var can be used in other node
+    bool preserved_ = false;
+
+    loop_phi_coalesce_data_t(const expr &v = expr())
+        : check_after_define_(v.impl) {}
+};
+
+// get loop_phi_coalesce_data_t or null
+static inline loop_phi_coalesce_data_t *get_coalesce_data(const expr_c &v) {
+    if (!v->get_temp_data().isa<loop_phi_coalesce_data_t>()) { //
+        return nullptr;
+    }
+    return &(v->temp_data().get<loop_phi_coalesce_data_t>());
+}
+// get loop_phi_coalesce_data_t or create new
+static inline loop_phi_coalesce_data_t *get_or_create_coalesce_data(
+        const expr_c &v, const expr &c = expr()) {
+    if (!v->get_temp_data().isa<loop_phi_coalesce_data_t>()) {
+        v->temp_data() = loop_phi_coalesce_data_t(c);
+    }
+    return &(v->temp_data().get<loop_phi_coalesce_data_t>());
+}
+
+// Merge related loop phi var interfered data,
+// if one interfered, mark all interfered
+static inline bool merge_interfered_data(
+        const expr_c &var, const ssa_phi_c &phi) {
+    if (!get_coalesce_data(var)) { return true; }
+    bool interfered = get_coalesce_data(var)->interfered_;
+    for (auto &val : phi->values_) {
+        if (!get_coalesce_data(val)) { return true; }
+        interfered |= get_coalesce_data(val)->interfered_;
+    }
+    get_coalesce_data(var)->interfered_ = interfered;
+    for (auto &val : phi->values_) {
+        get_coalesce_data(val)->interfered_ = interfered;
+    }
+    return interfered;
+}
+
+// Get final coalesced var
+static inline expr get_coalesced_from_var(const expr_c &v) {
+    if (get_coalesce_data(v)) {
+        auto ptr = get_coalesce_data(v)->coalesced_var_;
+        if (!utils::is_uninitialized_weakptr(ptr)) {
+            assert(ptr.lock());
+            return ptr.lock()->node_ptr_from_this();
+        }
+    }
+    return expr();
+}
+// Get if the coalesced var is preserved
+static inline bool get_perservd_from_var(const expr_c &v) {
+    return get_coalesce_data(v) ? get_coalesce_data(v)->preserved_ : false;
+}
+// Get final coalesced var from phi node, if incoming coalesced ptr_same
+static inline expr get_coalesced_from_phi(const ssa_phi_c &phi) {
+    assert(phi->values_.size() == 2);
+    auto c0 = get_coalesced_from_var(phi->values_[0]);
+    auto c1 = get_coalesced_from_var(phi->values_[1]);
+    return c0.defined() && c1.defined() && c0.ptr_same(c1) ? c0 : expr();
+}
+// Merge final coalesced var, set to the first incoming phi var
+static inline void merge_coalesced_var(
+        const expr_c &thevar, const ssa_phi_c &phi, const stmt &toplevel) {
+    assert(phi->values_.size() == 2);
+    auto &val_0 = phi->values_[0];
+    auto &val_1 = phi->values_[1];
+
+    expr coalesced = get_coalesced_from_var(val_0);
+
+    if (!coalesced.defined()) {
+        // perserve the outer loop defined var
+        get_coalesce_data(val_0)->preserved_ = true;
+        // make a copy of outer loop var
+        coalesced = thevar->remake();
+        coalesced.static_as<var>()->name_ += "_coalesced";
+        // insert define after original var
+        auto coalesced_def = builder::make_var_tensor_def_unattached(
+                coalesced, linkage::local, val_0);
+        auto valowner = val_0->ssa_data_->get_owner();
+        if (valowner.defined()) {
+            auto &tempdata = valowner->temp_data().get<dessa_analysis_data_t>();
+            tempdata.inserted_after_.emplace_back(coalesced_def);
+        } else {
+            auto &tempdata = toplevel->temp_data().get<dessa_analysis_data_t>();
+            tempdata.inserted_within_.emplace_back(coalesced_def);
+        }
+    }
+
+    get_coalesce_data(thevar)->coalesced_var_ = coalesced.impl;
+    get_coalesce_data(val_0)->coalesced_var_ = coalesced.impl;
+    get_coalesce_data(val_1)->coalesced_var_ = coalesced.impl;
+}
+
 struct ssa_analysis_viewer_t : public ssa_viewer_t {
     using ssa_viewer_t::dispatch;
     using ssa_viewer_t::view;
     const stmt_base_t *current_ = nullptr;
 
     std::vector<define_c> defines_;
+    // all the phi node defined in the current loop
+    std::vector<std::vector<std::pair<expr, ssa_phi>>> curr_loop_phi_;
+    // restore parent loop's phi vars check state after curr loop
+    std::vector<std::vector<std::pair<expr, bool>>> curr_check_state_;
+
+    void process_define(const expr &var, const expr &init = expr()) {
+        // process var data for interference check
+        if (get_coalesce_data(var)) {
+            auto data = get_coalesce_data(var);
+            auto ptr = data->check_after_define_;
+            if (!utils::is_uninitialized_weakptr(ptr)) {
+                assert(ptr.lock());
+                auto node = ptr.lock()->node_ptr_from_this();
+                // set to check interference for merged node
+                get_coalesce_data(node)->check_ = true;
+                get_coalesce_data(var)->check_ = false;
+            }
+        } else {
+            var->temp_data() = loop_phi_coalesce_data_t();
+        }
+        // If the var is defined not inside any loop, a copy will
+        // be made when coalescing, and orignal var is preserved
+        bool from_loop = curr_loop_phi_.size() > 0;
+        get_coalesce_data(var)->from_loop_ = from_loop;
+        // process loop phi define
+        if (init.defined() && init.isa<ssa_phi>()) {
+            auto phi = init.static_as<ssa_phi>();
+            if (phi->is_loop_phi_) {
+                assert(phi->values_.size() == 2);
+                auto &phi_val_0 = phi->values_[0];
+                auto &phi_val_1 = phi->values_[1];
+                if (get_coalesce_data(phi_val_0)
+                        && get_coalesce_data(phi_val_1)) {
+                    // critical loop var defined before current phi var
+                    // exist interference (potentially swap problem)
+                    // may need parallel copy implementation to resolve
+                    get_coalesce_data(var)->interfered_ = true;
+                    get_coalesce_data(phi_val_0)->interfered_ = true;
+                    get_coalesce_data(phi_val_1)->interfered_ = true;
+                } else if (phi_val_0.isa<constant>()) {
+                    // TODO(longsheng): deal with uninitialized vars
+                    get_or_create_coalesce_data(var)->interfered_ = true;
+                    get_or_create_coalesce_data(phi_val_0)->interfered_ = true;
+                    get_or_create_coalesce_data(phi_val_1)->interfered_ = true;
+                } else {
+                    // assume phi_val_0 is the incoming var
+                    // assume phi_val_1 is the critical var
+                    // save incoming phi check state
+                    COMPILE_ASSERT(get_coalesce_data(phi_val_0),
+                            "incoming phi var should be defined already.");
+                    auto &curr_state = curr_check_state_.back();
+                    bool check = get_coalesce_data(phi_val_0)->check_;
+                    curr_state.emplace_back(std::make_pair(phi_val_0, check));
+                    // set to check interference for incoming phi vars
+                    // and critical phi vars
+                    bool v0_check = get_coalesce_data(phi_val_0)->from_loop_;
+                    get_coalesce_data(phi_val_0)->check_ = v0_check;
+                    phi_val_1->temp_data() = loop_phi_coalesce_data_t(var);
+                    get_coalesce_data(phi_val_1)->check_ = true;
+                }
+                // record loop phi in current loop
+                curr_loop_phi_.back().emplace_back(std::make_pair(var, phi));
+            } else {
+                // if phi merged loop phi vars inherent the interferece state
+                merge_interfered_data(var, phi);
+                if (phi->values_.size() == 2) {
+                    auto v0_data = get_coalesce_data(phi->values_[0]);
+                    auto v1_data = get_coalesce_data(phi->values_[1]);
+                    bool v0_interfered = v0_data ? v0_data->interfered_ : true;
+                    bool v1_interfered = v1_data ? v1_data->interfered_ : true;
+                    bool interfered = v0_interfered || v1_interfered;
+                    bool v0_check = v0_data && v0_data->from_loop_;
+                    if (v0_data && !interfered) { v0_data->check_ = v0_check; }
+                    if (v1_data && !interfered) { v1_data->check_ = true; }
+                }
+            }
+        }
+    }
+
+    func_c dispatch(func_c v) override {
+        for (auto &p : v->params_) {
+            process_define(p);
+        }
+        return ssa_viewer_t::dispatch(std::move(v));
+    }
 
     stmt_c dispatch(stmt_c s) override {
         if (!s->get_temp_data().isa<dessa_analysis_data_t>()) {
@@ -72,8 +275,25 @@ struct ssa_analysis_viewer_t : public ssa_viewer_t {
         return ret;
     }
 
+    void view(for_loop_c v) override {
+        curr_loop_phi_.emplace_back(std::vector<std::pair<expr, ssa_phi>>());
+        curr_check_state_.emplace_back(std::vector<std::pair<expr, bool>>());
+        ssa_viewer_t::view(v);
+        // merge current loop phi var interference
+        for (auto &kv : curr_loop_phi_.back()) {
+            merge_interfered_data(kv.first, kv.second);
+        }
+        curr_loop_phi_.pop_back();
+        // recover incoming phi check state
+        for (auto &kv : curr_check_state_.back()) {
+            get_coalesce_data(kv.first)->check_ = kv.second;
+        }
+        curr_check_state_.pop_back();
+    }
+
     void view(define_c v) override {
         if (v->init_.defined()) { dispatch(v->init_); }
+        process_define(v->var_, v->init_);
         defines_.emplace_back(std::move(v));
     }
 
@@ -92,6 +312,10 @@ struct ssa_analysis_viewer_t : public ssa_viewer_t {
                         .get<dessa_analysis_data_t>()
                         .uses_.emplace_back(current_);
             }
+        }
+        if (get_coalesce_data(v) && get_coalesce_data(v)->check_) {
+            // check for loop phi var interference
+            get_coalesce_data(v)->interfered_ = true;
         }
     }
 };
@@ -121,14 +345,19 @@ struct ssa_mutator_t : public ir_visitor_t {
         return ir_visitor_t::dispatch(std::move(v));
     }
 
-    // we are not interested in exprs. Simply return and don't dispatch down
-    expr_c dispatch(expr_c v) override { return v; }
+    expr_c visit(var_c v) override {
+        auto coalesced = get_coalesced_from_var(v);
+        auto preserved = get_perservd_from_var(v);
+        if (coalesced.defined() && !preserved) { return coalesced; }
+        return v;
+    }
 
     stmt_c visit(define_c v) override {
         if (v->var_.isa<var>()
                 && v->var_.static_as<var>()->dtype_ == datatypes::void_t) {
             assert(v->init_.defined());
-            return builder::make_evaluate_unattached(v->init_);
+            return builder::make_evaluate_unattached(
+                    ir_visitor_t::dispatch(v->init_));
         }
         return ir_visitor_t::visit(std::move(v));
     }
@@ -138,7 +367,7 @@ struct ssa_mutator_t : public ir_visitor_t {
                 && v->value_.static_as<var>()->dtype_ == datatypes::void_t) {
             return stmt_c();
         }
-        return v;
+        return ir_visitor_t::visit(v);
     }
 
     stmt_c visit(stmts_c v) override {
@@ -171,9 +400,12 @@ struct ssa_mutator_t : public ir_visitor_t {
             auto &s_dessa_data
                     = s->get_temp_data().get<dessa_analysis_data_t>();
             if (!s_dessa_data.inserted_after_.empty()) {
-                ret_vec.insert(ret_vec.end(),
-                        s_dessa_data.inserted_after_.begin(),
-                        s_dessa_data.inserted_after_.end());
+                std::transform(s_dessa_data.inserted_after_.begin(),
+                        s_dessa_data.inserted_after_.end(),
+                        std::back_inserter(ret_vec), [this](stmt in) {
+                            return ir_visitor_t::dispatch(std::move(in))
+                                    .remove_const();
+                        });
                 changed = true;
             }
         }
@@ -237,6 +469,30 @@ static const stmt_base_t *find_shared_parent_for_uses(const stmt_base_t *cur) {
     return find_parent_stmts(cur);
 }
 
+// If the loop phi is coalesced, use the coalesced var to replace the usage of
+// all merged loop phi vars and romove the define.
+// For non-loop phis, if the 2 merged vars are both coalesced to same var,
+// use the coalesced var to replace the phi node
+static void coalesce_var_for_phi(const expr &coalesced, const expr &var_for_phi,
+        const stmt_base_t *cur) {
+    dessa_analysis_data_t &data = cur->temp_data().get<dessa_analysis_data_t>();
+    auto def = cur->node_ptr_from_this().checked_as<define>();
+    data.should_remove_ = true; // remove the phi node
+
+    auto coalesced_loop_var = get_coalesced_from_var(var_for_phi);
+    if (!coalesced_loop_var.defined()) {
+        // this is a non loop phi merge, use coalesced var as init to define var
+        auto newnode = def->remake();
+        newnode.static_as<define>()->init_ = coalesced;
+        data.inserted_after_.insert(data.inserted_after_.begin(), newnode);
+    } else if (!coalesced_loop_var.ptr_same(coalesced)) {
+        // this is a non loop phi merge, but src and dst are both coalesced,
+        // use coalesced var as init to assign to other coalesced var
+        data.inserted_after_.insert(data.inserted_after_.begin(),
+                builder::make_assign_unattached(coalesced_loop_var, coalesced));
+    }
+}
+
 // in SSA form, a var may be defined in a child scope (e.g. within if-else), but
 // is used in parent scope. This function inserts a var def in parent scope and
 // replaces the var def in child scope with an assignment to make the IR valid.
@@ -245,6 +501,14 @@ static bool promote_scope_for_non_phi_var(
         const define_c &def, const expr &value) {
     dessa_analysis_data_t &curdata
             = def->temp_data().get<dessa_analysis_data_t>();
+    auto coalesced = get_coalesced_from_var(def->var_);
+    if (coalesced.defined()) {
+        // The var is coalesced
+        curdata.should_remove_ = true;
+        curdata.inserted_after_.emplace_back(
+                builder::make_assign_unattached(coalesced, value));
+        return false;
+    }
     auto shared_parent = find_shared_parent_for_uses(def.get());
     if (shared_parent != get_parent(def.get())) {
         curdata.should_remove_ = true;
@@ -321,20 +585,30 @@ static void process_phi(
 
         if (is_loop_phi) {
             COMPILE_ASSERT(cur_for, "Cannot find parent for-loop for loop phi");
-            // the phi is a loop-phi
-            data.shadow_phi_var_ = builder::make_var(
-                    thevar->dtype_, thevar->name_ + "_shadow");
-            auto cur_for_body
-                    = static_cast<const for_loop_node_t *>(cur_for)->body_;
-            // copy the value in shadow to old var at the begining of the
-            // for-loop
-            cur_for_body->temp_data()
-                    .get<dessa_analysis_data_t>()
-                    .inserted_within_.emplace_back(
-                            builder::make_assign_unattached(
-                                    thevar, data.shadow_phi_var_));
+            if (!merge_interfered_data(thevar, phi)) {
+                // No interference between loop_phi vars
+                merge_coalesced_var(thevar, phi, toplevel);
+            } else {
+                // the phi is a loop-phi
+                data.shadow_phi_var_ = builder::make_var(
+                        thevar->dtype_, thevar->name_ + "_shadow");
+                auto cur_for_body
+                        = static_cast<const for_loop_node_t *>(cur_for)->body_;
+                // copy the value in shadow to old var at the begining of the
+                // for-loop
+                cur_for_body->temp_data()
+                        .get<dessa_analysis_data_t>()
+                        .inserted_within_.emplace_back(
+                                builder::make_assign_unattached(
+                                        thevar, data.shadow_phi_var_));
+            }
         }
-        insert_value_copy_for_phi(phi, thevar, cur, toplevel);
+        expr coalesced = get_coalesced_from_phi(phi);
+        if (coalesced.defined()) {
+            coalesce_var_for_phi(coalesced, thevar, cur);
+        } else {
+            insert_value_copy_for_phi(phi, thevar, cur, toplevel);
+        }
     } else {
         // not-phi
         if (!promote_scope_for_non_phi_var(def, phi->values_.front())) {

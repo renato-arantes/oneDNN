@@ -1,5 +1,5 @@
 /*******************************************************************************
- * Copyright 2022-2023 Intel Corporation
+ * Copyright 2022-2024 Intel Corporation
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -269,6 +269,13 @@ public:
                         transform_disabled("fmadd"),
                         transform_4a_to_3a(xbyak_intrin_type::fmadd));
             } break;
+            case intrin_type::fnmadd: {
+                transform(dst,
+                        {intrin->args_[0], intrin->args_[1], intrin->args_[2]},
+                        dst->dtype_, //
+                        transform_disabled("fnmadd"),
+                        transform_4a_to_3a(xbyak_intrin_type::fnmadd));
+            } break;
             case intrin_type::broadcast: {
                 transform(dst, {intrin->args_[0]},
                         dst->dtype_, //
@@ -429,11 +436,11 @@ public:
                         transform_intrin(xbyak_intrin_type::round_and_cast),
                         transform_intrin(xbyak_intrin_type::round_and_cast));
             } break;
-            case intrin_type::load_const_mem: {
+            case intrin_type::constant_load:
+            case intrin_type::volatile_load: {
                 transform(dst, {intrin->args_[0]},
                         dst->dtype_, //
-                        transform_disabled("load_const_mem"),
-                        transform_assign());
+                        transform_assign(), transform_assign());
             } break;
             default: add_assignment(dst, intrin); break;
         }
@@ -767,27 +774,33 @@ public:
                 return v;
             }
         };
+        auto v = load_when_interfere(dst, rhs);
         // dst = lhs
         add_assignment(dst, lhs);
         // dst = 2a(rhs)
-        transform_intrin(dst, {load_if_imm_64_bit(rhs)}, intrin, isa);
+        transform_intrin(dst, {load_if_imm_64_bit(v)}, intrin, isa);
     }
 
     void transform_4a_to_3a(const expr &dst, const expr &a, const expr &b,
             const expr &c, xbyak_intrin_type intrin, xbyak_intrin_isa isa) {
+        auto bb = load_when_interfere(dst, b);
+        auto cc = load_when_interfere(dst, c);
         // dst = a
         add_assignment(dst, a);
         // dst = 3a(b, c)
-        transform_intrin(dst, {b, c}, intrin, isa);
+        transform_intrin(dst, {bb, cc}, intrin, isa);
     }
 
     void transform_5a_to_4a(const expr &dst, const expr &a, const expr &b,
             const expr &c, const expr &d, xbyak_intrin_type intrin,
             xbyak_intrin_isa isa) {
+        auto bb = load_when_interfere(dst, b);
+        auto cc = load_when_interfere(dst, c);
+        auto dd = load_when_interfere(dst, d);
         // dst = src1
         add_assignment(dst, a);
         // dst = 4a(b, c, d)
-        transform_intrin(dst, {b, c, d}, intrin, isa);
+        transform_intrin(dst, {bb, cc, dd}, intrin, isa);
     }
 
     void transform_x86_mul(const expr &dst, const expr &lhs, const expr &rhs) {
@@ -1302,6 +1315,17 @@ public:
     expr load_when_imm(const expr &v, const std::string &name) {
         if (v.isa<constant>()) {
             auto tmp = builder::make_var(v->dtype_, name);
+            add_defination(tmp, linkage::local);
+            add_assignment(tmp, v);
+            return tmp;
+        } else {
+            return v;
+        }
+    }
+
+    expr load_when_interfere(const expr &dst, const expr &v) {
+        if (dst.ptr_same(v)) {
+            auto tmp = builder::make_var(v->dtype_, "__load_interfere");
             add_defination(tmp, linkage::local);
             add_assignment(tmp, v);
             return tmp;

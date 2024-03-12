@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2022-2023 Intel Corporation
+* Copyright 2022-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -26,9 +26,9 @@
 #include "gpu/jit/conv/plan.hpp"
 #include "gpu/jit/conv/problem.hpp"
 #include "gpu/jit/conv/tiler.hpp"
-#include "gpu/jit/ir/block_2d_utils.hpp"
 #include "gpu/jit/ir/gemm_schedule.hpp"
 #include "gpu/jit/ir/tensor_config.hpp"
+#include "gpu/jit/jit_eltwise_injector.hpp"
 
 namespace dnnl {
 namespace impl {
@@ -149,7 +149,8 @@ status_t conv_problem_t::init(
     wei_data_type = conv_pd->invariant_wei_md()->data_type;
     bia_data_type = conv_pd->invariant_bia_md()->data_type;
     dst_data_type = conv_pd->invariant_dst_md()->data_type;
-    fpmath_mode = attr->fpmath_mode_;
+    fpmath_mode = attr->fpmath_.mode_;
+    deterministic = attr->deterministic_;
 
     ndims = conv_pd->ndims();
 
@@ -188,7 +189,7 @@ status_t conv_problem_t::init(
     dh = conv_pd->KDH();
     dw = conv_pd->KDW();
 
-    try_reduce_to_1d();
+    normalize_shape();
 
     is_dw = with_groups && (g > 1) && (oc == 1) && (ic == 1);
     ksp = kd * kh * kw;
@@ -196,62 +197,86 @@ status_t conv_problem_t::init(
     osp = od * oh * ow;
 
     hw_t hw(engine);
+    init_transpose(hw);
     CHECK(init_abc_data_types(hw));
     CHECK(init_acc_data_type());
-    init_transpose(hw);
 
     return status::success;
 }
 
-void conv_problem_t::try_reduce_to_1d() {
+bool can_reduce_to_1d(const memory_desc_t &out_md, const post_ops_t &post_ops) {
+    int ndims = out_md.ndims;
+    int sp_ndims = ndims - 2;
+    int non_one_sp_ndims = 0;
+    for (int i = ndims - sp_ndims; i < ndims; i++) {
+        if (out_md.dims[i] != 1) non_one_sp_ndims++;
+    }
+    if (non_one_sp_ndims == 1) return true;
+    for (int i = 0; i < post_ops.len(); i++) {
+        auto &po = post_ops.entry_[i];
+        int mask = 0;
+        if (po.is_prelu()) {
+            mask = po.prelu.mask;
+        } else if (po.is_binary()) {
+            mask = utils::get_dims_mask(
+                    out_md.dims, po.binary.src1_desc.dims, ndims);
+        }
+        // If the post-op is applied per D/H/W dimension then it cannot be
+        // transformed to 1D.
+        for (int i = ndims - sp_ndims; i < ndims; i++) {
+            if ((mask & (1 << i)) != 0) return false;
+        }
+    }
+    return true;
+}
+
+void conv_problem_t::normalize_shape() {
     bool is_1x1 = (kd * kh * kw == 1);
     bool is_eq_oi = (od == id && oh == ih && ow == iw);
-    bool is_iw_1 = iw == 1 && kw == 1 && pw == 0 && ow == 1;
-    bool is_ih_1 = ih == 1 && kh == 1 && ph == 0 && oh == 1;
-    reduced_dim = 0;
-    auto shift_oh_to_ow = [&]() {
-        ow = oh;
-        iw = ih;
-        ih = 1;
-        oh = 1;
-        kw = kh;
-        kh = 1;
-        pw = ph;
-        ph = 0;
-        sw = sh;
-        sh = 1;
-        dw = dh;
-        dh = 0;
-        reduced_dim += 1;
-    };
-    auto shift_od_to_oh = [&]() {
-        oh = od;
-        ih = id;
-        id = 1;
-        od = 1;
-        kh = kd;
-        kd = 1;
-        ph = pd;
-        pd = 0;
-        sh = sd;
-        sd = 1;
-        dh = dd;
-        dd = 0;
-        reduced_dim += 1;
-    };
-
-    if (is_iw_1) { shift_oh_to_ow(); }
-    if (is_ih_1 || is_iw_1) { shift_od_to_oh(); }
-    if (is_iw_1 && is_ih_1) { shift_oh_to_ow(); }
-
-    if (is_1x1 && is_stride1() && is_eq_oi) {
+    if (is_1x1 && is_stride1() && is_eq_oi
+            && can_reduce_to_1d(c_md(), conv_pd->attr()->post_ops_)) {
+        // Convert 3D to 1D convolution.
         ir_assert(pd == 0 && ph == 0 && pw == 0);
         ow = od * oh * ow;
         iw = id * ih * iw;
         od = id = kd = 1;
         oh = ih = kh = 1;
-        reduced_dim = 3;
+        dhw_map[0] = dhw_map[1] = dhw_map[2] = 2;
+        return;
     }
+    // Propagate D -> H -> W. If the spatial dimension is not present, map it
+    // to the next present dimension.
+    std::vector<int *> xd = {&id, &od, &kd, &sd, &dd, &pd};
+    std::vector<int *> xh = {&ih, &oh, &kh, &sh, &dh, &ph};
+    std::vector<int *> xw = {&iw, &ow, &kw, &sw, &dw, &pw};
+    std::vector<int *> x[3] = {xd, xh, xw};
+    std::vector<int> x_old[3];
+    std::vector<int> xdef = {1, 1, 1, 1, 0, 0};
+    bool has_dim[3] = {false, false, false};
+    for (int i = 0; i < 3; i++) {
+        x_old[i].resize(xdef.size());
+        for (size_t j = 0; j < xdef.size(); j++) {
+            if (*x[i][j] != xdef[j]) has_dim[i] = true;
+            x_old[i][j] = *x[i][j];
+        }
+    }
+    auto set = [](const std::vector<int *> &x, const std::vector<int> &values) {
+        for (size_t i = 0; i < x.size(); i++)
+            *x[i] = values[i];
+    };
+    if (!has_dim[0] && !has_dim[1] && !has_dim[2]) has_dim[2] = true;
+    int sp_count = (int)has_dim[0] + (int)has_dim[1] + (int)has_dim[2];
+    int shift = 3 - sp_count;
+    for (int i = 0, idx = 0; i < 3; i++) {
+        if (has_dim[i]) dhw_map[i] = shift + idx++;
+        set(x[i], xdef);
+    }
+    for (int i = 0; i < 3; i++) {
+        if (dhw_map[i] != -1) set(x[dhw_map[i]], x_old[i]);
+    }
+    if (!has_dim[2]) dhw_map[2] = 2;
+    if (!has_dim[1]) dhw_map[1] = dhw_map[2];
+    if (!has_dim[0]) dhw_map[0] = dhw_map[1];
 }
 
 std::string conv_problem_t::desc_str(bool print_mb) const {
@@ -668,6 +693,11 @@ void init_data_tags(const conv_config_t &cfg, const memory_desc_t &src_md,
     if (!matches_tag(dst_md, dst_tag) && is_small_oc_g1)
         user_dst_tag = (user_dst_req.empty() ? "axb" : user_dst_req);
 
+    // Avoid reorder for small shapes
+    if (prb.g == 1 && prb.ic < 4 && prb.oc < 4 && prb.mb < 4 && prb.ksp == 1) {
+        src_tag = user_src_tag;
+        dst_tag = user_dst_tag;
+    }
     maybe_set_plain_weights(
             cfg, src_axb && dst_axb, user_wei_req, wei_tag, user_wei_tag);
 
@@ -758,9 +788,11 @@ status_t init_tensor_layouts(conv_config_t &cfg, convolution_pd_t *pd) {
     auto bia_layout = user_bia_layout;
 
     if (prb.is_bwd_w) {
-        if (utils::one_of(prb.wei_data_type, data_type::bf16, data_type::f16))
+        if (utils::one_of(prb.wei_data_type, data_type::bf16, data_type::f16,
+                    data_type::f8_e5m2))
             wei_layout = wei_layout.retype(type_t::f32());
-        if (utils::one_of(prb.bia_data_type, data_type::bf16, data_type::f16))
+        if (utils::one_of(prb.bia_data_type, data_type::bf16, data_type::f16,
+                    data_type::f8_e5m2))
             bia_layout = bia_layout.retype(type_t::f32());
     }
 
@@ -776,11 +808,11 @@ status_t init_tensor_layouts(conv_config_t &cfg, convolution_pd_t *pd) {
     // Normalize layouts: add group dimension for all layouts and reduce/fuse
     // spatial dimensions when applicable.
     normalize_conv_layouts(src_layout, wei_layout, dst_layout, bia_layout,
-            prb.with_groups, prb.g, prb.ic, prb.oc, prb.is_dw, prb.reduced_dim,
+            prb.with_groups, prb.g, prb.ic, prb.oc, prb.is_dw, prb.dhw_map,
             /*add_groups=*/true);
     normalize_conv_layouts(user_src_layout, user_wei_layout, user_dst_layout,
             user_bia_layout, prb.with_groups, prb.g, prb.ic, prb.oc, prb.is_dw,
-            prb.reduced_dim,
+            prb.dhw_map,
             /*add_groups=*/true);
 
     src.set_compute(src_layout);
@@ -805,23 +837,27 @@ bool data_types_ok(const conv_problem_t &prb, const hw_t &hw) {
     auto wei = prb.wei_data_type;
     auto dst = prb.dst_data_type;
     auto bia = prb.bia_data_type;
-    bool is_bf16 = utils::one_of(data_type::bf16, src, wei, dst, bia);
+    bool is_bf8 = utils::one_of(data_type::f8_e5m2, src, wei, dst, bia);
+    bool is_hf8 = utils::one_of(data_type::f8_e4m3, src, wei, dst, bia);
     if (!prb.is_f64_conv() && utils::one_of(data_type::f64, src, wei, dst, bia))
         return false;
     bool is_xelpg = hw == ngen::HW::XeHPG && !hw.systolic_support();
-    if (is_bf16 && (hw <= ngen::HW::XeLP || is_xelpg)) return false;
     if (prb.is_f64_conv()
             && (utils::one_of(hw.to_ngen(), ngen::HW::XeLP, ngen::HW::XeHPG)
                     && !is_xelpg))
         return false;
+    if (is_bf8
+            && !(utils::one_of(hw, ngen::HW::XeHPC) && hw.systolic_support()))
+        return false;
+    if (is_hf8) return false;
     if (prb.is_fwd) return true;
     if (prb.is_bwd_d) return true;
     if (prb.is_bwd_w) {
         bool ok = true;
         data_type_t default_acc_type
                 = src == data_type::f64 ? data_type::f64 : data_type::f32;
-        ok &= utils::one_of(src, data_type::bf16, data_type::f16,
-                data_type::f32, data_type::f64);
+        ok &= utils::one_of(src, data_type::f8_e5m2, data_type::bf16,
+                data_type::f16, data_type::f32, data_type::f64);
         ok &= (dst == src);
         ok &= utils::one_of(wei, src, default_acc_type);
 
@@ -858,13 +894,14 @@ bool post_ops_ok(const conv_problem_t &prb, const hw_t &hw) {
     // No post-ops are supported for f64
     if (prb.is_f64_conv() && !attr->has_default_values()) return false;
 
+    using sm = primitive_attr_t::skip_mask_t;
+    auto attr_skip_mask = sm::fpmath_mode;
     if (prb.is_fwd || prb.is_bwd_d) {
-        using sm = primitive_attr_t::skip_mask_t;
-        auto attr_skip_mask = sm::post_ops | sm::sum_dt
-                | sm::zero_points_runtime | sm::scales_runtime;
+        attr_skip_mask |= sm::post_ops | sm::sum_dt | sm::zero_points_runtime
+                | sm::scales_runtime;
         if (!attr->has_default_values(attr_skip_mask)) return false;
     } else {
-        if (!attr->has_default_values()) return false;
+        if (!attr->has_default_values(attr_skip_mask)) return false;
     }
 
     using namespace data_type;
@@ -1042,7 +1079,6 @@ status_t init_pd_time_cfg(const conv_problem_t &prb, conv_config_t &cfg,
     CHECK(init_fma_kind(cfg));
     CHECK(init_simd(cfg));
     CHECK(init_vec_size(cfg));
-    CHECK(init_regs(cfg));
     CHECK(init_tensor_layouts(cfg, pd));
 
     CHECK(attr->set_default_formats(&prb.c_md()));
@@ -1075,6 +1111,10 @@ bool pipeline_unroll_hint(const conv_problem_t &prb, fma_kind_t fma_kind,
                 && bwd_d_optimize_kind
                         != bwd_d_optimize_kind_t::skip_strided_dhw)
             do_unroll = false;
+    } else if (prb.is_bwd_w) {
+        // Deterministic mode requires to have full reduction in one thread which may result in multiple nested loops
+        // with large bounds so disable unrolling to avoid code size blow-up.
+        if (prb.deterministic) do_unroll = false;
     }
     // Unrolling with mad or dp4a results in too large kernels.
     if (utils::one_of(fma_kind, fma_kind_t::mad, fma_kind_t::dp4a)
@@ -1105,14 +1145,6 @@ send_pattern_t<prb_dim_t> validate_blocking(const conv_config_t &cfg,
             }
         }
         return true;
-    };
-
-    struct pattern_match_t {
-        pattern_match_t(
-                send_pattern pattern, std::vector<send_hint_t<prb_dim_t>> hints)
-            : pattern(pattern), hints(std::move(hints)) {};
-        send_pattern pattern;
-        std::vector<send_hint_t<prb_dim_t>> hints;
     };
 
     auto layout = conv_stride_layout_t(cfg.prb(), tensor);
@@ -1242,19 +1274,29 @@ void init_thread_group_grid(conv_config_t &cfg) {
     cfg.init_thread_group_grid(get_thread_group_grid_conv_dims(cfg.prb()));
 }
 
+int fixup_slm_bufs(const conv_problem_t &prb, int slm_bufs,
+        bool zp_do_src_compensation, bool enable_a, bool enable_b,
+        bool do_unroll) {
+    if (do_unroll) return slm_bufs;
+    // Multiple SLM buffering without unrolling has some limitations as compute
+    // indices are not tracked: A/B buffers are directly loaded from SLM and
+    // multiplied so some scenarios are not supported:
+    // - Mixing SLM and direct memory load for A/B as memory load requires
+    //   masking which relies on problem indices
+    // - Source zero-points as compensation masks require problem indices
+    if (enable_a != enable_b || zp_do_src_compensation)
+        return std::min(slm_bufs, 1);
+    return slm_bufs;
+}
+
 int slm_bufs_hint(const conv_problem_t &prb, int m_tg, int n_tg,
         bool zp_do_src_compensation, bool enable_a, bool enable_b,
         bool do_unroll) {
-    if (enable_a || enable_b) {
-        bool is_small_tg = (m_tg * n_tg <= 8);
-        int pref_bufs
-                = ((is_small_tg || prb.is_f32_conv()) && prb.mb > 1 ? 2 : 3);
-        if (do_unroll) return pref_bufs;
-        const bool use_pref_bufs
-                = (enable_a == enable_b) && !zp_do_src_compensation;
-        return use_pref_bufs ? pref_bufs : 1;
-    }
-    return 0;
+    if (!enable_a && !enable_b) return 0;
+    bool is_small_tg = (m_tg * n_tg <= 8);
+    int pref_bufs = ((is_small_tg || prb.is_f32_conv()) && prb.mb > 1 ? 2 : 3);
+    return fixup_slm_bufs(prb, pref_bufs, zp_do_src_compensation, enable_a,
+            enable_b, do_unroll);
 }
 
 void init_slm(conv_config_t &cfg) {
@@ -1273,7 +1315,11 @@ void init_slm(conv_config_t &cfg) {
             bufs = slm_bufs_hint(prb, tg.dim(1), tg.dim(0),
                     cfg.zp_cfg().do_src_compensation, enable_a, enable_b,
                     cfg.pipeline().do_unroll());
+        } else if (cfg.zp_cfg().do_src_compensation) {
+            bufs = std::min(bufs, 1);
         }
+        bufs = fixup_slm_bufs(prb, bufs, cfg.zp_cfg().do_src_compensation,
+                enable_a, enable_b, cfg.pipeline().do_unroll());
         ir_assert(bufs > 0);
         gmem_bufs = (cfg.is_dp_fma() && cfg.pipeline().do_unroll()) ? 2 : 1;
     }

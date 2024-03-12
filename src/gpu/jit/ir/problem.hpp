@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2023 Intel Corporation
+* Copyright 2023-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -438,6 +438,11 @@ bool has_spatial(const dim_map_t<prb_dim_t, T> &map,
     }
     return false;
 }
+
+const expr_t &index_var(const prb_dim_t &prb_dim);
+const expr_t &size_var(const prb_dim_t &prb_dim);
+prb_dim_t index_to_prb_dim(const expr_t &var);
+prb_dim_t size_to_prb_dim(const expr_t &var);
 
 } // namespace jit
 } // namespace gpu

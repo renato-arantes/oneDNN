@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2022-2023 Intel Corporation
+* Copyright 2022-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -815,8 +815,18 @@ private:
         auto tmp_type = (post_op_builders_.empty() ? c_mem_view_.type()
                                                    : type_t::f32());
         int tmp_buf_elems = tile_size_ / tmp_type.size();
-        auto base_tile = c_mem_view_.split_into_max_tile(
-                tmp_buf_elems, /*is_dense=*/false);
+        tensor_t base_tile;
+        while (tmp_buf_elems) {
+            base_tile = c_mem_view_.split_into_max_tile(
+                    tmp_buf_elems, /*is_dense=*/false);
+            try {
+                c_reg_layout.map(base_tile);
+                break;
+            } catch (std::runtime_error &) {
+                tmp_buf_elems /= 2;
+                if (!tmp_buf_elems) throw;
+            }
+        }
 
         // Generate preload statements.
         for (auto &t : post_op_tensors_) {
@@ -958,8 +968,11 @@ private:
             c_stages.emplace_back(c_fx_layout, 0, make_c_tmp_buffer()); // R_f32
         }
         if (restore_zero_padding_) {
-            c_zero_pad_stage_idx = int(c_stages.size());
-            c_stages.emplace_back(c_fx_layout, 0, make_c_tmp_buffer()); // Z_f32
+            auto buf = make_c_tmp_buffer();
+            if (!zero_pad_builder_.build_stmt(c_fx_layout, buf).is_empty()) {
+                c_zero_pad_stage_idx = int(c_stages.size());
+                c_stages.emplace_back(c_fx_layout, 0, buf); // Z_f32
+            }
         }
         c_stages.emplace_back(r2g.reg_layout(), r2g.reg_buf_size(), tmp_reg_buf,
                 r2g.stmt()); // S_y

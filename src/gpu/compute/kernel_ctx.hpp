@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2019-2023 Intel Corporation
+* Copyright 2019-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -25,9 +25,8 @@
 #include <type_traits>
 
 #include "common/bit_cast.hpp"
-#include "common/primitive_attr.hpp"
-#include "common/verbose.hpp"
 #include "gpu/gpu_primitive_attr.hpp"
+#include "gpu/utils.hpp"
 
 namespace dnnl {
 namespace impl {
@@ -38,6 +37,7 @@ class kernel_ctx_t {
 public:
     kernel_ctx_t(const primitive_attr_t *attr = nullptr) {
         set_default_options(attr);
+        set_default_macros(attr);
     }
 
     std::string options() const {
@@ -94,6 +94,8 @@ public:
             case data_type::f64: define_int("DT_F64", 1); break;
             case data_type::s8: define_int("DT_S8", 1); break;
             case data_type::u8: define_int("DT_U8", 1); break;
+            case data_type::f8_e4m3: define_int("DT_HF8", 1); break;
+            case data_type::f8_e5m2: define_int("DT_BF8", 1); break;
             case data_type::s32: define_int("DT_S32", 1); break;
             default: assert(!"unknown data type"); break;
         }
@@ -130,6 +132,18 @@ private:
                 add_option("-cl-intel-256-GRF-per-thread");
             }
         }
+
+        // Set override flag for checking compiler assumptions
+        if (gpu_utils::dev_getenv("enable_check_assumptions", 0)) {
+            add_option("-DENABLE_CHECK_ASSUMPTIONS");
+        }
+
+        if (gpu_utils::dev_getenv("ocl_debug", 0)) {
+            add_option("-DOCL_DEBUG");
+        }
+    }
+    void set_default_macros(const primitive_attr_t *attr) {
+        if (attr) { define_int("DETERMINISTIC", attr->deterministic_); }
     }
 
     std::map<std::string, int64_t> int_var_map_;

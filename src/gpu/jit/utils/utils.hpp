@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2021-2023 Intel Corporation
+* Copyright 2021-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -51,18 +51,15 @@ inline std::ostream &operator<<(std::ostream &out, const T &obj) {
 
 namespace ir_utils {
 
+const int LOG_DYNAMIC = -1;
 const int LOG_OFF = 0;
+const int LOG_FATAL = 50;
 const int LOG_WARNING = 100;
 const int LOG_SUGGESTION = 120;
 const int LOG_INFO = 150;
 const int LOG_PERF = 170;
 const int LOG_TRACE = 200;
-
-#ifdef DNNL_DEV_MODE
-const int LOG_LEVEL = LOG_WARNING;
-#else
-const int LOG_LEVEL = LOG_OFF;
-#endif
+const int LOG_CHECK_DEFAULT = LOG_TRACE;
 
 template <typename T>
 size_t get_hash(const T &t);
@@ -218,30 +215,59 @@ bool contains(const std::vector<T> &vec, const U &u) {
 #define ir_error_not_expected() ir_assert(false) << "Not expected. "
 #define ir_except_not_implemented(msg) throw std::runtime_error(msg)
 
-template <int level>
-class logger_t {
+template <int level, bool value = true, bool add_new_line = false>
+class base_logger_t {
 public:
-    logger_t(std::ostream &out = std::cout) : out_(out) {}
-
-    operator bool() const { return true; }
-
-    static bool is_enabled() {
+    template <int L = level>
+    base_logger_t(
+            typename std::enable_if<L == LOG_DYNAMIC, int>::type dynamic_level,
+            std::ostream &out = std::cout)
+        : dynamic_level_(dynamic_level), out_(out) {}
+    template <int L = level>
+    base_logger_t(
+            typename std::enable_if<L != LOG_DYNAMIC, std::ostream &>::type out
+            = std::cout)
+        : out_(out) {}
+    ~base_logger_t() {
+        if (add_new_line && !is_first_print_) out_ << std::endl;
 #if defined(DNNL_DEV_MODE)
-        return get_verbose(verbose_t::debuginfo) >= level;
+        if (get_level() <= LOG_FATAL) {
+            out_ << "Aborting after fatal error..." << std::endl;
+            abort();
+        }
+#endif
+    }
+
+    template <int L = level>
+    static typename std::enable_if<L != LOG_DYNAMIC, bool>::type is_enabled() {
+#if defined(DNNL_DEV_MODE)
+        return level <= LOG_FATAL || get_verbose(verbose_t::debuginfo) >= level;
 #else
         return false;
 #endif
     }
 
+    template <int L = level>
+    typename std::enable_if<L != LOG_DYNAMIC, int>::type get_level() const {
+        return level;
+    }
+
+    template <int L = level>
+    typename std::enable_if<L == LOG_DYNAMIC, int>::type get_level() const {
+        return dynamic_level_;
+    }
+
+    operator bool() const { return value; }
+
     template <typename T>
-    logger_t &operator<<(const T &obj) {
+    base_logger_t &operator<<(const T &obj) {
         using dnnl::impl::gpu::jit::operator<<;
         maybe_print_header();
         out_ << obj;
         return *this;
     }
 
-    logger_t &operator<<(std::ostream &(*os)(std::ostream &)) {
+    base_logger_t &operator<<(std::ostream &(*os)(std::ostream &)) {
         maybe_print_header();
         out_ << os;
         return *this;
@@ -251,7 +277,8 @@ private:
     void maybe_print_header() {
         if (!is_first_print_) return;
 
-        switch (level) {
+        switch (get_level()) {
+            case LOG_FATAL: out_ << "[FATAL] "; break;
             case LOG_WARNING: out_ << "[WARNING] "; break;
             case LOG_SUGGESTION: out_ << "[SUGGESTION] "; break;
             default: break;
@@ -259,9 +286,47 @@ private:
         is_first_print_ = false;
     }
 
+    int dynamic_level_ = level;
     std::ostream &out_;
     bool is_first_print_ = true;
 };
+
+template <int level>
+class logger_t : public base_logger_t<level> {
+public:
+    logger_t() : base_logger_t<level>() {}
+};
+
+class ir_check_log_level_t {
+public:
+    static int level() { return level_; }
+    static bool is_enabled() {
+#if defined(DNNL_DEV_MODE)
+        switch (level_) {
+            case LOG_FATAL: return logger_t<LOG_FATAL>::is_enabled();
+            case LOG_TRACE: return logger_t<LOG_TRACE>::is_enabled();
+            default: abort();
+        }
+#else
+        return false;
+#endif
+    }
+    ir_check_log_level_t(int new_level) {
+        old_level_ = level_;
+        level_ = new_level;
+    }
+    ~ir_check_log_level_t() { level_ = old_level_; }
+    ir_check_log_level_t(const ir_check_log_level_t &) = delete;
+
+private:
+    static thread_local int level_;
+    int old_level_ = LOG_CHECK_DEFAULT;
+};
+
+template <bool value = true, bool add_new_line = false>
+base_logger_t<LOG_DYNAMIC, value, add_new_line> make_logger(int level) {
+    return base_logger_t<LOG_DYNAMIC, value, add_new_line>(level);
+}
 
 #define ir_perf() \
     ir_utils::logger_t<ir_utils::LOG_PERF>::is_enabled() \
@@ -288,6 +353,29 @@ private:
 #define ir_trace() \
     ir_utils::logger_t<ir_utils::LOG_TRACE>::is_enabled() \
             && ir_utils::logger_t<ir_utils::LOG_TRACE>()
+
+#define ir_check(cond) \
+    if (!(cond)) \
+    return ir_utils::ir_check_log_level_t::is_enabled() \
+            && ir_utils::make_logger<false, true>( \
+                    ir_utils::ir_check_log_level_t::level())
+
+// This macro enables logging in all nested ir_check() calls. This is useful
+// when a check function can be used in scenarios when a failed check is
+// expected (regular check) or unexpected (e.g. debug assertion).
+// Example 1 (regular check):
+//     for (auto &cfg: generate_configs()) {
+//         // No logging here.
+//         if (!cfg.is_ok()) continue;
+//         ...
+//     }
+//
+// Example 2 (debug assertion):
+//     auto config = read_from_environment(...);
+//     // Detailed logging will show the cause of the failed assertion.
+//     ir_assert(ir_check_fatal(config.is_ok()));
+#define ir_check_fatal(call) \
+    (ir_utils::ir_check_log_level_t(ir_utils::LOG_FATAL), (call))
 
 // Pretty printers for STL objects.
 template <typename KeyT, typename HashT, typename EqualT>
@@ -503,8 +591,12 @@ inline std::string add_tag(
         const std::string &tag, const std::string &s, bool eol = true) {
     std::ostringstream oss;
     oss << tag << ":";
-    if (eol) oss << std::endl;
-    oss << add_indent(s, "  ", /*skip_first=*/!eol);
+    if (s.empty()) {
+        oss << " (empty)";
+    } else {
+        if (eol) oss << std::endl;
+        oss << add_indent(s, "  ", /*skip_first=*/!eol);
+    }
     return oss.str();
 }
 
@@ -770,34 +862,43 @@ void deserialize(T &t, const std::string &path) {
 }
 
 template <typename T>
-void serialize_to_file(
-        const T &t, const std::string &file_name, const std::string &var_name) {
+void serialize_to_file(const T &t, const std::string &file_name,
+        const std::string &var_name,
+        const std::vector<std::string> &namespaces = {}) {
     std::ostringstream t_oss;
     serialize(t, t_oss);
     auto str = t_oss.str();
     auto data = std::vector<uint8_t>(str.begin(), str.end());
     std::ostringstream oss;
-    oss << "std::vector<uint64_t> " << var_name << " = {" << std::endl;
+    oss << "#include <cstdint>\n";
+    oss << "#include <vector>\n\n";
+    for (auto &ns : namespaces)
+        oss << "namespace " << ns << " {\n";
+    oss << "\n// clang-format off\n";
+    oss << "const std::vector<uint64_t> &get_" << var_name << "() {\n";
+    oss << "    static std::vector<uint64_t> data = {\n";
+    oss << "        ";
     size_t bytes = data.size();
     size_t u64_bytes = sizeof(uint64_t);
     for (size_t i = 0; i < bytes; i += u64_bytes) {
         uint64_t v = 0;
-        for (size_t j = 0; j < std::min(bytes - i, u64_bytes); j++) {
-            v |= ((uint64_t)data[i + j]) << (j * 8);
-        }
+        size_t len = std::min(bytes - i, u64_bytes);
+        std::memcpy(&v, &data[i], len);
         oss << "0x" << std::setfill('0') << std::setw(16) << std::hex << v;
         if (i + u64_bytes < bytes) {
+            bool eol = ((i / u64_bytes + 1) % 8 == 0);
             oss << ",";
-            if ((i / u64_bytes + 1) % 8 == 0) {
-                oss << std::endl;
-            } else {
-                oss << " ";
-            }
+            oss << (eol ? "\n        " : " ");
         }
     }
-    oss << "};";
+    oss << "\n    };";
+    oss << "\n    return data;";
+    oss << "\n};";
+    oss << "\n// clang-format on\n\n";
+    for (auto it = namespaces.rbegin(); it != namespaces.rend(); it++)
+        oss << "} // namespace " << *it << "\n";
     std::ofstream out(file_name);
-    out << oss.str() << std::endl;
+    out << oss.str();
 }
 
 inline bool str_to_bool(const std::string &s) {
@@ -886,6 +987,99 @@ private:
     int32_t seed_;
 };
 
+template <typename T>
+class cli_iface_t {
+public:
+    using get_func_t = std::string (&)(const T *);
+    using set_func_t = void (&)(T *, const std::string &);
+
+    void add_arg(const std::string &key, const std::string &help,
+            get_func_t getter, set_func_t setter) {
+        args_.emplace_back((int)args_.size(), key, help, getter, setter);
+    }
+
+    void parse(const std::string &s, T *obj) {
+        bool is_help = (s.find("--help") != std::string::npos);
+        if (is_help) {
+            for (auto &a : args_) {
+                std::cout << "  ";
+                std::cout << std::left << std::setw(22) << a.key;
+                std::cout << a.help << std::endl;
+            }
+            exit(0);
+            return;
+        }
+        std::vector<bool> seen(args_.size());
+        auto parse_part = [&](const std::string &key,
+                                  const std::string &value) {
+            for (auto &a : args_) {
+                if (a.key == key) {
+                    if (seen[a.idx]) {
+                        std::cout << "Error: argument set twice: " << key
+                                  << std::endl;
+                        ir_error_not_expected();
+                    }
+                    a.setter(obj, value);
+                    seen[a.idx] = true;
+                    return;
+                }
+            }
+            std::cout << "Error: unknown argument: " << key << std::endl;
+            ir_error_not_expected();
+        };
+        std::vector<std::string> parts;
+        for (auto &p : gpu_utils::split(s, " ")) {
+            if (p.empty()) continue;
+            parts.push_back(p);
+        }
+        int nparts = (int)parts.size();
+        for (int i = 0; i < nparts; i += 2) {
+            if (i + 1 >= nparts) {
+                std::cout << "Error: value is missing for argument: "
+                          << parts[i] << std::endl;
+                ir_error_not_expected();
+            }
+            parse_part(parts[i], parts[i + 1]);
+        }
+    }
+
+    std::string cmd_str(const T *obj) const {
+        std::vector<std::string> parts;
+        auto add = [&](const std::string &key, const std::string &value) {
+            if (value.empty()) return;
+            parts.push_back(key);
+            parts.push_back(value);
+        };
+        for (auto &a : args_) {
+            add(a.key, a.getter(obj));
+        }
+        std::ostringstream oss;
+        bool is_first = true;
+        for (auto &p : parts) {
+            if (!is_first) oss << " ";
+            oss << p;
+            is_first = false;
+        }
+        return oss.str();
+    }
+
+private:
+    struct arg_t {
+        arg_t(int idx, const std::string &key, const std::string &help,
+                get_func_t getter, set_func_t setter)
+            : idx(idx), key(key), help(help), getter(getter), setter(setter) {}
+
+        int idx = -1;
+        std::string key;
+        std::string help;
+        get_func_t getter;
+        set_func_t setter;
+        bool is_parsed = false;
+    };
+
+    std::vector<arg_t> args_;
+};
+
 inline std::unordered_map<std::string, int> to_string_int_map(
         const std::string &s) {
     std::unordered_map<std::string, int> ret;
@@ -921,6 +1115,16 @@ inline void idiv_magicgu(uint32_t d, uint32_t &m, uint32_t &p) {
         }
     }
     ir_error_not_expected();
+}
+
+inline uint64_t idiv_magicgu_packed(uint32_t d) {
+    uint32_t m = 0, p = 0;
+    if (math::is_pow2(d)) {
+        p = math::ilog2q(d);
+    } else {
+        ir_utils::idiv_magicgu(d, m, p);
+    }
+    return m + (static_cast<uint64_t>(p) << 32);
 }
 
 } // namespace ir_utils

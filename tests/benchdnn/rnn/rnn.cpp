@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2018-2023 Intel Corporation
+* Copyright 2018-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -108,8 +108,11 @@ dnnl_primitive_attr_t create_dnnl_rnn_attr(const prb_t &prb) {
     DNN_SAFE_V(dnnl_primitive_attr_set_scratchpad_mode(
             dnnl_attr, prb.attr.scratchpad_mode));
 
-    DNN_SAFE_V(dnnl_primitive_attr_set_fpmath_mode(
-            dnnl_attr, prb.attr.fpmath_mode));
+    DNN_SAFE_V(dnnl_primitive_attr_set_fpmath_mode_v2(dnnl_attr,
+            prb.attr.fpmath_mode.mode, prb.attr.fpmath_mode.apply_to_int));
+
+    DNN_SAFE_V(dnnl_primitive_attr_set_deterministic(
+            dnnl_attr, prb.attr.deterministic.enabled));
 
     return dnnl_attr;
 }
@@ -563,14 +566,26 @@ dnnl_status_t init_pd(init_pd_args_t<prb_t> &init_pd_args) {
 
     dnnl_dims_t src_layer_dims = {prb.n_iter, prb.mb, prb.slc};
     auto src_layer_d = dnn_mem_t::init_md(
-            3, src_layer_dims, prb.cfg[SRC_LAYER].dt, tag::abx /* dnnl_tnc */);
-    dims_t src_layer_strides(query_md_ndims(src_layer_d));
-    std::memcpy(src_layer_strides.data(), query_md_strides(src_layer_d),
-            src_layer_strides.size() * sizeof(dnnl_dim_t));
-    src_layer_strides[0] += the_stride;
-    src_layer_d = dnn_mem_t::init_md(query_md_ndims(src_layer_d),
-            query_md_dims(src_layer_d), query_md_data_type(src_layer_d), "",
-            src_layer_strides);
+            3, src_layer_dims, prb.cfg[SRC_LAYER].dt, prb.tag[0]);
+    if (prb.tag[0] != tag::any) {
+        dims_t src_layer_strides(query_md_ndims(src_layer_d));
+        std::memcpy(src_layer_strides.data(), query_md_strides(src_layer_d),
+                src_layer_strides.size() * sizeof(dnnl_dim_t));
+        int biggest_stride_idx = 0;
+        int64_t biggest_stride = src_layer_strides[biggest_stride_idx];
+        for (int i = 1; i < query_md_ndims(src_layer_d); i++) {
+            if (src_layer_strides[i] > biggest_stride) {
+                biggest_stride = src_layer_strides[i];
+                biggest_stride_idx = i;
+            }
+        }
+        // Apply the extra +1 to the biggest stride to avoid modifying all of
+        // them.
+        src_layer_strides[biggest_stride_idx] += the_stride;
+        src_layer_d = dnn_mem_t::init_md(query_md_ndims(src_layer_d),
+                query_md_dims(src_layer_d), query_md_data_type(src_layer_d), "",
+                src_layer_strides);
+    }
 
     dnnl_dims_t src_iter_dims = {prb.n_layer, prb.n_dir(), prb.mb, prb.sic};
     auto src_iter_d = dnn_mem_t::init_md(
@@ -602,10 +617,13 @@ dnnl_status_t init_pd(init_pd_args_t<prb_t> &init_pd_args) {
             query_md_dims(src_iter_c_d), query_md_data_type(src_iter_c_d), "",
             src_iter_c_strides);
 
-    auto weights_layer_d = dnn_mem_t::init_md(
-            5, weights_layer_dims, prb.cfg[WEIGHTS_LAYER].dt, tag::any);
-    auto weights_iter_d = dnn_mem_t::init_md(
-            5, weights_iter_dims, prb.cfg[WEIGHTS_ITER].dt, tag::any);
+    // Forward and backward support different layouts for weights. When
+    // testing backward, we cannot reliably use the supplied weights tag.
+    bool has_service_prim = prb.prop == dnnl_backward;
+    auto weights_layer_d = dnn_mem_t::init_md(5, weights_layer_dims,
+            prb.cfg[WEIGHTS_LAYER].dt, has_service_prim ? "any" : prb.tag[1]);
+    auto weights_iter_d = dnn_mem_t::init_md(5, weights_iter_dims,
+            prb.cfg[WEIGHTS_ITER].dt, has_service_prim ? "any" : prb.tag[1]);
 
     benchdnn_dnnl_wrapper_t<dnnl_memory_desc_t> attention_d {};
     if (prb.is_augru())
@@ -625,14 +643,26 @@ dnnl_status_t init_pd(init_pd_args_t<prb_t> &init_pd_args) {
     auto bias_d = dnn_mem_t::init_md(4, bias_dims, prb.cfg[BIAS].dt, tag::any);
 
     auto dst_layer_d = dnn_mem_t::init_md(
-            3, dst_layer_dims, prb.cfg[DST_LAYER].dt, tag::abx /* dnnl_tnc */);
-    dims_t dst_layer_strides(query_md_ndims(dst_layer_d));
-    std::memcpy(dst_layer_strides.data(), query_md_strides(dst_layer_d),
-            dst_layer_strides.size() * sizeof(dnnl_dim_t));
-    dst_layer_strides[0] += the_stride;
-    dst_layer_d = dnn_mem_t::init_md(query_md_ndims(dst_layer_d),
-            query_md_dims(dst_layer_d), query_md_data_type(dst_layer_d), "",
-            dst_layer_strides);
+            3, dst_layer_dims, prb.cfg[DST_LAYER].dt, prb.tag[2]);
+    if (prb.tag[2] != tag::any) {
+        dims_t dst_layer_strides(query_md_ndims(dst_layer_d));
+        std::memcpy(dst_layer_strides.data(), query_md_strides(dst_layer_d),
+                dst_layer_strides.size() * sizeof(dnnl_dim_t));
+        int biggest_stride_idx = 0;
+        int64_t biggest_stride = dst_layer_strides[biggest_stride_idx];
+        for (int i = 1; i < query_md_ndims(dst_layer_d); i++) {
+            if (dst_layer_strides[i] > biggest_stride) {
+                biggest_stride = dst_layer_strides[i];
+                biggest_stride_idx = i;
+            }
+        }
+        // Apply the extra +1 to the biggest stride to avoid modifying all of
+        // them.
+        dst_layer_strides[biggest_stride_idx] += the_stride;
+        dst_layer_d = dnn_mem_t::init_md(query_md_ndims(dst_layer_d),
+                query_md_dims(dst_layer_d), query_md_data_type(dst_layer_d), "",
+                dst_layer_strides);
+    }
 
     dnnl_dims_t dst_iter_dims = {prb.n_layer, prb.n_dir(), prb.mb, prb.dic};
     auto dst_iter_d = dnn_mem_t::init_md(
@@ -678,15 +708,15 @@ dnnl_status_t init_pd(init_pd_args_t<prb_t> &init_pd_args) {
     } else {
         // TODO: add stride support for diff_* tensors
         auto diff_src_layer_d = dnn_mem_t::init_md(
-                3, src_layer_dims, prb.cfg[DIFF_SRC_LAYER].dt, tag::any);
+                3, src_layer_dims, prb.cfg[DIFF_SRC_LAYER].dt, prb.tag[0]);
         auto diff_src_iter_d = dnn_mem_t::init_md(
                 4, src_iter_dims, prb.cfg[DIFF_SRC_ITER].dt, tag::any);
         auto diff_src_iter_c_d = dnn_mem_t::init_md(
                 4, src_iter_c_dims, prb.cfg[DIFF_SRC_ITER_C].dt, tag::any);
         auto diff_weights_layer_d = dnn_mem_t::init_md(5, weights_layer_dims,
-                prb.cfg[DIFF_WEIGHTS_LAYER].dt, tag::any);
-        auto diff_weights_iter_d = dnn_mem_t::init_md(
-                5, weights_iter_dims, prb.cfg[DIFF_WEIGHTS_ITER].dt, tag::any);
+                prb.cfg[DIFF_WEIGHTS_LAYER].dt, prb.tag[1]);
+        auto diff_weights_iter_d = dnn_mem_t::init_md(5, weights_iter_dims,
+                prb.cfg[DIFF_WEIGHTS_ITER].dt, prb.tag[1]);
 
         benchdnn_dnnl_wrapper_t<dnnl_memory_desc_t> diff_attention_d {};
         if (prb.is_augru())
@@ -709,7 +739,7 @@ dnnl_status_t init_pd(init_pd_args_t<prb_t> &init_pd_args) {
         auto diff_bias_d = dnn_mem_t::init_md(
                 4, bias_dims, prb.cfg[DIFF_BIAS].dt, tag::any);
         auto diff_dst_layer_d = dnn_mem_t::init_md(
-                3, dst_layer_dims, prb.cfg[DIFF_DST_LAYER].dt, tag::any);
+                3, dst_layer_dims, prb.cfg[DIFF_DST_LAYER].dt, prb.tag[2]);
         auto diff_dst_iter_d = dnn_mem_t::init_md(
                 4, dst_iter_dims, prb.cfg[DIFF_DST_ITER].dt, tag::any);
         auto diff_dst_iter_c_d = dnn_mem_t::init_md(
@@ -749,13 +779,10 @@ void skip_unimplemented_prb(const prb_t *prb_, res_t *res) {
 #endif
 
 #if DNNL_CPU_RUNTIME != DNNL_RUNTIME_NONE
-    static auto isa = dnnl_get_effective_cpu_isa();
-    // f16 is not implemented on any x64 platform yet.
-    const bool is_f16_not_ok = prb.cfg[SRC_LAYER].dt == dnnl_f16;
-    // bf16 is currently supported only on avx512_core[+] platforms
-    const bool is_bf16_not_ok = prb.cfg[SRC_LAYER].dt == dnnl_bf16
-            && !dnnl::is_superset(isa, dnnl_cpu_isa_avx512_core);
-    if (is_f16_not_ok || is_bf16_not_ok) {
+    // f16 training is not yet fully supported.
+    const bool is_f16_not_ok
+            = prb.cfg[SRC_LAYER].dt == dnnl_f16 && !(dir & FLAG_INF);
+    if (is_f16_not_ok) {
         res->state = SKIPPED, res->reason = CASE_NOT_SUPPORTED;
         return;
     }
@@ -785,10 +812,18 @@ void skip_unimplemented_prb(const prb_t *prb_, res_t *res) {
             res->state = SKIPPED, res->reason = CASE_NOT_SUPPORTED;
             return;
         }
+        if (is_cpu()
+                && (prb.tag[0] != tag::abx || prb.tag[1] != tag::any
+                        || prb.tag[2] != tag::abx)) {
+            res->state = SKIPPED, res->reason = CASE_NOT_SUPPORTED;
+            return;
+        }
     }
 
     // LSTM w/ projection is not supported for bf16
-    if (prb.is_lstm_projection() && prb.cfg[SRC_LAYER].dt == dnnl_bf16) {
+    if (prb.is_lstm_projection()
+            && (prb.cfg[SRC_LAYER].dt == dnnl_bf16
+                    || prb.cfg[SRC_LAYER].dt == dnnl_f16)) {
         res->state = SKIPPED, res->reason = CASE_NOT_SUPPORTED;
         return;
     }
@@ -851,6 +886,22 @@ void skip_invalid_prb(const prb_t *prb_, res_t *res) {
     bool is_lstm_projection
             = IMPLICATION(prb.with_projection, prb.alg == VANILLA_LSTM);
     if (!is_lstm_peephole || !is_lstm_projection) {
+        res->state = SKIPPED, res->reason = INVALID_CASE;
+        return;
+    }
+
+    // Bitwise backward requires the flag, otherwise, diff_weights accumulate
+    // the output, which doesn't allow to validate numerical stability.
+    if (has_bench_mode_bit(mode_bit_t::bitwise) && (prb.prop == dnnl_backward)
+            && prb.flags != DIFF_WEIGHTS_OVERWRITE) {
+        res->state = SKIPPED, res->reason = INVALID_CASE;
+        return;
+    }
+
+    // Non-trivial strides modify existing strides, when the tag is defined.
+    // With tag::any, strides are not defined.
+    if (!prb.trivial_strides
+            && (prb.tag[0] == tag::any || prb.tag[2] == tag::any)) {
         res->state = SKIPPED, res->reason = INVALID_CASE;
         return;
     }
@@ -973,7 +1024,7 @@ std::vector<int> supported_exec_args(dir_t dir) {
 };
 
 int init_ref_memory_args(dnn_mem_map_t &ref_mem_map, dnn_mem_map_t &mem_map,
-        dnnl_primitive_t prim, const prb_t *prb_, res_t *res, dir_t dir,
+        dnnl_primitive_t prim, const prb_t *prb_, res_t *res,
         dnnl_primitive_t prim_ref) {
     if (has_bench_mode_modifier(mode_modifier_t::no_host_memory)) return OK;
 
@@ -984,13 +1035,23 @@ int init_ref_memory_args(dnn_mem_map_t &ref_mem_map, dnn_mem_map_t &mem_map,
     auto const_pd = query_pd(prim);
     // for int8 RNN we need pass attributes for data q10n
     auto rnn_attr = query_attr(const_pd);
+    const bool is_fwd_prim = is_fwd_prop_kind(query_prop_kind(const_pd));
 
     for (auto &entry : mem_map) {
         const int exec_arg = entry.first;
+        // The function targets regular exec_args that are positive.
+        // Negative args are used by bitwise and are broken in the `default`
+        // branch due to `&` always returns `true`.
+        if (exec_arg <= 0) continue;
+
         auto &mem = entry.second; // `mem` is modified by filler (reorder).
 
-        ref_mem_map.emplace(
-                exec_arg, dnn_mem_t(mem.md_, dnnl_f32, tag::abx, ref_engine));
+        // Scratchpad memory relates to a primitive. If reference needs it,
+        // use switch below to define a memory desc for it.
+        if (exec_arg != DNNL_ARG_SCRATCHPAD && exec_arg != DNNL_ARG_WORKSPACE) {
+            ref_mem_map.emplace(exec_arg,
+                    dnn_mem_t(mem.md_, dnnl_f32, tag::abx, ref_engine));
+        }
         auto &ref_mem = ref_mem_map[exec_arg];
 
         switch (exec_arg) {
@@ -1011,7 +1072,7 @@ int init_ref_memory_args(dnn_mem_map_t &ref_mem_map, dnn_mem_map_t &mem_map,
                 SAFE(fill_src_iter_c(prb, mem, ref_mem, rnn_attr), WARN);
                 break;
             case DNNL_ARG_WEIGHTS_LAYER:
-                if (dir & FLAG_FWD) {
+                if (is_fwd_prim) {
                     SAFE(fill_weights(
                                  prb, WEIGHTS_LAYER, mem, ref_mem, rnn_attr),
                             WARN);
@@ -1025,7 +1086,7 @@ int init_ref_memory_args(dnn_mem_map_t &ref_mem_map, dnn_mem_map_t &mem_map,
                 }
                 break;
             case DNNL_ARG_WEIGHTS_ITER:
-                if (dir & FLAG_FWD) {
+                if (is_fwd_prim) {
                     SAFE(fill_weights(
                                  prb, WEIGHTS_ITER, mem, ref_mem, rnn_attr),
                             WARN);
@@ -1039,12 +1100,12 @@ int init_ref_memory_args(dnn_mem_map_t &ref_mem_map, dnn_mem_map_t &mem_map,
                 }
                 break;
             case DNNL_ARG_WEIGHTS_PEEPHOLE:
-                if (dir & FLAG_FWD)
+                if (is_fwd_prim)
                     SAFE(fill_memory(prb, WEIGHTS_PEEPHOLE, mem, ref_mem),
                             WARN);
                 break;
             case DNNL_ARG_WEIGHTS_PROJECTION:
-                if (dir & FLAG_FWD) {
+                if (is_fwd_prim) {
                     SAFE(fill_weights(prb, WEIGHTS_PROJECTION, mem, ref_mem,
                                  rnn_attr),
                             WARN);
@@ -1058,23 +1119,23 @@ int init_ref_memory_args(dnn_mem_map_t &ref_mem_map, dnn_mem_map_t &mem_map,
                 }
                 break;
             case DNNL_ARG_BIAS:
-                if (dir & FLAG_FWD)
+                if (is_fwd_prim)
                     SAFE(fill_memory(prb, BIAS, mem, ref_mem), WARN);
                 break;
             case DNNL_ARG_DST_LAYER:
-                if (dir & FLAG_FWD)
+                if (is_fwd_prim)
                     SAFE(fill_activation(prb, DST_LAYER, mem, ref_mem), WARN);
                 break;
             case DNNL_ARG_DST_ITER:
-                if (dir & FLAG_FWD)
+                if (is_fwd_prim)
                     SAFE(fill_activation(prb, DST_ITER, mem, ref_mem), WARN);
                 break;
             case DNNL_ARG_DST_ITER_C:
-                if (dir & FLAG_FWD)
+                if (is_fwd_prim)
                     SAFE(fill_memory(prb, DST_ITER_C, mem, ref_mem), WARN);
                 break;
-            case DNNL_ARG_SCRATCHPAD: break;
-            case DNNL_ARG_WORKSPACE: break;
+            case DNNL_ARG_SCRATCHPAD: /* Put internal allocations here */ break;
+            case DNNL_ARG_WORKSPACE: /* Or here... */ break;
             case DNNL_ARG_DIFF_SRC_LAYER:
                 SAFE(fill_activation(prb, DIFF_SRC_LAYER, mem, ref_mem), WARN);
                 break;
@@ -1123,14 +1184,14 @@ int init_ref_memory_args(dnn_mem_map_t &ref_mem_map, dnn_mem_map_t &mem_map,
     return OK;
 }
 
-std::vector<data_kind_t> get_kinds_to_check(const prb_t *prb) {
+std::vector<data_kind_t> get_kinds_to_check(const prb_t *prb, dir_t dir) {
     std::vector<data_kind_t> check_kinds;
-    if (prb->dir & FLAG_FWD) {
+    if ((prb->dir & FLAG_FWD) && (dir & FLAG_FWD)) {
         check_kinds = {data_kind_t::DST, data_kind_t::DST_ITER};
         if (prb->alg == VANILLA_LSTM) {
             check_kinds.push_back(data_kind_t::DST_ITER_C);
         }
-    } else if (prb->dir & FLAG_BWD) {
+    } else if ((prb->dir & FLAG_BWD) && (dir & FLAG_BWD)) {
         check_kinds = {data_kind_t::DST, data_kind_t::DST_ITER,
                 data_kind_t::SRC, data_kind_t::SRC_ITER, data_kind_t::WEI,
                 data_kind_t::WEI_ITER, data_kind_t::BIA};
@@ -1144,11 +1205,8 @@ std::vector<data_kind_t> get_kinds_to_check(const prb_t *prb) {
             check_kinds.push_back(data_kind_t::WEI_PEEPHOLE);
         if (prb->is_lstm_projection())
             check_kinds.push_back(data_kind_t::WEI_PROJECTION);
-    } else {
-        assert(!"unexpected!");
-        SAFE_V(FAIL);
     }
-    assert(!check_kinds.empty());
+    // `check_kinds` is empty for `(prb->dir & FLAG_BWD) && (dir & FLAG_FWD)`.
     return check_kinds;
 }
 
@@ -1181,27 +1239,26 @@ int doit(const std::vector<benchdnn_dnnl_wrapper_t<dnnl_primitive_t>> &v_prim,
     dnn_mem_map_t mem_map, ref_mem_map;
     init_memory_args<prb_t>(
             mem_map, &prb, v_prim[0], supported_exec_args(FLAG_FWD));
-    TIME_FILL(SAFE(init_ref_memory_args(ref_mem_map, mem_map, v_prim[0], &prb,
-                           res, FLAG_FWD),
+    TIME_FILL(SAFE(
+            init_ref_memory_args(ref_mem_map, mem_map, v_prim[0], &prb, res),
             WARN));
 
     args_t args(mem_map), ref_args(ref_mem_map);
 
     SAFE(execute_and_wait(v_prim[0], args, res), WARN);
 
-    if (has_bench_mode_bit(mode_bit_t::corr)) {
-        if (prb.prop != dnnl_backward) {
-            check_correctness(&prb, get_kinds_to_check(&prb), args, ref_args,
-                    setup_cmp, res);
-        }
-    }
+    check_correctness(&prb, get_kinds_to_check(&prb, FLAG_FWD), args, ref_args,
+            setup_cmp, res);
+    SAFE(check_bitwise(prim, get_kinds_to_check(&prb, FLAG_FWD), args, prb.attr,
+                 prb.inplace, res),
+            WARN);
 
     if (prb.prop == dnnl_backward) {
         // Pass same memory map as we need data from forward on backward.
         init_memory_args<prb_t>(
                 mem_map, &prb, v_prim[1], supported_exec_args(FLAG_BWD));
-        TIME_FILL(SAFE(init_ref_memory_args(ref_mem_map, mem_map, v_prim[1],
-                               &prb, res, FLAG_BWD),
+        TIME_FILL(SAFE(init_ref_memory_args(
+                               ref_mem_map, mem_map, v_prim[1], &prb, res),
                 WARN));
 
         args = args_t(mem_map);
@@ -1209,10 +1266,11 @@ int doit(const std::vector<benchdnn_dnnl_wrapper_t<dnnl_primitive_t>> &v_prim,
 
         SAFE(execute_and_wait(v_prim[1], args, res), WARN);
 
-        if (has_bench_mode_bit(mode_bit_t::corr)) {
-            check_correctness(&prb, get_kinds_to_check(&prb), args, ref_args,
-                    setup_cmp, res);
-        }
+        check_correctness(&prb, get_kinds_to_check(&prb, FLAG_BWD), args,
+                ref_args, setup_cmp, res);
+        SAFE(check_bitwise(prim, get_kinds_to_check(&prb, FLAG_BWD), args,
+                     prb.attr, prb.inplace, res),
+                WARN);
     }
 
     return measure_perf(prb.ctx_exe, res, prim, args);

@@ -44,13 +44,18 @@ status_t brgemm_convolution_bwd_weights_t::pd_t::init(engine_t *engine) {
     const auto diff_wei_type = diff_weights_md(0)->data_type;
     const auto diff_bia_type = diff_weights_md(1)->data_type;
     const auto diff_dst_type = diff_dst_md(0)->data_type;
-    bool ok = true && is_bwd_w()
-            && set_default_alg_kind(alg_kind::convolution_direct)
-            && utils::one_of(src_type, bf16, f16) && diff_dst_type == src_type
-            && utils::one_of(diff_wei_type, f32, src_type)
-            && utils::one_of(diff_bia_type, data_type::undef, f32, src_type)
-            && attr()->has_default_values() && !has_zero_dim_memory();
-    if (!ok) return status::unimplemented;
+    VDISPATCH_CONV(is_bwd_w(), VERBOSE_BAD_PROPKIND);
+    VDISPATCH_CONV(utils::one_of(src_type, bf16, f16), VERBOSE_UNSUPPORTED_DT);
+    VDISPATCH_CONV(diff_dst_type == src_type, VERBOSE_UNSUPPORTED_DT);
+    VDISPATCH_CONV(utils::one_of(diff_wei_type, f32, src_type),
+            VERBOSE_UNSUPPORTED_DT);
+    VDISPATCH_CONV(
+            utils::one_of(diff_bia_type, data_type::undef, f32, src_type),
+            VERBOSE_UNSUPPORTED_BIAS_CFG);
+    VDISPATCH_CONV(set_default_alg_kind(alg_kind::convolution_direct),
+            VERBOSE_BAD_ALGORITHM);
+    VDISPATCH_CONV(!has_zero_dim_memory(), VERBOSE_EMPTY_TENSOR, "");
+    VDISPATCH_CONV(attr()->has_default_values(), VERBOSE_UNSUPPORTED_ATTR);
 
     auto scratchpad = scratchpad_registry().registrar();
 
@@ -329,7 +334,10 @@ struct brgemm_convolution_bwd_weights_t::thread_info_t {
 
     thread_info_t(const brgemm_convolution_bwd_weights_t *pcnv,
             const exec_ctx_t &ctx, int ithr)
-        : self(pcnv)
+        : src(CTX_IN_MEM(const src_data_t *, DNNL_ARG_SRC))
+        , diff_dst(CTX_IN_MEM(const diff_dst_data_t *, DNNL_ARG_DIFF_DST))
+        , diff_weights(CTX_OUT_MEM(void *, DNNL_ARG_DIFF_WEIGHTS))
+        , self(pcnv)
         , scratchpad(ctx.get_scratchpad_grantor())
         , ithr(ithr)
         , exec_ctx(ctx)
@@ -337,9 +345,6 @@ struct brgemm_convolution_bwd_weights_t::thread_info_t {
         , src_d(self->pd()->src_md())
         , diff_dst_d(self->pd()->diff_dst_md())
         , diff_weights_d(self->pd()->diff_weights_md(0)) {
-        diff_dst = CTX_IN_MEM(const diff_dst_data_t *, DNNL_ARG_DIFF_DST);
-        src = CTX_IN_MEM(const src_data_t *, DNNL_ARG_SRC);
-        diff_weights = CTX_OUT_MEM(void *, DNNL_ARG_DIFF_WEIGHTS);
 
         diff_bias = self->pd()->with_bias() && (jcp.oc % jcp.oc_block != 0)
                         && self->pd()->jcp_.bia_dt == data_type::f32

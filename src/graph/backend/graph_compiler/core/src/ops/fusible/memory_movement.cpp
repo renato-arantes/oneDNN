@@ -1,5 +1,5 @@
 /*******************************************************************************
- * Copyright 2022-2023 Intel Corporation
+ * Copyright 2022-2024 Intel Corporation
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -319,13 +319,20 @@ concat_op_t::concat_op_t(const std::vector<graph_tensor_ptr> &ins,
 }
 
 void concat_op_t::set_format_and_axis() {
-    if (info_.inputs_[0]->details_.get_format().get_format_category()
+    // find the largest input index
+    auto max_buffer = std::max_element(info_.inputs_.begin(),
+            info_.inputs_.end(),
+            [](const graph_tensor_ptr &a, const graph_tensor_ptr &b) {
+                return get_dims_product(a->details_.get_plain_dims())
+                        < get_dims_product(b->details_.get_plain_dims());
+            });
+    if ((*max_buffer)->details_.get_format().get_format_category()
             == sc_format_category::non_blocking) {
-        ori_format_ = info_.inputs_[0]->details_.get_format();
+        ori_format_ = (*max_buffer)->details_.get_format();
     } else {
         // if the input has any/block/vnni format, use plain format when concat
         ori_format_ = sc_data_format_t::get_plain_by_dims(
-                (int)info_.inputs_[0]->details_.get_plain_dims().size());
+                (int)(*max_buffer)->details_.get_plain_dims().size());
     }
     // here axis_ is in plain format (because it is copied from llga bridge)
     // we need to transform it to blocking format
@@ -358,6 +365,12 @@ void concat_op_t::query_format(context_ptr ctx,
             info_.outputs_.size(), {ori_format_});
     format_to_dense_format_stride_pair(
             in_formats, out_formats, supported_ins, supported_outs);
+    for (size_t i = 0; i < info_.inputs_.size(); ++i) {
+        if (info_.inputs_[i]->details_.get_format() == ori_format_) {
+            supported_ins[i][0].second
+                    = info_.inputs_[i]->details_.get_strides();
+        }
+    }
 }
 
 infer_status_code concat_op_t::infer_slice_ranges(
@@ -644,6 +657,28 @@ tensor_view_op_t::tensor_view_op_t(const std::vector<graph_tensor_ptr> &ins,
     }
 }
 
+bool tensor_view_op_t::is_only_expand_or_penetrate() const {
+    const auto &in_tensor = this->get_inputs()[0]->details_;
+    auto in_shape = in_tensor.get_plain_dims();
+    auto in_real_shape = in_tensor.get_blocking_dims();
+    auto out_tensor = this->get_outputs()[0]->details_;
+    auto out_shape = out_tensor.get_plain_dims();
+    auto out_real_shape = out_tensor.get_blocking_dims();
+    auto erase_element_one = [&](sc_dims &dim) {
+        dim.erase(std::remove_if(dim.begin(), dim.end(),
+                          [&](sc_dim v) { return v == 1; }),
+                dim.end());
+    };
+    erase_element_one(in_shape);
+    erase_element_one(in_real_shape);
+    erase_element_one(out_shape);
+    erase_element_one(out_real_shape);
+    if (in_real_shape == out_real_shape && in_shape == out_shape) {
+        return true;
+    }
+    return false;
+}
+
 tensor_view_op_t::tensor_view_op_t(graph_tensor_ptr v, const sc_dims &shapes)
     : tensor_view_op_t({std::move(v)}, {}, {{"shape", shapes}, {}}) {}
 
@@ -669,10 +704,13 @@ bool tensor_view_op_t::try_penetrate(
     std::unordered_map<size_t, size_t> inp_blk_map;
     size_t short_idx = 0, long_idx = 0;
     while (short_idx < short_size) {
+        COMPILE_ASSERT(long_idx < long_plain_shapes.size(),
+                "long_idx shall be within the valid range.");
         int64_t acc_shape = long_plain_shapes[long_idx];
         long_to_short[long_idx] = short_idx;
         long_idx++;
         while (long_idx < long_size
+                && (long_size - long_idx) >= (short_size - short_idx)
                 && (acc_shape < short_plain_shapes[short_idx]
                         || long_plain_shapes[long_idx] == 1)) {
             acc_shape *= long_plain_shapes[long_idx];
@@ -1028,14 +1066,14 @@ infer_status_code tensor_view_op_t::pre_infer_slice_ranges(
 }
 
 // transpose_axis_map stores the transpose relation of src_axis --> dst_axis
-bound_axis infer_tensor_view_binding_axis(const bound_axis &src_axis,
+binding_axis infer_tensor_view_binding_axis(const binding_axis &src_axis,
         const sc_dims &src_dims, const sc_dims &dst_dims,
         const std::vector<int> &expand_dims = {},
         const std::vector<int> &transpose_axis_map = {}) {
-    bound_axis dst_axis, tv_axis_map;
+    binding_axis dst_axis, tv_axis_map;
 
     if (!transpose_axis_map.empty()) {
-        bound_axis real_src_axis;
+        binding_axis real_src_axis;
         COMPILE_ASSERT(src_dims.size() == dst_dims.size()
                         && src_dims.size() == transpose_axis_map.size(),
                 "src dims, dst dims, and transpose_axis_map shall have the "
@@ -1105,7 +1143,7 @@ bound_axis infer_tensor_view_binding_axis(const bound_axis &src_axis,
     return dst_axis;
 }
 
-void tensor_view_op_t::infer_binding_axis(bound_axis_map &bdax_map) {
+void tensor_view_op_t::infer_binding_axis(binding_axis_map &bdax_map) {
     auto known_axis_map = search_known_input_axis(this, bdax_map);
     if (!bdax_map.get(get_outputs()[0]).empty()) return;
     // src
@@ -1124,10 +1162,10 @@ void tensor_view_op_t::infer_binding_axis(bound_axis_map &bdax_map) {
     set_unknown_binding_axis(this, known_axis_map, bdax_map);
 }
 
-void tensor_view_op_t::pre_infer_binding_axis(bound_axis_map &bdax_map) {
+void tensor_view_op_t::pre_infer_binding_axis(binding_axis_map &bdax_map) {
     auto &outaxis = bdax_map.get(get_outputs()[0]);
     COMPILE_ASSERT(!outaxis.empty(),
-            "Unknown output axis found, could not pre bind axis")
+            "Unknown output axis found, could not pre infer binding axis")
     auto &input = get_inputs()[0];
     auto &inpaxis = bdax_map.get(input);
 

@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2023 Intel Corporation
+* Copyright 2023-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -20,7 +20,6 @@
 #include <memory>
 
 #include "common/c_types_map.hpp"
-#include "gpu/compute/compute.hpp"
 #include "gpu/gpu_pooling_pd.hpp"
 #include "gpu/gpu_primitive.hpp"
 #include "gpu/jit/pooling/config.hpp"
@@ -58,8 +57,8 @@ public:
 private:
     const pd_t *pd() const { return (const pd_t *)primitive_t::pd().get(); }
 
-    pooling_config_t cfg;
-    kernel_info_t kernel_info;
+    pooling_config_t cfg_;
+    kernel_info_t kernel_info_;
     compute::kernel_t kernel_;
 };
 

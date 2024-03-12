@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2023 Intel Corporation
+* Copyright 2023-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -111,7 +111,7 @@ void sycl_getting_started_tutorial(dnnl::engine::kind ekind) {
 
     /// Create first `Convolution` op (#dnnl::graph::op) and attaches attributes
     /// to it, such as `strides`, `pads_begin`, `pads_end`, `data_format`, etc.
-    /// @snippet cpu_getting_started.cpp Create first conv
+    /// @snippet sycl_getting_started.cpp Create first conv
     //[Create first conv]
     op conv0(0, op::kind::Convolution, {conv0_src_desc, conv0_weight_desc},
             {conv0_dst_desc}, "conv0");
@@ -125,7 +125,7 @@ void sycl_getting_started_tutorial(dnnl::engine::kind ekind) {
     //[Create first conv]
 
     /// Create input/output logical tensors for first `BiasAdd` op and create the first `BiasAdd` op
-    /// @snippet cpu_getting_started.cpp Create first bias_add
+    /// @snippet sycl_getting_started.cpp Create first bias_add
     //[Create first bias_add]
     logical_tensor conv0_bias_desc {3, data_type::f32};
     logical_tensor conv0_bias_add_dst_desc {
@@ -136,7 +136,7 @@ void sycl_getting_started_tutorial(dnnl::engine::kind ekind) {
     //[Create first bias_add]
 
     /// Create output logical tensors for first `Relu` op and create the op.
-    /// @snippet cpu_getting_started.cpp Create first relu
+    /// @snippet sycl_getting_started.cpp Create first relu
     //[Create first relu]
     logical_tensor relu0_dst_desc {5, data_type::f32};
     op relu0(2, op::kind::ReLU, {conv0_bias_add_dst_desc}, {relu0_dst_desc},
@@ -144,7 +144,7 @@ void sycl_getting_started_tutorial(dnnl::engine::kind ekind) {
     //[Create first relu]
 
     /// Create input/output logical tensors for second `Convolution` op and create the second `Convolution` op.
-    /// @snippet cpu_getting_started.cpp Create second conv
+    /// @snippet sycl_getting_started.cpp Create second conv
     //[Create second conv]
     logical_tensor conv1_weight_desc {6, data_type::f32};
     logical_tensor conv1_dst_desc {7, data_type::f32};
@@ -160,7 +160,7 @@ void sycl_getting_started_tutorial(dnnl::engine::kind ekind) {
     //[Create second conv]
 
     /// Create input/output logical tensors for second `BiasAdd` op and create the op.
-    /// @snippet cpu_getting_started.cpp Create second bias_add
+    /// @snippet sycl_getting_started.cpp Create second bias_add
     //[Create second bias_add]
     logical_tensor conv1_bias_desc {8, data_type::f32};
     logical_tensor conv1_bias_add_dst_desc {9, data_type::f32};
@@ -170,7 +170,7 @@ void sycl_getting_started_tutorial(dnnl::engine::kind ekind) {
     //[Create second bias_add]
 
     /// Create output logical tensors for second `Relu` op and create the op
-    /// @snippet cpu_getting_started.cpp Create second relu
+    /// @snippet sycl_getting_started.cpp Create second relu
     //[Create second relu]
     logical_tensor relu1_dst_desc {10, data_type::f32};
     op relu1(5, op::kind::ReLU, {conv1_bias_add_dst_desc}, {relu1_dst_desc},
@@ -203,10 +203,10 @@ void sycl_getting_started_tutorial(dnnl::engine::kind ekind) {
     /// ops into a finalized graph or partitioning a unfinalized graph
     /// will both lead to a failure.
     ///
-    /// @snippet cpu_getting_started.cpp Finialize graph
-    //[Finialize graph]
+    /// @snippet sycl_getting_started.cpp Finalize graph
+    //[Finalize graph]
     g.finalize();
-    //[Finialize graph]
+    //[Finalize graph]
 
     /// After finished above operations, we can get partitions by calling
     /// #dnnl::graph::graph::get_partitions(). Here we can also specify the
@@ -277,8 +277,8 @@ void sycl_getting_started_tutorial(dnnl::engine::kind ekind) {
     // output tensor is fed into partition 1)
     std::unordered_map<size_t, tensor> global_outputs_ts_map;
 
-    // Memory buffers binded to the partition input/output tensors
-    // that helpe manage the lifetime of these tensors
+    // Memory buffers bound to the partition input/output tensors
+    // that helps manage the lifetime of these tensors
     std::vector<std::shared_ptr<void>> data_buffer;
 
     // Mapping from id to queried logical tensor from compiled partition
@@ -310,7 +310,7 @@ void sycl_getting_started_tutorial(dnnl::engine::kind ekind) {
     // 4. Allocate memory and bind the data buffer for the partition
     // 5. Execute the partition
     //
-    // Although they are not part of the APIs, these steps are esstential for
+    // Although they are not part of the APIs, these steps are essential for
     // the integration of Graph API., hence users need to implement similar
     // logic.
     for (const auto &partition : partitions) {
@@ -349,7 +349,7 @@ void sycl_getting_started_tutorial(dnnl::engine::kind ekind) {
         /// Compile the partition to generate compiled partition with the
         /// input and output logical tensors.
         ///
-        /// @snippet cpu_getting_started.cpp Compile partition
+        /// @snippet sycl_getting_started.cpp Compile partition
         //[Compile partition]
         compiled_partition cp = partition.compile(inputs, outputs, eng);
         //[Compile partition]
@@ -372,7 +372,7 @@ void sycl_getting_started_tutorial(dnnl::engine::kind ekind) {
 
         /// Execute the compiled partition on the specified stream.
         ///
-        /// @snippet cpu_getting_started.cpp Execute compiled partition
+        /// @snippet sycl_getting_started.cpp Execute compiled partition
         //[Execute compiled partition]
         sycl_interop::execute(cp, strm, inputs_ts, outputs_ts);
         //[Execute compiled partition]

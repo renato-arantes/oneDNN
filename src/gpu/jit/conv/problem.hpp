@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2023 Intel Corporation
+* Copyright 2023-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -29,6 +29,7 @@ namespace jit {
 
 bool is_conv_index(const prb_dim_t &dim);
 bool is_conv_index(const prb_dim_t &dim, prop_kind_t prop);
+const std::vector<prb_dim_t> &conv_dims();
 const std::vector<prb_dim_t> &conv_index_dims(prop_kind_t prop);
 
 const std::vector<prb_dim_t> &conv_layout_dims(
@@ -71,8 +72,9 @@ public:
 
     bool is_stride1() const { return sd == 1 && sh == 1 && sw == 1; }
 
-    // Reduces dimensions for 1x1 kernel.
-    void try_reduce_to_1d();
+    // If possible, reduces dimensions for 1x1 kernel and shifts spatial
+    // dimensions.
+    void normalize_shape();
 
     // Number of operations (including virtual padding operations).
     double ops() const {
@@ -145,6 +147,7 @@ public:
     data_type_t dst_data_type = data_type::undef;
     data_type_t bia_data_type = data_type::undef;
     fpmath_mode_t fpmath_mode = fpmath_mode::strict;
+    bool deterministic = false;
 
     bool is_fwd = false;
     bool is_bwd_d = false;
@@ -165,7 +168,8 @@ public:
     int sd = 0, sh = 0, sw = 0; // Strides.
     int pd = 0, ph = 0, pw = 0; // Padding in the beginning.
     int dd = 0, dh = 0, dw = 0; // Dilation.
-    int reduced_dim = 0; // Indicates which dims were shifted over or reduced.
+    // Mapping for spatial dimensions (e.g. when 3D convolution is reduced to 1D).
+    std::array<int, 3> dhw_map = {-1, -1, -1};
     int isp = 0, osp = 0, ksp = 0; // Combined input/output/kernel spatial size.
 
     data_type_t a_data_type = data_type::undef;
@@ -247,8 +251,16 @@ private:
     const conv_problem_t &prb_;
 };
 
-prb_dim_t to_gemm(const prb_dim_t &d, const conv_problem_t &prb);
-prb_tile_t to_gemm(const prb_tile_t &t, const conv_problem_t &prb);
+prb_dim_t to_gemm(
+        const prb_dim_t &d, prop_kind_t prop, bool is_transpose = false);
+prb_tile_t to_gemm(
+        const prb_tile_t &t, prop_kind_t prop, bool is_transpose = false);
+inline prb_dim_t to_gemm(const prb_dim_t &d, const conv_problem_t &prb) {
+    return to_gemm(d, prb.prop_kind(), prb.ab_swap_transpose);
+}
+inline prb_tile_t to_gemm(const prb_tile_t &t, const conv_problem_t &prb) {
+    return to_gemm(t, prb.prop_kind(), prb.ab_swap_transpose);
+}
 
 } // namespace jit
 } // namespace gpu

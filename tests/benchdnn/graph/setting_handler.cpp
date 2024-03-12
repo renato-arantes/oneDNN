@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2022-2023 Intel Corporation
+* Copyright 2022-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -38,6 +38,8 @@ dnnl_data_type_t convert_dt(const dnnl::graph::logical_tensor::data_type dt) {
         // use u8 instead of boolean in the reference path
         // dnn_graph_mem_t will use the data type from the logical tensor and the u8 data handle
         case graph_dt::boolean: return dnnl_u8;
+        case graph_dt::f8_e5m2: return dnnl_f8_e5m2;
+        case graph_dt::f8_e4m3: return dnnl_f8_e4m3;
         case graph_dt::undef:
         default: return dnnl_data_type_undef;
     }
@@ -56,6 +58,10 @@ logical_tensor::data_type get_data_type(const std::string &data_type) {
         return logical_tensor::data_type::bf16;
     } else if (data_type == "s32") {
         return logical_tensor::data_type::s32;
+    } else if (data_type == "f8_e5m2") {
+        return logical_tensor::data_type::f8_e5m2;
+    } else if (data_type == "f8_e4m3") {
+        return logical_tensor::data_type::f8_e4m3;
     } else {
         return logical_tensor::data_type::undef;
     }
@@ -190,7 +196,10 @@ namespace custom {
         auto arg = get_prim_arg_name_from_graph_op_input_offset(
                 opkind, static_cast<int>(i));
         auto dim = base_op_ref.in_lts_[i].shape_;
-        auto dt = convert_dt(base_op_ref.in_lts_[i].get_data_type());
+        auto dt = rewrite_lt_ids.find(base_op_ref.in_lts_[i].id_)
+                        == rewrite_lt_ids.end()
+                ? convert_dt(base_op_ref.in_lts_[i].get_data_type())
+                : dnnl_f32;
         auto tag = strides2memory_tag(base_op_ref.in_lts_[i].stride_.size(),
                 base_op_ref.in_lts_[i].stride_, false);
 
@@ -205,7 +214,10 @@ namespace custom {
         auto arg = get_prim_arg_name_from_graph_op_output_offset(
                 opkind, static_cast<int>(i));
         auto dim = base_op_ref.out_lts_[i].shape_;
-        auto dt = convert_dt(base_op_ref.out_lts_[i].get_data_type());
+        auto dt = rewrite_lt_ids.find(base_op_ref.out_lts_[i].id_)
+                        == rewrite_lt_ids.end()
+                ? convert_dt(base_op_ref.out_lts_[i].get_data_type())
+                : dnnl_f32;
         auto tag = strides2memory_tag(base_op_ref.out_lts_[i].stride_.size(),
                 base_op_ref.out_lts_[i].stride_, false);
 
@@ -254,7 +266,7 @@ bool get_binary_prb_vdims(
             int64_t channel_idx = 1;
             if (base_op_ref.has_NXC_format()) { channel_idx = ndims - 1; }
             src1_dims_tmp[channel_idx] = src0_dims[channel_idx];
-            src1_dims = src1_dims_tmp;
+            src1_dims = std::move(src1_dims_tmp);
 
             // convert NXC to NCX
             if (base_op_ref.has_NXC_format()) {
@@ -299,8 +311,8 @@ bool get_binary_stag_and_dtag(
             || !get_driver_tag_by_idx(base_op_ref, stag0, 0, false)) {
         return false;
     }
-    op_setting.stag = {{stag0, stag1}};
-    op_setting.dtag.front() = dtag;
+    op_setting.stag = {{std::move(stag0), std::move(stag1)}};
+    op_setting.dtag.front() = std::move(dtag);
     return true;
 }
 
@@ -466,8 +478,8 @@ bool get_concat_stag_and_dtag(
     }
     if (!get_driver_tag_by_idx(base_op_ref, dtag, 0, true)) { return false; }
 
-    op_setting.stag.front() = stags;
-    op_setting.dtag.front() = dtag;
+    op_setting.stag.front() = std::move(stags);
+    op_setting.dtag.front() = std::move(dtag);
     return true;
 }
 
@@ -685,8 +697,8 @@ bool get_conv_stag_and_dtag(
         assert(!"unexpected op_kind");
         return false;
     }
-    op_setting.stag.front() = stag;
-    op_setting.dtag.front() = dtag;
+    op_setting.stag.front() = std::move(stag);
+    op_setting.dtag.front() = std::move(dtag);
     return true;
 }
 
@@ -1693,12 +1705,15 @@ bool get_reorder_attrs(const deserialized_op &base_op_ref,
 
     if (op_kind == "Dequantize" || op_kind == "Quantize") {
         std::vector<float> scales {};
-        base_op_ref.get_attr_f32_vector(scales, "scales");
-        arg_scales.set(arg, {scale_policy, scales.front()});
+        const auto has_scales
+                = base_op_ref.get_attr_f32_vector(scales, "scales");
+        if (has_scales) arg_scales.set(arg, {scale_policy, scales.front()});
+
         std::vector<int64_t> zps;
-        base_op_ref.get_attr_s64_vector(zps, "zps");
+        const auto has_zps = base_op_ref.get_attr_s64_vector(zps, "zps");
         // currently, zps only support per_tensor quantization in primitive
-        zp.set(arg, attr_t::policy_t::COMMON, zps.front());
+        if (has_zps && !zps.empty())
+            zp.set(arg, attr_t::policy_t::COMMON, zps.front());
     } else if (op_kind == "DynamicDequantize" || op_kind == "DynamicQuantize") {
         //  TODO: benchdnn needs to alloc memory based on is_def() function.
         //  so add tmp value for per_tensor scales && zps to make is_def()

@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2021-2023 Intel Corporation
+* Copyright 2021-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -40,9 +40,11 @@
     HANDLE_IR_OBJECT(binary_op_t) \
     HANDLE_IR_OBJECT(bool_imm_t) \
     HANDLE_IR_OBJECT(cast_t) \
+    HANDLE_IR_OBJECT(const_var_t) \
     HANDLE_IR_OBJECT(float_imm_t) \
     HANDLE_IR_OBJECT(iif_t) \
     HANDLE_IR_OBJECT(int_imm_t) \
+    HANDLE_IR_OBJECT(linear_t) \
     HANDLE_IR_OBJECT(load_t) \
     HANDLE_IR_OBJECT(ptr_t) \
     HANDLE_IR_OBJECT(shuffle_t) \
@@ -205,6 +207,10 @@ enum class type_kind_t {
     s64,
 
     // Floating point types.
+    bf8,
+    f8_e5m2 = bf8,
+    hf8,
+    f8_e4m3 = hf8,
     bf16,
     f16,
     tf32,
@@ -260,7 +266,8 @@ public:
         }
         return type_t::undef();
     }
-
+    static type_t bf8(int elems = 1) { return type_t(type_kind_t::bf8, elems); }
+    static type_t hf8(int elems = 1) { return type_t(type_kind_t::hf8, elems); }
     static type_t bf16(int elems = 1) {
         return type_t(type_kind_t::bf16, elems);
     }
@@ -383,6 +390,8 @@ public:
         switch ((int)dt) {
 #define CASE(x) \
     case data_type::x: kind_ = type_kind_t::x; break;
+            CASE(f8_e5m2);
+            CASE(f8_e4m3);
             CASE(bf16);
             CASE(f16);
             CASE(tf32);
@@ -434,10 +443,13 @@ public:
     bool is_bool() const { return kind() == type_kind_t::_bool; }
 
     bool is_fp() const {
-        return utils::one_of(kind(), type_kind_t::bf16, type_kind_t::f16,
-                type_kind_t::tf32, type_kind_t::f32, type_kind_t::f64);
+        return utils::one_of(kind(), type_kind_t::bf8, type_kind_t::hf8,
+                type_kind_t::bf16, type_kind_t::f16, type_kind_t::tf32,
+                type_kind_t::f32, type_kind_t::f64);
     }
 
+    bool is_bf8() const { return kind() == type_kind_t::bf8; }
+    bool is_hf8() const { return kind() == type_kind_t::hf8; }
     bool is_bf16() const { return kind() == type_kind_t::bf16; }
     bool is_f16() const { return kind() == type_kind_t::f16; }
     bool is_tf32() const { return kind() == type_kind_t::tf32; }
@@ -993,6 +1005,9 @@ enum class op_kind_t {
     // Multiply-accumulate.
     // op = a + b * c
     _mad,
+    // Integer division by a constant with rounding up.
+    // op = (a + b - 1) / b
+    _div_up,
     // Integer division by a non-constant (rounding down behavior).
     // if (a % b < 0) op = a / b - 1
     // else           op = a / b
@@ -1160,6 +1175,31 @@ private:
     }
 };
 
+// Constant variable, used as a coefficient in a linear expression.
+class const_var_t : public expr_impl_t {
+public:
+    IR_DECL_EXPR_TYPE_ID(const_var_t)
+
+    static expr_t make(const type_t &type, const std::string &name) {
+        return expr_t(new const_var_t(type, name));
+    }
+
+    bool is_equal(const object_impl_t &obj) const override {
+        // Do not allow variable cloning.
+        return this == &obj;
+    }
+
+    size_t get_hash() const override { return ir_utils::get_hash(name); }
+
+    IR_DECLARE_TRAVERSERS()
+
+    std::string name;
+
+private:
+    const_var_t(const type_t &type, const std::string &name)
+        : expr_impl_t(_type_info(), type), name(name) {}
+};
+
 // Floating-point immediate value.
 class float_imm_t : public expr_impl_t {
 public:
@@ -1275,6 +1315,59 @@ private:
         , cond(cond)
         , true_expr(true_expr)
         , false_expr(false_expr) {}
+};
+
+// Linear combination expression:
+//   u[0] * v[0] + u[1] * v[1] + ... u[n - 1] * v[n - 1] + c,
+// where:
+// - c/u[i] is either an integer immediate (int_imm_t) or a constant variable
+//  (const_var_t)
+// - v[i] is a non-constant variable (var_t)
+class linear_t : public expr_impl_t {
+public:
+    IR_DECL_EXPR_TYPE_ID(linear_t)
+    static expr_t make(const expr_t &c, const std::vector<expr_t> &u_vec,
+            const std::vector<expr_t> &v_vec) {
+        return expr_t(new linear_t(c, u_vec, v_vec));
+    }
+    static expr_t make(const expr_t &c) { return make(c, {}, {}); }
+    static expr_t make(const expr_t &c, const std::vector<expr_t> &v_vec) {
+        std::vector<expr_t> ones(v_vec.size(), expr_t(1));
+        return make(c, ones, v_vec);
+    }
+    static expr_t to_expr(const expr_t &c, const std::vector<expr_t> &u_vec,
+            const std::vector<expr_t> &v_vec) {
+        auto e = linear_t::make(c, u_vec, v_vec);
+        return e.as<linear_t>().to_expr();
+    }
+    int nargs() const { return int(v_vec.size()); }
+    expr_t to_expr() const;
+
+    bool is_equal(const object_impl_t &obj) const override {
+        if (!obj.is<self_type>()) return false;
+        auto &other = obj.as<self_type>();
+
+        return c.is_equal(other.c) && ir_utils::is_equal(u_vec, other.u_vec)
+                && ir_utils::is_equal(v_vec, other.v_vec);
+    }
+
+    size_t get_hash() const override {
+        return ir_utils::get_hash(c, u_vec, v_vec);
+    }
+
+    IR_DECLARE_TRAVERSERS()
+
+    expr_t c;
+    std::vector<expr_t> u_vec;
+    std::vector<expr_t> v_vec;
+
+private:
+    linear_t(const expr_t &c, const std::vector<expr_t> &u_vec,
+            const std::vector<expr_t> &v_vec)
+        : expr_impl_t(_type_info(), type_t::s32())
+        , c(c)
+        , u_vec(u_vec)
+        , v_vec(v_vec) {}
 };
 
 // Updates `base_expr` and `off` so that after return:
@@ -1723,6 +1816,10 @@ T to_cpp(const expr_t &e) {
 
     ir_error_not_expected();
     return 0;
+}
+
+inline int to_int(const expr_t &e) {
+    return to_cpp<int>(e);
 }
 
 expr_t operator-(const expr_t &a);

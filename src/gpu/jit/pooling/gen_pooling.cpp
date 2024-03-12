@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2023 Intel Corporation
+* Copyright 2023-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -26,6 +26,7 @@
 #include "gpu/jit/ir/kernel_info.hpp"
 #include "gpu/jit/ir/post_ops.hpp"
 #include "gpu/jit/ir/tensor_config.hpp"
+#include "gpu/jit/ngen/ngen_register_allocator.hpp"
 #include "gpu/jit/pooling/pooling_kernel.hpp"
 #include "gpu/jit/utils/utils.hpp"
 #include "gpu/ocl/ocl_utils.hpp"
@@ -47,32 +48,47 @@ status_t gen_pooling_fwd_t::pd_t::init(engine_t *engine) {
     auto acc_data_t = desc()->accum_data_type;
 
     // TODO: add training(?), add bwd
-    bool ok = set_default_params() == status::success
-            && utils::one_of(
-                    desc()->prop_kind, /*forward_training,*/ forward_inference)
-            && utils::one_of(desc()->alg_kind, pooling_max,
-                    pooling_avg_include_padding, pooling_avg_exclude_padding)
-            && (utils::everyone_is(f32, src_data_t, dst_data_t, acc_data_t)
+    VDISPATCH_POOLING_SC(set_default_params(), VERBOSE_UNSUPPORTED_TAG);
+    VDISPATCH_POOLING(utils::one_of(desc()->prop_kind,
+                              /*forward_training,*/ forward_inference),
+            VERBOSE_BAD_PROPKIND);
+    VDISPATCH_POOLING(
+            utils::one_of(desc()->alg_kind, pooling_max,
+                    pooling_avg_include_padding, pooling_avg_exclude_padding),
+            VERBOSE_BAD_ALGORITHM);
+    VDISPATCH_POOLING(
+            (utils::everyone_is(f32, src_data_t, dst_data_t, acc_data_t)
                     || utils::everyone_is(f16, src_data_t, dst_data_t)
                     || utils::everyone_is(bf16, src_data_t, dst_data_t)
                     || utils::everyone_is(u8, src_data_t, dst_data_t)
-                    || utils::everyone_is(s8, src_data_t, dst_data_t))
-            && IMPLICATION(utils::one_of(src_data_t, f16, s8, u8),
-                    desc()->prop_kind == forward_inference)
-            && attr_.set_default_formats(dst_md(0)) == status::success
-            && !is_dilated() && !utils::one_of(f64, src_data_t, dst_data_t)
-            && compute_engine->mayiuse(compute::device_ext_t::intel_subgroups)
-            && IMPLICATION(src_data_t == f16,
+                    || utils::everyone_is(s8, src_data_t, dst_data_t)),
+            VERBOSE_UNSUPPORTED_DT);
+    VDISPATCH_POOLING(IMPLICATION(utils::one_of(src_data_t, f16, s8, u8),
+                              desc()->prop_kind == forward_inference),
+            VERBOSE_UNSUPPORTED_DT_CFG);
+    VDISPATCH_POOLING_SC(
+            attr_.set_default_formats(dst_md(0)), VERBOSE_UNSUPPORTED_TAG);
+    VDISPATCH_POOLING(
+            !is_dilated(), VERBOSE_UNSUPPORTED_FEATURE, "is_dilated()");
+    VDISPATCH_POOLING(!utils::one_of(f64, src_data_t, dst_data_t),
+            VERBOSE_UNSUPPORTED_DT_CFG);
+    VDISPATCH_POOLING(
+            compute_engine->mayiuse(compute::device_ext_t::intel_subgroups),
+            VERBOSE_UNSUPPORTED_DEVICE_FEATURE, "subgroups");
+    VDISPATCH_POOLING(
+            IMPLICATION(src_data_t == f16,
                     compute_engine->mayiuse(compute::device_ext_t::khr_fp16)
                             && compute_engine->mayiuse(compute::device_ext_t::
-                                            intel_subgroups_short))
-            && IMPLICATION(src_data_t == bf16, // easier to refuse BF16 on XeHPG
-                    arch != compute::gpu_arch_t::xe_hpg);
-    if (!ok) return status::unimplemented;
+                                            intel_subgroups_short)),
+            VERBOSE_UNSUPPORTED_DT_CFG);
+    VDISPATCH_POOLING(IMPLICATION(src_data_t == bf16,
+                              arch >= compute::gpu_arch_t::xe_hpc),
+            VERBOSE_UNSUPPORTED_DT_CFG);
 
     src = std::make_shared<layout_t>(invariant_src_md());
     dst = std::make_shared<layout_t>(invariant_dst_md());
-    if (src->ndims() != dst->ndims()) return status::unimplemented;
+    VDISPATCH_POOLING(src->ndims() == dst->ndims(), VERBOSE_INCONSISTENT_NDIMS,
+            "src->ndims()", "dst_ndims()");
 
     pool_conf = std::make_shared<pool_conf_t>();
     set_default_pool_conf(*pool_conf, *desc(), *invariant_src_md(),
@@ -85,29 +101,37 @@ status_t gen_pooling_fwd_t::pd_t::init(engine_t *engine) {
     exec_cfg->set_regs(hw.prefer_large_grf(gpu_attr) ? 256 : 128);
     exec_cfg->set_simd(16);
 
-    return (pooling_config_t::check_compatibility(*pool_conf, *exec_cfg, *src))
-            ? status::success
-            : status::unimplemented;
+    VDISPATCH_POOLING(pooling_config_t::check_compatibility(*pool_conf,
+                              *exec_cfg, *src, attr()->post_ops_, dst->type()),
+            "incompatible pooling configuration");
+    return status::success;
 }
 
 status_t gen_pooling_fwd_t::init(engine_t *engine) {
-    cfg = pooling_config_t(
+    cfg_ = pooling_config_t(
             *pd()->exec_cfg, *pd()->pool_conf, *pd()->src, *pd()->dst);
     zero_points_config_t zp_cfg(pd());
-    cfg.set_zp_cfg(zp_cfg);
-    cfg.compute_grid();
+    cfg_.set_zp_cfg(zp_cfg);
+    cfg_.compute_grid();
+
+    if (auto blob = cache_blob()) {
+        int32_t version;
+        CHECK(blob.get_value((uint8_t *)&version, sizeof(version)));
+        while (version--)
+            cfg_.cut();
+    }
 
     tensor_config_t tensor_cfg;
     tensor_cfg.add_tensor("src", DNNL_ARG_SRC, true, false,
-            cfg.src_layout().user(), cfg.src_layout().user());
+            cfg_.src_layout().user(), cfg_.src_layout().user());
     tensor_cfg.add_tensor("dst", DNNL_ARG_DST, true, true,
-            cfg.dst_layout().user(), cfg.dst_layout().user());
+            cfg_.dst_layout().user(), cfg_.dst_layout().user());
 
-    init_extra_tensors(cfg.zp_cfg(), *pd()->attr(), *pd()->dst_md(),
+    init_extra_tensors(cfg_.zp_cfg(), *pd()->attr(), *pd()->dst_md(),
             /* ic = */ 1, /* oc = */ 1, tensor_cfg);
 
-    kernel_info = kernel_info_t();
-    kernel_info.set_nd_range(pooling_kernel_t<>::nd_range(cfg));
+    kernel_info_ = kernel_info_t();
+    kernel_info_.set_nd_range(cfg_.nd_range());
 
     // Initialize kernel arguments.
     for (auto &t : tensor_cfg.tensors()) {
@@ -124,23 +148,36 @@ status_t gen_pooling_fwd_t::init(engine_t *engine) {
             continue;
         }
 
-        kernel_info.register_user_arg(user_buf, user_arg_key,
+        kernel_info_.register_user_arg(user_buf, user_arg_key,
                 /*is_input=*/t.is_input && !t.is_output);
     }
 
-    kernel_ = make_kernel<pooling_kernel_t>(this, engine, cfg,
-            "gen_pooling_fwd", kernel_info, grf_mode_t::any, *pd());
+    while (!kernel_) {
+        try {
+            kernel_ = make_kernel<pooling_kernel_t>(this, engine, cfg_,
+                    "gen_pooling_fwd", kernel_info_, grf_mode_t::any, *pd());
+        } catch (const ngen::out_of_registers_exception &exc) {
+            UNUSED(exc);
+            ir_warning() << "loop too large: cut and retry!" << std::endl;
+            kernel_ = {};
+            if (!cfg_.cut()) {
+                ir_error_not_expected() << "minimal loop too large!";
+                break;
+            }
+        }
+    }
+    set_version(cfg_.n_cuts());
     return (kernel_) ? status::success : status::runtime_error;
 }
 
 status_t gen_pooling_fwd_t::execute(const exec_ctx_t &ctx) const {
     std::vector<memory_storage_wrapper_t> storage_list;
-    kernel_info.init_memory_storage_list(storage_list, ctx, this);
+    kernel_info_.init_memory_storage_list(storage_list, ctx, this);
 
     compute::kernel_arg_list_t arg_list;
-    kernel_info.set_args(arg_list, storage_list);
+    kernel_info_.set_args(arg_list, storage_list);
 
-    return parallel_for(ctx, kernel_info.nd_range(), kernel_, arg_list);
+    return parallel_for(ctx, cfg_.nd_range(), kernel_, arg_list);
 }
 
 } // namespace jit

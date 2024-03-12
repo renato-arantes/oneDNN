@@ -1,5 +1,5 @@
 /*******************************************************************************
- * Copyright 2020-2023 Intel Corporation
+ * Copyright 2020-2024 Intel Corporation
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -460,6 +460,13 @@ expr make_fmadd(const expr_c &v_a, const expr_c &v_b, const expr_c &v_c) {
             any_map_t());
 }
 
+expr make_fnmadd(const expr_c &v_a, const expr_c &v_b, const expr_c &v_c) {
+    return make_expr<intrin_call_node>(intrin_type::fnmadd,
+            std::vector<expr> {
+                    v_a.remove_const(), v_b.remove_const(), v_c.remove_const()},
+            any_map_t());
+}
+
 expr make_unpack_low(const expr_c &v_a, const expr_c &v_b, int elem_bits) {
     return make_expr<intrin_call_node>(intrin_type::unpack_low,
             std::vector<expr> {v_a.remove_const(), v_b.remove_const()},
@@ -516,6 +523,35 @@ expr make_extract(const expr_c &v_a, const int imm, const int lanes) {
     return make_expr<intrin_call_node>(intrin_type::extract,
             std::vector<expr> {v_a.remove_const()},
             any_map_t {{"extract_imm", imm}, {"lanes", lanes}});
+}
+
+static expr flatten_2d_index(
+        const expr_c &v_a, const expr_c &row, const expr_c &col) {
+    uint64_t parent_rows = v_a->dtype_.rows_;
+    if (parent_rows == 0) { parent_rows = 1; }
+    uint64_t parent_cols = v_a->dtype_.lanes_ / parent_rows;
+    auto p_cols_expr = make_constant({parent_cols}, datatypes::u16);
+    return (make_cast(datatypes::u16, row) * p_cols_expr
+                   + make_cast(datatypes::u16, col))
+            * make_constant(
+                    {(uint64_t)utils::get_sizeof_etype(v_a->dtype_.type_code_)},
+                    datatypes::u16);
+}
+
+expr make_insert(const expr_c &v_a, const expr_c &v_b, const expr_c &row,
+        const expr_c &col) {
+    return make_expr<intrin_call_node>(intrin_type::insert,
+            std::vector<expr> {v_a.remove_const(), v_b.remove_const(),
+                    flatten_2d_index(v_a, row, col)},
+            any_map_t {});
+}
+
+expr make_extract(const expr_c &v_a, const expr_c &row, const expr_c &col,
+        uint32_t rows, uint32_t cols) {
+    return make_expr<intrin_call_node>(intrin_type::extract,
+            std::vector<expr> {
+                    v_a.remove_const(), flatten_2d_index(v_a, row, col)},
+            any_map_t {{"rows", rows}, {"cols", cols}});
 }
 
 expr make_read_struct(const expr_c &in, const std::string &struct_name,
@@ -576,25 +612,26 @@ expr make_clip(
 }
 
 expr make_indexing(const expr &ptr, const std::vector<expr> &idx,
-        uint16_t length, const expr &mask) {
-    return make_expr<indexing_node>(ptr, idx, length, mask);
+        uint16_t length, const expr &mask, uint16_t rows) {
+    return make_expr<indexing_node>(ptr, idx, length, rows, mask);
 }
 
 expr make_indexing(const expr_c &ptr, const std::vector<expr_c> &idx,
-        uint16_t length, const expr_c &mask) {
+        uint16_t length, const expr_c &mask, uint16_t rows) {
     return make_expr<indexing_node>(ptr.remove_const(),
-            vector_remove_const(idx), length, mask.remove_const());
+            vector_remove_const(idx), length, rows, mask.remove_const());
 }
 
 expr make_indexing(const expr &ptr, std::initializer_list<expr> idx,
-        uint16_t length, const expr &mask) {
-    return make_expr<indexing_node>(ptr, std::vector<expr>(idx), length, mask);
+        uint16_t length, const expr &mask, uint16_t rows) {
+    return make_expr<indexing_node>(
+            ptr, std::vector<expr>(idx), length, rows, mask);
 }
 
 expr make_indexing(const expr_c &ptr, const expr_c &idx, uint16_t length,
-        const expr_c &mask) {
+        const expr_c &mask, uint16_t rows) {
     return make_expr<indexing_node>(ptr.remove_const(),
-            std::vector<expr> {idx.remove_const()}, length,
+            std::vector<expr> {idx.remove_const()}, length, rows,
             mask.remove_const());
 }
 
@@ -795,7 +832,8 @@ stmt builder_impl_t::brgemm(const expr_c &x, const expr_c &w, const expr_c &y,
         const expr_c &ldx, const expr_c &ldw, const expr_c &ldy,
         const expr_c &x_block_stride, const expr_c &w_block_stride,
         const std::vector<expr> &postops_data, const expr_c &c_buf,
-        const expr_c &bd_mask_idx, const brgemm_args::extra_args_t &extras) {
+        const expr_c &bd_mask_idx, const expr_c &top_pad,
+        const expr_c &bottom_pad, const brgemm_args::extra_args_t &extras) {
     auto args = std::vector<expr> {x.remove_const(), w.remove_const(),
             y.remove_const(), blocks.remove_const(), M.remove_const(),
             N.remove_const(), K.remove_const(), ldx.remove_const(),
@@ -804,6 +842,8 @@ stmt builder_impl_t::brgemm(const expr_c &x, const expr_c &w, const expr_c &y,
     args.insert(args.end(), postops_data.begin(), postops_data.end());
     args.emplace_back(c_buf.remove_const());
     args.emplace_back(bd_mask_idx.remove_const());
+    args.emplace_back(top_pad.remove_const());
+    args.emplace_back(bottom_pad.remove_const());
     return push_evaluate(make_expr<intrin_call_node>(intrin_type::brgemm, args,
             any_map_t {{intrin_attr::brgemm_extras, extras}}));
 }
@@ -814,7 +854,8 @@ stmt builder_impl_t::list_brgemm(const expr_c &x, const expr_c &w,
         const expr_c &ldy, const expr_c &x_block_stride,
         const expr_c &w_block_stride, const expr_c &len,
         const std::vector<expr> &postops_data, const expr_c &c_buf,
-        const expr_c &bd_mask_idx, const brgemm_args::extra_args_t &extras) {
+        const expr_c &bd_mask_idx, const expr_c &top_pad,
+        const expr_c &bottom_pad, const brgemm_args::extra_args_t &extras) {
     auto args = std::vector<expr> {x.remove_const(), w.remove_const(),
             y.remove_const(), blocks.remove_const(), M.remove_const(),
             N.remove_const(), K.remove_const(), ldx.remove_const(),
@@ -824,9 +865,12 @@ stmt builder_impl_t::list_brgemm(const expr_c &x, const expr_c &w,
     args.insert(args.end(), postops_data.begin(), postops_data.end());
     args.emplace_back(c_buf.remove_const());
     args.emplace_back(bd_mask_idx.remove_const());
+    args.emplace_back(top_pad.remove_const());
+    args.emplace_back(bottom_pad.remove_const());
     return push_evaluate(make_expr<intrin_call_node>(intrin_type::list_brgemm,
             args, any_map_t {{intrin_attr::brgemm_extras, extras}}));
 }
+
 } // namespace builder
 } // namespace gc
 } // namespace graph

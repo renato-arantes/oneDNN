@@ -1,5 +1,5 @@
 ################################################################################
-# Copyright 2020-2023 Intel Corporation
+# Copyright 2020-2024 Intel Corporation
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -212,6 +212,8 @@ class LogParser:
                     start_idx += len(type) + 1
                     end_symbol = " "
                     end_idx = attrs.find(end_symbol, start_idx)
+                    if end_idx == -1:
+                        end_idx = None
                     return attrs[start_idx:end_idx]
 
                 def convert_structure_to_ir_seq(ir, value):
@@ -292,7 +294,7 @@ class LogParser:
                     for s in scales:
                         arg = s[: s.find(":")]
                         s_wo_arg = s[s.find(":") + 1 :]
-                        scale_dict = {"mask": "0"}
+                        scale_dict = {"mask": "0", "data_type": "f32", "groups": ""}
                         res[arg] = convert_structure_to_ir_seq(scale_dict, s_wo_arg)
                     return res
 
@@ -302,7 +304,7 @@ class LogParser:
                     for zp in zp_value:
                         arg = zp[: zp.find(":")]
                         zp_value_wo_arg = zp[zp.find(":") + 1 :]
-                        zp_dict = {"mask": "0"}
+                        zp_dict = {"mask": "0", "data_type": "s32", "groups": ""}
                         res[arg] = convert_structure_to_ir_seq(zp_dict, zp_value_wo_arg)
                     return res
 
@@ -315,6 +317,9 @@ class LogParser:
                 def convert_acc_mode(value):
                     return value
 
+                def convert_deterministic(value):
+                    return value
+
                 converters = {
                     "attr-post-ops": convert_post_ops,
                     "attr-scales": convert_scales,
@@ -322,6 +327,7 @@ class LogParser:
                     "attr-scratchpad": convert_scratchpad_mode,
                     "attr-fpmath": convert_fpmath_mode,
                     "attr-acc": convert_acc_mode,
+                    "attr-deterministic": convert_deterministic,
                 }
                 attrs = {}
                 for e in converters.keys():

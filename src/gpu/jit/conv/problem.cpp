@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2023 Intel Corporation
+* Copyright 2023-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -23,6 +23,26 @@ namespace dnnl {
 namespace impl {
 namespace gpu {
 namespace jit {
+
+const std::vector<prb_dim_t> &conv_dims() {
+    static std::vector<prb_dim_t> _conv_dims = []() {
+        std::vector<prb_dim_t> ret;
+        for (auto &d : conv_index_dims(prop_kind::forward)) {
+            ret.push_back(d);
+        }
+        ret.push_back(prb_dims::id);
+        ret.push_back(prb_dims::ih);
+        ret.push_back(prb_dims::iw);
+        for (auto &d : conv_stride_dims())
+            ret.push_back(d);
+        for (auto &d : conv_dilation_dims())
+            ret.push_back(d);
+        for (auto &d : conv_padding_dims())
+            ret.push_back(d);
+        return ret;
+    }();
+    return _conv_dims;
+}
 
 const std::vector<prb_dim_t> &conv_index_dims(prop_kind_t prop) {
     auto get_dims = [&](prop_kind_t prop) {
@@ -174,20 +194,20 @@ status_t conv_problem_t::init_abc_data_types(const hw_t &hw) {
         bool use_matching_fpmath
                 = gpu_utils::dev_getenv("use_matching_fpmath", false);
         if (use_matching_fpmath
-                && attr->mayidownconvert(data_type::f32, data_type::bf16)
+                && attr->mayiconvert(data_type::f32, data_type::bf16)
                 && get_supported_fma_kind(
                            hw, data_type::bf16, data_type::bf16, data_type::f32)
                         != fma_kind_t::undef) {
             a_data_type = data_type::bf16;
             b_data_type = data_type::bf16;
         } else if (use_matching_fpmath
-                && attr->mayidownconvert(data_type::f32, data_type::f16)
+                && attr->mayiconvert(data_type::f32, data_type::f16)
                 && get_supported_fma_kind(
                            hw, data_type::f16, data_type::f16, data_type::f32)
                         != fma_kind_t::undef) {
             a_data_type = data_type::f16;
             b_data_type = data_type::f16;
-        } else if (attr->mayidownconvert(data_type::f32, data_type::tf32)
+        } else if (attr->mayiconvert(data_type::f32, data_type::tf32)
                 && get_supported_fma_kind(
                            hw, data_type::tf32, data_type::tf32, data_type::f32)
                         != fma_kind_t::undef) {
@@ -210,7 +230,8 @@ status_t conv_problem_t::init_acc_data_type() {
             && utils::one_of(b, data_type::s8, data_type::u8)) {
         acc_data_type = data_type::s32;
     } else if (utils::everyone_is(data_type::f16, a, b)
-            || utils::everyone_is(data_type::bf16, a, b)) {
+            || utils::everyone_is(data_type::bf16, a, b)
+            || utils::everyone_is(data_type::f8_e5m2, a, b)) {
         acc_data_type = data_type::f32;
     } else if (utils::everyone_is(data_type::tf32, a, b)) {
         acc_data_type = data_type::f32;
@@ -247,7 +268,7 @@ void conv_problem_t::init_transpose(const hw_t &hw) {
                         || fpmath_mode == dnnl_fpmath_mode_tf32)
                     && osp % 8 == 0);
     bool allow_bwd_d
-            = !is_bwd_d || (a_data_type == data_type::f32 && osp == isp);
+            = !is_bwd_d || (wei_data_type == data_type::f32 && osp == isp);
     bool allow_fwd = !is_fwd
             || (dst_data_type != data_type::f32
                     && dst_data_type != data_type::f64 && mb <= 8 && ih != iw
@@ -258,8 +279,7 @@ void conv_problem_t::init_transpose(const hw_t &hw) {
             = gpu_utils::dev_getenv("ab_swap_transpose", ab_swap_transpose);
 }
 
-prb_dim_t to_gemm(const prb_dim_t &d, const conv_problem_t &prb) {
-    const auto prop = prb.prop_kind();
+prb_dim_t to_gemm(const prb_dim_t &d, prop_kind_t prop, bool is_transpose) {
     const bool is_fwd = (prop == prop_kind::forward);
     const bool is_bwd_d = (prop == prop_kind::backward_data);
     const bool is_bwd_w = (prop == prop_kind::backward_weights);
@@ -272,7 +292,7 @@ prb_dim_t to_gemm(const prb_dim_t &d, const conv_problem_t &prb) {
     };
     auto pick = [&](const prb_dim_t &fwd, const prb_dim_t &bwd_d,
                         const prb_dim_t &bwd_w) {
-        if (prb.ab_swap_transpose) {
+        if (is_transpose) {
             if (is_fwd) return transpose_gemm(fwd);
             if (is_bwd_d) return transpose_gemm(bwd_d);
             if (is_bwd_w) return transpose_gemm(bwd_w);
@@ -307,14 +327,14 @@ prb_dim_t to_gemm(const prb_dim_t &d, const conv_problem_t &prb) {
     }
 }
 
-prb_tile_t to_gemm(const prb_tile_t &t, const conv_problem_t &prb) {
+prb_tile_t to_gemm(const prb_tile_t &t, prop_kind_t prop, bool is_transpose) {
     prb_tile_t ret;
     ret[prb_dims::b] = 1;
     ret[prb_dims::m] = 1;
     ret[prb_dims::n] = 1;
     ret[prb_dims::k] = 1;
     for (auto &d : t) {
-        auto gemm_d = to_gemm(d, prb);
+        auto gemm_d = to_gemm(d, prop, is_transpose);
         if (gemm_d.is_undef()) continue;
         ret[gemm_d] *= t[d];
     }

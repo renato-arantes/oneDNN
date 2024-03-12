@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2020-2023 Intel Corporation
+* Copyright 2020-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -379,8 +379,7 @@ void jit_avx512_core_amx_1x1_fwd_kernel_t::store_output_vectors_int8(
                 zmm_zero, zmm_saturation, aux_reg_saturation, f32, jcp.dst_dt);
         for (int j = 0; j < jcp.tile_width; j++) {
             const Zmm zmm_r = zmm_out(j);
-            saturate_f32(zmm_r, zmm_zero, zmm_saturation, jcp.dst_dt);
-            vcvtps2dq(zmm_r, zmm_r);
+            saturate_cvt_f32(zmm_r, zmm_zero, zmm_saturation, jcp.dst_dt);
         }
     }
 
@@ -466,8 +465,7 @@ void jit_avx512_core_amx_1x1_fwd_kernel_t::store_output_vector_int8(
     if (one_of(jcp.dst_dt, u8, s8, s32)) {
         init_saturate_f32(
                 zmm_zero, zmm_saturation, aux_reg_saturation, f32, jcp.dst_dt);
-        saturate_f32(zmm_out, zmm_zero, zmm_saturation, jcp.dst_dt);
-        vcvtps2dq(zmm_out, zmm_out);
+        saturate_cvt_f32(zmm_out, zmm_zero, zmm_saturation, jcp.dst_dt);
     }
 
     const Zmm zmm_out_store = zmm_mask(zmm_out, mask_flag, true);
@@ -1205,10 +1203,10 @@ status_t jit_avx512_core_amx_1x1_fwd_kernel_t::init_conf(jit_conv_conf_t &jcp,
     jcp.nb_oc_blocking = (jcp.nb_oc % 2 == 0) ? 2 : 1;
     jcp.nb_ic_blocking = 1;
     jcp.nb_os_blocking = (os / jcp.tile_width > 2) ? 2 : 1;
-    jcp.nb_os2_blocking = (jcp.nb_os_blocking > 1)
-            ? ((jcp.nb_os_blocking * jcp.tile_width) % 2 == 0) ? 2 : 1
-            : 1;
     jcp.nb_os = os / jcp.tile_width;
+    jcp.nb_os2_blocking = (jcp.nb_os_blocking > 1)
+            ? (jcp.nb_os % jcp.nb_os_blocking == 0) ? 2 : 1
+            : 1;
 
     jcp.wsp_buffer_size = (size_t)2 * jcp.nb_os_blocking * jcp.nb_oc_blocking
             * jcp.max_width * jcp.oc_block;

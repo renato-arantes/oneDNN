@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2016-2023 Intel Corporation
+* Copyright 2016-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -56,7 +56,7 @@ template <typename Vmm>
 _jit_avx512_core_x8s8s32x_fwd_kernel<Vmm>::_jit_avx512_core_x8s8s32x_fwd_kernel(
         const jit_conv_conf_t &ajcp, const primitive_attr_t &attr,
         const memory_desc_t &dst_md)
-    : jit_generator(jit_name())
+    : jit_generator(jit_name(), nullptr, MAX_CODE_SIZE, true, ajcp.isa)
     , jcp(ajcp)
     , attr_(attr)
     , postops_injector_(nullptr) {
@@ -65,10 +65,13 @@ _jit_avx512_core_x8s8s32x_fwd_kernel<Vmm>::_jit_avx512_core_x8s8s32x_fwd_kernel(
         static constexpr bool preserve_gpr = true;
         static constexpr bool preserve_vmm = false;
         static constexpr size_t helper_vmm_idx = 31;
-        const size_t oc_block_tail = jcp.oc_block % isa_simd_width_;
-        const size_t tail_size = oc_block_tail
-                ? oc_block_tail
-                : jcp.oc_without_padding % isa_simd_width_;
+        const size_t block_tail
+                = (jcp.is_depthwise ? jcp.ch_block : jcp.oc_block)
+                % isa_simd_width_;
+        const size_t tail_size = block_tail
+                ? block_tail
+                : (jcp.is_depthwise ? jcp.ngroups : jcp.oc_without_padding)
+                        % isa_simd_width_;
         static constexpr bool use_exact_tail_scalar_bcast = false;
 
         const rhs_arg_static_params_t rhs_arg_static_params {helper_vmm_idx,
@@ -348,8 +351,7 @@ void _jit_avx512_core_x8s8s32x_fwd_kernel<Vmm>::store_output(
         for (int k = 0; k < nb_oc_block; k++) {
             for (int j = 0; j < ur_w; j++) {
                 Vmm vmm = vmm_out(j, k);
-                saturate_f32(vmm, vmm_zero, vmm_saturation, jcp.dst_dt);
-                vcvtps2dq(vmm, vmm);
+                saturate_cvt_f32(vmm, vmm_zero, vmm_saturation, jcp.dst_dt);
             }
         }
     }
@@ -1426,8 +1428,16 @@ status_t jit_avx512_core_x8s8s32x_fwd_kernel::init_conf(jit_conv_conf_t &jcp,
     jcp.is_depthwise = true && with_groups && everyone_is(1, jcp.ic, jcp.oc);
 
     // Used for bfloat16 output
-    jcp.isa = mayiuse(avx512_core_bf16) ? avx512_core_bf16
-                                        : bf16_emulation_t::get_isa();
+    jcp.isa = mayiuse(avx512_core_vnni) ? avx512_core_vnni : avx512_core;
+    if (dst_d.data_type() == bf16) {
+        if (mayiuse(avx512_core_bf16)) {
+            jcp.isa = avx512_core_bf16;
+        } else {
+            const auto bf16_emulation_isa = bf16_emulation_t::get_isa();
+            if (!is_superset(jcp.isa, bf16_emulation_isa))
+                return status::unimplemented;
+        }
+    }
 
     if (jcp.is_depthwise && is_3d)
         // NOTE: 3D depthwise is not currently supported here.
