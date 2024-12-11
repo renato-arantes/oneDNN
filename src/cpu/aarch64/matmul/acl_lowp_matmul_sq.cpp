@@ -156,7 +156,6 @@ status_t acl_lowp_matmul_sq_t::pd_t::init_scratchpad(engine_t *engine,
     // the current bias vector is f32 we need to convert.
     if (almc_.with_bias) {
         const memory_desc_wrapper bias_d(&bias_md_);
-        // printf("*** init_scratchpad: bias_data_type=%d\n", bias_md_.data_type);
         scratchpad.book(memory_tracking::names::key_conv_bias_s32_convert,
                 bias_d.nelems(), bias_d.data_type_size());
     }
@@ -229,8 +228,10 @@ status_t acl_lowp_matmul_sq_t::execute(const exec_ctx_t &ctx) const {
             arm_compute::QuantizationInfo(
                     1.0 / (*dst_scale), dst_zero_point, true));
 
+    // The two calls below are stateful and, therefore, not fully thread-safe.
+    // This issue is being addressed, and the lock will be removed when the
+    // matmul stateless work is finished.
     acl_obj.gemm.update_quantization_parameters();
-
     acl_obj.gemm.run();
 
     // free() here tells ACL it can no longer use it, it does not deallocate
