@@ -199,6 +199,7 @@ public:
     gpu_arch_t gpu_arch() const { return gpu_arch_; }
     int gpu_product_family() const { return gpu_product_family_; }
     int stepping_id() const { return stepping_id_; }
+    uint64_t native_extensions() const { return native_extensions_; }
     bool is_integrated() const;
     uint32_t ip_version() const { return ip_version_; }
     int max_eus_per_wg() const { return max_eus_per_wg_; }
@@ -234,9 +235,6 @@ public:
     const std::string &name() const { return name_; }
 
     bool mayiuse_ngen_kernels() const { return mayiuse_ngen_kernels_; }
-
-    /// Returns true if the OpenCL compiler supports microkernels.
-    bool mayiuse_microkernels() const { return mayiuse_microkernels_; }
 
     bool mayiuse_systolic() const { return mayiuse_systolic_; }
 
@@ -285,7 +283,6 @@ protected:
     bool mayiuse_systolic_ = false;
     bool mayiuse_ngen_kernels_ = false;
     bool mayiuse_system_memory_allocators_ = false;
-    bool mayiuse_microkernels_ = false;
 
     std::string name_;
     xpu::runtime_version_t runtime_version_;

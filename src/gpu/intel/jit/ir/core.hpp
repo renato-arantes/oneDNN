@@ -159,11 +159,14 @@ struct type_info_t {
 
 // Defines getter for a function argument.
 #define IR_DEFINE_ARG_GET(name, index) \
+    static const expr_t &arg_##name(const func_call_t &c) { \
+        ir_assert(c.func.is<self_type>()) << c; \
+        return c.args[index]; \
+    } \
     static const expr_t &arg_##name(const stmt_t &s) { \
         ir_assert(s.is<func_call_t>()) << s; \
         auto &c = s.as<func_call_t>(); \
-        ir_assert(c.func.is<self_type>()) << s; \
-        return c.args[index]; \
+        return arg_##name(c); \
     } \
     template <typename T> \
     static T &arg_##name(std::vector<T> &args) { \
@@ -412,6 +415,7 @@ public:
 
     // Constructor from dnnl_data_type_t.
     type_t(data_type_t dt) {
+        if (dt == data_type::undef) return;
         elems_ = 1;
         switch ((int)dt) {
 #define CASE(x) \
@@ -453,7 +457,7 @@ public:
     static void init_parse_iface(parse_iface_t<type_t> *iface) {
         iface->add<type_kind_t, &type_t::kind_>();
         iface->set_pre_stringify_func([](const type_t &type) {
-            ir_assert(!type.is_ptr() && type.is_scalar())
+            ir_assert(!type.is_ptr() && (type.is_scalar() || type.is_undef()))
                     << "Cannot stringify pointer/non-scalar type.";
         });
     }

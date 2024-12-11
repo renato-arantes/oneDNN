@@ -23,6 +23,9 @@
 KERNEL_ATTR
 __kernel void gen9_global_pooling_fwd(
         __global DATA_T *src, __global int *ws, __global DST_DATA_T *dst) {
+
+    if (GWS_OVERFLOW) return;
+
     const off_t mb = get_global_id(0) / C;
     const off_t oc = get_global_id(0) % C;
 
@@ -74,7 +77,7 @@ __kernel void gen9_global_pooling_fwd(
     ws[dst_off] = max_idx;
 #endif
 #else
-    dst[dst_off] = TO_DST(dst_val / ID / IH / IW);
+    dst[dst_off] = TO_DST(dst_val / convert_float(ID * IH * IW));
 #endif
 }
 #endif // IS_FWD
@@ -93,6 +96,9 @@ __kernel void gen9_global_pooling_fwd(
 KERNEL_ATTR
 __kernel void gen9_global_pooling_bwd(__global DATA_T *diff_src,
         __global int *ws, __global DATA_T *diff_dst) {
+
+    if (GWS_OVERFLOW) return;
+
     const off_t mb = GWS_GET_MB();
 #if IS_VECTORIZED
     const off_t c = GWS_GET_C() + get_sub_group_local_id();
@@ -109,7 +115,8 @@ __kernel void gen9_global_pooling_bwd(__global DATA_T *diff_src,
 #endif // ALG_AVG
     int ws_val = ws[dst_off];
     for (off_t sp_idx = spatial;
-            sp_idx < min(spatial + SPATIAL_CHUNK, SPATIAL_DIM); sp_idx++) {
+            sp_idx < min(spatial + SPATIAL_CHUNK, (off_t)SPATIAL_DIM);
+            sp_idx++) {
         const off_t iw = sp_idx % IW;
         const off_t ih = ((sp_idx - iw) % (IH * IW)) / IW;
         const off_t id = (sp_idx - iw - ih * IW) / (IH * IW);

@@ -387,6 +387,30 @@ attr_t::dropout_t parse_attr_dropout_func(const std::string &s) {
     return v;
 }
 
+bool parse_impl_filter(impl_filter_t &impl_filter,
+        const impl_filter_t &def_impl_filter, bool use_impl, const char *str,
+        const std::string &option_name, const std::string &help) {
+    const auto chars2chars = [](const char *str) { return str; };
+    const auto str2impl_filter = [&](const char *str) {
+        std::vector<std::string> v, def;
+        parse_vector_str(v, def, chars2chars, str);
+
+        // Remove all quotes from input string since they affect the search.
+        for_(auto &e : v)
+        for (auto c : {'"', '\''}) {
+            size_t start_pos = 0;
+            while (start_pos != eol) {
+                start_pos = e.find_first_of(c, start_pos);
+                if (start_pos != eol) e.erase(start_pos, 1);
+            }
+        }
+
+        return impl_filter_t(v, use_impl);
+    };
+    return parse_single_value_option(impl_filter, def_impl_filter,
+            str2impl_filter, str, option_name, help);
+}
+
 } // namespace parser_utils
 
 // vector types
@@ -649,6 +673,37 @@ bool parse_test_pattern_match(const char *&match, const char *str,
     const auto chars2chars = [](const char *str) { return str; };
     return parse_single_value_option(
             match, def_match, chars2chars, str, option_name, help);
+}
+
+bool parse_impl(impl_filter_t &impl_filter,
+        const impl_filter_t &def_impl_filter, const char *str,
+        const std::string &option_name) {
+    static const std::string help
+            = "STRINGS    (Default: not specified)\n    Instructs the driver "
+              "to fetch the next implementation from the list if fetched "
+              "implementation name doesn't match any from the `STRINGS` list "
+              "(a.k.a. include-list).\n    `STRINGS` is a comma-separated list "
+              "of string literal entries with no spaces.\n    When empty, the "
+              "option has no effect. The option is opposite to "
+              "`--skip-impl`.\n";
+
+    return parser_utils::parse_impl_filter(impl_filter, def_impl_filter,
+            /* use_impl = */ true, str, option_name, help);
+}
+
+bool parse_skip_impl(impl_filter_t &impl_filter,
+        const impl_filter_t &def_impl_filter, const char *str,
+        const std::string &option_name) {
+    static const std::string help
+            = "STRINGS    (Default: not specified)\n    Instructs the driver "
+              "to fetch the next implementation from the list if fetched "
+              "implementation name matches any from the `STRINGS` list (a.k.a. "
+              "exclude-list).\n    `STRINGS` is a comma-separated list of "
+              "string literal entries with no spaces.\n    When empty, the "
+              "option has no effect. The option is opposite to `--impl`.\n";
+
+    return parser_utils::parse_impl_filter(impl_filter, def_impl_filter,
+            /* use_impl = */ false, str, option_name, help);
 }
 
 bool parse_inplace(std::vector<bool> &inplace,
@@ -959,6 +1014,28 @@ static bool parse_fast_ref(
     return parsed;
 }
 
+static bool parse_global_impl(
+        const char *str, const std::string &option_name = "global-impl") {
+    static const std::string help
+            = "STRINGS    (Default: not specified)\n    Same as `--impl` but "
+              "overrides any values from `--impl` or `--skip-impl` options met "
+              "on the way\n.";
+
+    return parser_utils::parse_impl_filter(global_impl_filter, impl_filter_t(),
+            /* use_impl = */ true, str, option_name, help);
+}
+
+static bool parse_global_skip_impl(
+        const char *str, const std::string &option_name = "global-skip-impl") {
+    static const std::string help
+            = "STRINGS    (Default: not specified)\n    Same as `--skip-impl` "
+              "but overrides any values from `--impl` or `--skip-impl` options "
+              "met on the way\n.";
+
+    return parser_utils::parse_impl_filter(global_impl_filter, impl_filter_t(),
+            /* use_impl = */ false, str, option_name, help);
+}
+
 // TODO: remove
 static bool parse_fast_ref_gpu(
         const char *str, const std::string &option_name = "fast-ref-gpu") {
@@ -1180,7 +1257,10 @@ static bool parse_mode(
                 case 'i':
                 case 'I': mode = bench_mode_t::init; break;
                 case 'r':
-                case 'R': mode = bench_mode_t::exec; break;
+                case 'R':
+                    mode = bench_mode_t::exec;
+                    bench_mode_modifier |= mode_modifier_t::no_ref_memory;
+                    break;
                 case 'c':
                 case 'C': mode = bench_mode_t::corr; break;
                 case 'p':
@@ -1189,8 +1269,8 @@ static bool parse_mode(
                 case 'F':
                     mode = bench_mode_t::perf_fast;
                     max_ms_per_prb = 10;
-                    bench_mode_modifier = mode_modifier_t::par_create
-                            | mode_modifier_t::no_host_memory;
+                    bench_mode_modifier |= mode_modifier_t::par_create
+                            | mode_modifier_t::no_ref_memory;
                     break;
                 case 'b':
                 case 'B': mode = bench_mode_t::bitwise; break;
@@ -1218,21 +1298,20 @@ static bool parse_mode_modifier(
               "          The flow will create as many primitives in parallel \n"
               "          as number of threads identified on the system \n"
               "          first, then execute them one by one.\n"
-              "    * `M` to disable usage of host memory.\n"
+              "    * `M` to disable usage of reference memory.\n"
               "          It removes any overheads for mapping, unmapping and \n"
               "          reorders used in filling functions (disabled).\n"
-              "          Applicable for performance mode and GPU engine only.\n"
               "    More details at "
             + doc_url + "benchdnn_general_info.md\n";
 
     const auto str2mode_modifier = [](const std::string &_str) {
-        mode_modifier_t modifier = default_bench_mode_modifier;
+        mode_modifier_t modifier = bench_mode_modifier;
         for (auto s : _str) {
             switch (s) {
                 case 'p':
                 case 'P': modifier |= mode_modifier_t::par_create; break;
                 case 'm':
-                case 'M': modifier |= mode_modifier_t::no_host_memory; break;
+                case 'M': modifier |= mode_modifier_t::no_ref_memory; break;
                 default:
                     BENCHDNN_PRINT(0, "%s\n%s",
                             "Error: modifier value is invalid.", help.c_str());
@@ -1246,30 +1325,6 @@ static bool parse_mode_modifier(
     return parse_single_value_option(bench_mode_modifier,
             default_bench_mode_modifier, str2mode_modifier, str, option_name,
             help);
-}
-
-static bool parse_skip_impl(
-        const char *str, const std::string &option_name = "skip-impl") {
-    static const std::string help
-            = "STRING    (Default: not specified)\n    Instructs the driver to "
-              "iterate over implementations when fetched implementation name "
-              "matching `STRING`.\n    `STRING` is a string literal with no "
-              "spaces.\n    When empty, option has no effect.\n";
-    const auto chars2chars = [](const char *str) { return str; };
-    bool parsed = parse_single_value_option(
-            skip_impl, std::string(), chars2chars, str, option_name, help);
-
-    // Remove all quotes from input string since they affect the search.
-    if (parsed) {
-        for (auto c : {'"', '\''}) {
-            size_t start_pos = 0;
-            while (start_pos != eol) {
-                start_pos = skip_impl.find_first_of(c, start_pos);
-                if (start_pos != eol) skip_impl.erase(start_pos, 1);
-            }
-        }
-    }
-    return parsed;
 }
 
 static bool parse_start(
@@ -1342,11 +1397,12 @@ bool parse_bench_settings(const char *str) {
             || parse_check_ref_impl(str) || parse_cold_cache(str)
             || parse_cpu_isa_hints(str) || parse_engine(str)
             || parse_fast_ref(str) || parse_fast_ref_gpu(str)
-            || parse_fix_times_per_prb(str) || parse_max_ms_per_prb(str)
+            || parse_fix_times_per_prb(str) || parse_global_impl(str)
+            || parse_global_skip_impl(str) || parse_max_ms_per_prb(str)
             || parse_num_streams(str) || parse_repeats_per_prb(str)
             || parse_mem_check(str) || parse_memory_kind(str) || parse_mode(str)
-            || parse_mode_modifier(str) || parse_skip_impl(str)
-            || parse_start(str) || parse_stream_kind(str) || parse_verbose(str);
+            || parse_mode_modifier(str) || parse_start(str)
+            || parse_stream_kind(str) || parse_verbose(str);
 
     // Last condition makes this help message to be triggered once driver_name
     // is already known.

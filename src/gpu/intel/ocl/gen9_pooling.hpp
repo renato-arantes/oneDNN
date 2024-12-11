@@ -33,9 +33,7 @@ namespace ocl {
 struct gen9_pooling_fwd_t : public gpu_primitive_t {
     using gpu_primitive_t::gpu_primitive_t;
     struct pd_t : public gpu_pooling_fwd_pd_t {
-        pd_t(const pooling_desc_t *adesc, const primitive_attr_t *attr,
-                const pooling_fwd_pd_t *hint_fwd_pd)
-            : gpu_pooling_fwd_pd_t(adesc, attr, hint_fwd_pd) {}
+        using gpu_pooling_fwd_pd_t::gpu_pooling_fwd_pd_t;
 
         DECLARE_COMMON_PD_T("ocl:gen9", gen9_pooling_fwd_t);
 
@@ -93,8 +91,7 @@ struct gen9_pooling_fwd_t : public gpu_primitive_t {
             if (desc()->alg_kind == pooling_max && is_training)
                 init_default_ws(s32);
 
-            VDISPATCH_POOLING_SC(init_conf(engine),
-                    VERBOSE_PRIMITIVE_CREATION_FAIL, "pooling");
+            CHECK(init_conf(engine));
 
             // Required for storing spatial offsets into workspace for
             // pooling_max training.
@@ -135,9 +132,7 @@ private:
 struct gen9_pooling_bwd_t : public gpu_primitive_t {
     using gpu_primitive_t::gpu_primitive_t;
     struct pd_t : public gpu_pooling_bwd_pd_t {
-        pd_t(const pooling_desc_t *adesc, const primitive_attr_t *attr,
-                const pooling_fwd_pd_t *hint_fwd_pd)
-            : gpu_pooling_bwd_pd_t(adesc, attr, hint_fwd_pd) {}
+        using gpu_pooling_bwd_pd_t::gpu_pooling_bwd_pd_t;
 
         DECLARE_COMMON_PD_T("ocl:gen9:any", gen9_pooling_bwd_t);
 
@@ -190,8 +185,7 @@ struct gen9_pooling_bwd_t : public gpu_primitive_t {
                         compare_ws(hint_fwd_pd_), VERBOSE_WS_MISMATCH);
             }
 
-            VDISPATCH_POOLING_SC(init_conf(engine),
-                    VERBOSE_PRIMITIVE_CREATION_FAIL, "pooling");
+            CHECK(init_conf(engine));
 
             // Required for storing spatial offsets into workspace for
             // pooling_max training due to use of int type.

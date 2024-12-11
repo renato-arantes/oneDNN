@@ -21,11 +21,11 @@
 #include <typeindex>
 #include <type_traits>
 
-#include "c_types_map.hpp"
-#include "engine_id.hpp"
-#include "oneapi/dnnl/dnnl.h"
-#include "primitive_attr.hpp"
-#include "type_helpers.hpp"
+#include "common/c_types_map.hpp"
+#include "common/engine_id.hpp"
+#include "common/primitive_attr.hpp"
+#include "common/type_helpers.hpp"
+#include "common/verbose.hpp"
 
 namespace dnnl {
 namespace impl {
@@ -59,11 +59,6 @@ struct key_t {
     engine_id_t engine_id_;
 
 private:
-    template <typename desc_t>
-    static const desc_t &cast_to_desc(const void *p) {
-        return *(reinterpret_cast<const desc_t *>(p));
-    }
-
     static primitive_kind_t get_pkind(primitive_kind_t pkind);
 
     // Thread ID is not used as part of the key, it's only used to get
@@ -153,11 +148,19 @@ struct hash<dnnl::impl::primitive_hashing::key_t> {
         seed = hash_combine(seed, hash_combine(0, key.skip_idx_));
 
         seed = hash_combine(seed, key.engine_id_.hash());
+
+        seed = get_array_hash(
+                seed, key.hint_mds_.data(), (int)key.hint_mds_.size());
+
+        const result_type verb_seed_before_desc = seed;
+        UNUSED(verb_seed_before_desc);
+
         // Combine hash for op_desc with the computed hash
 #define CASE(pkind) \
     case primitive_kind::pkind: \
-        seed = hash_combine( \
-                seed, get_desc_hash(*(pkind##_desc_t *)key.op_desc_)); \
+        seed = hash_combine(seed, \
+                get_desc_hash( \
+                        *op_desc_t::to_desc<pkind##_desc_t>(key.op_desc_))); \
         break;
 
         // clang-format off
@@ -189,8 +192,13 @@ struct hash<dnnl::impl::primitive_hashing::key_t> {
         }
             // clang-format on
 #undef CASE
-        seed = get_array_hash(
-                seed, key.hint_mds_.data(), (int)key.hint_mds_.size());
+
+        // Note: `16` is just a random number, as debuginfo hasn't received a
+        // single command center for levels across layers of the library.
+        // ANCHOR: HASHING_DEBUGINFO_16.
+        VDEBUGINFO(16, primitive, hashing,
+                "operator(),seed_before_desc=%zu seed_after_desc=%zu",
+                verb_seed_before_desc, seed);
 
         return seed;
     }

@@ -36,7 +36,9 @@ namespace aarch64 {
 template <cpu_isa_t isa, data_type_t src_type, data_type_t dst_type = src_type>
 struct jit_uni_dw_convolution_fwd_t : public primitive_t {
     struct pd_t : public cpu_convolution_fwd_pd_t {
-        pd_t(const convolution_desc_t *adesc, const primitive_attr_t *attr,
+        // Note: check `USING_INHERITED_IS_IMPOSSIBLE` comment in other files
+        // for details why this ctor can't be removed.
+        pd_t(const op_desc_t *adesc, const primitive_attr_t *attr,
                 const typename pd_t::base_class *hint_fwd_pd)
             : cpu_convolution_fwd_pd_t(adesc, attr, hint_fwd_pd), jcp_() {}
 
@@ -69,7 +71,7 @@ struct jit_uni_dw_convolution_fwd_t : public primitive_t {
             return status::success;
         }
 
-        jit_conv_conf_t jcp_;
+        jit_conv_conf_t jcp_ = utils::zero<decltype(jcp_)>();
     };
 
     jit_uni_dw_convolution_fwd_t(const pd_t *apd) : primitive_t(apd) {}
@@ -105,9 +107,7 @@ template <cpu_isa_t isa, data_type_t diff_dst_type,
         data_type_t diff_src_type = diff_dst_type>
 struct jit_uni_dw_convolution_bwd_data_t : public primitive_t {
     struct pd_t : public cpu_convolution_bwd_data_pd_t {
-        pd_t(const convolution_desc_t *adesc, const primitive_attr_t *attr,
-                const convolution_fwd_pd_t *hint_fwd_pd)
-            : cpu_convolution_bwd_data_pd_t(adesc, attr, hint_fwd_pd), jcp_() {}
+        using cpu_convolution_bwd_data_pd_t::cpu_convolution_bwd_data_pd_t;
 
         DECLARE_COMMON_PD_T(JIT_IMPL_NAME_HELPER("jit_dw:", jcp_.isa, ""),
                 jit_uni_dw_convolution_bwd_data_t);
@@ -134,7 +134,7 @@ struct jit_uni_dw_convolution_bwd_data_t : public primitive_t {
             return status::success;
         }
 
-        jit_conv_conf_t jcp_;
+        jit_conv_conf_t jcp_ = utils::zero<decltype(jcp_)>();
 
     protected:
         bool set_default_formats() {
@@ -191,10 +191,9 @@ template <cpu_isa_t isa, data_type_t src_type,
         data_type_t diff_weights_type = src_type>
 struct jit_uni_dw_convolution_bwd_weights_t : public primitive_t {
     struct pd_t : public cpu_convolution_bwd_weights_pd_t {
-        pd_t(const convolution_desc_t *adesc, const primitive_attr_t *attr,
-                const convolution_fwd_pd_t *hint_fwd_pd)
-            : cpu_convolution_bwd_weights_pd_t(adesc, attr, hint_fwd_pd)
-            , jcp_() {}
+        using cpu_convolution_bwd_weights_pd_t::
+                cpu_convolution_bwd_weights_pd_t;
+
         using jit_uni_dw_convolution_bwd_weights
                 = jit_uni_dw_convolution_bwd_weights_t<isa, src_type,
                         diff_weights_type>;
@@ -229,7 +228,7 @@ struct jit_uni_dw_convolution_bwd_weights_t : public primitive_t {
             return status::success;
         }
 
-        jit_conv_conf_t jcp_;
+        jit_conv_conf_t jcp_ = utils::zero<decltype(jcp_)>();
 
     protected:
         bool set_default_formats() {

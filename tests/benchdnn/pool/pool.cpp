@@ -219,12 +219,19 @@ std::vector<int> supported_exec_args(dir_t dir) {
             DNNL_ARG_WORKSPACE,
     };
     static const std::vector<int> exec_bwd_args = {
+            DNNL_ARG_DIFF_DST,
+            DNNL_ARG_DIFF_SRC,
+            DNNL_ARG_WORKSPACE,
+    };
+    static const std::vector<int> exec_bwd_args_graph = {
             DNNL_ARG_SRC, // For Graph to compute ws on backward
             DNNL_ARG_DIFF_DST,
             DNNL_ARG_DIFF_SRC,
             DNNL_ARG_WORKSPACE,
     };
-    return (dir & FLAG_FWD) ? exec_fwd_args : exec_bwd_args;
+    return (dir & FLAG_FWD)            ? exec_fwd_args
+            : (driver_name == "graph") ? exec_bwd_args_graph
+                                       : exec_bwd_args;
 };
 
 fill_cfg_t binary_po_fill_cfg(
@@ -250,7 +257,7 @@ fill_cfg_t binary_po_fill_cfg(
 int init_ref_memory_args(dnn_mem_map_t &ref_mem_map, dnn_mem_map_t &mem_map,
         dnnl_primitive_t prim, const prb_t *prb, res_t *res,
         dnnl_primitive_t prim_ref) {
-    if (has_bench_mode_modifier(mode_modifier_t::no_host_memory)) return OK;
+    if (has_bench_mode_modifier(mode_modifier_t::no_ref_memory)) return OK;
 
     const auto &ref_engine = get_cpu_engine();
 

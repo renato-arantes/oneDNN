@@ -228,6 +228,7 @@ status_t gen_gemm_kernel_desc_t::finalize(const char *tags) {
     }
 #endif
 
+    strategy_.relaxedAccumulation |= relaxed_acc_;
     strategy_.systolicAvailable &= !disable_systolic_;
     try {
         strategy_.preflight(hw_, problem_);
@@ -373,14 +374,15 @@ status_t gen_gemm_nocopy_kernel_desc_t::select_kernel(compute::gpu_arch_t arch,
     k_ = k;
     eu_count_ = eu_count;
     disable_systolic_ = !has_systolic;
+    relaxed_acc_ = mode & mode_relaxed_acc;
 
     align_a = nstl::max(align_a, int(types::data_type_size(a_type)));
     align_b = nstl::max(align_b, int(types::data_type_size(b_type)));
     align_c = nstl::max(align_c, int(types::data_type_size(c_type)));
 
-    bool can_2d_a = (lda * problem_.Ta <= 16777216);
-    bool can_2d_b = (ldb * problem_.Tb <= 16777216);
-    bool can_2d_c = (ldc * problem_.Tc <= 16777216);
+    bool can_2d_a = (lda * problem_.Ta_ext <= 16777216);
+    bool can_2d_b = (ldb * problem_.Tb_ext <= 16777216);
+    bool can_2d_c = (ldc * problem_.Tc_ext <= 16777216);
 
     // Xe2 requires stronger alignment for block 2D.
     if (arch == compute::gpu_arch_t::xe2 || arch == compute::gpu_arch_t::xe3) {
@@ -486,102 +488,73 @@ status_t gen_gemm_nocopy_kernel_desc_t::select_kernel(compute::gpu_arch_t arch,
     problem_.cStochasticRound = dst_sround;
 
     // Select a kernel from the catalog.
-    MatchParams match_params[4];
-    int npatterns = 1;
+    std::vector<MatchParams> match_params;
+    MatchParams base(hw_, has_systolic, is_integrated, problem_);
 
-    match_params[0] = MatchParams(hw_, has_systolic, is_integrated, problem_);
+    base.sizes.m = m;
+    base.sizes.n = n;
+    base.sizes.k = k;
+    base.sizes.batch = batch;
+    base.stepping = stepping;
 
-    match_params[0].sizes.m = m;
-    match_params[0].sizes.n = n;
-    match_params[0].sizes.k = k;
-    match_params[0].sizes.batch = batch;
-    match_params[0].stepping = stepping;
-
-    auto tags = const_cast<char *>(match_params[0].tags);
+    auto tags = const_cast<char *>(base.tags);
     while (*tags)
         tags++;
     if (can_2d_a) *tags++ = kcatalog::ReqBlock2DA;
     if (can_2d_b) *tags++ = kcatalog::ReqBlock2DB;
     if (can_2d_c) *tags++ = kcatalog::ReqBlock2DC;
 
+    match_params.push_back(base);
+
     bool fpmath_tf32 = mode & mode_tf32;
     bool fpmath_bf16 = mode & mode_bf16x1;
     bool fpmath_f16 = mode & mode_f16x1;
 
-    if (fpmath_tf32
-            && utils::everyone_is(Type::f32, problem_.Ta, problem_.Tb)) {
-        match_params[npatterns] = match_params[0];
-        match_params[npatterns].selector.precisions[0] = "T";
-        match_params[npatterns].selector.precisions[1] = "T";
-        npatterns++;
-    }
-
-    if (fpmath_bf16
-            && utils::everyone_is(Type::f32, problem_.Ta, problem_.Tb)) {
-        match_params[npatterns] = match_params[0];
-        match_params[npatterns].selector.precisions[0] = "[SB]";
-        match_params[npatterns].selector.precisions[1] = "[SB]";
-        npatterns++;
-    } else if (fpmath_bf16
-            && (utils::one_of(Type::f32, problem_.Ta, problem_.Tb)
-                    || (problem_.Ta.isF8() || problem_.Tb.isF8()))
-            && (problem_.Ta.isInteger() || problem_.Tb.isInteger())) {
-        if (problem_.Ta.isInt8() || problem_.Ta.isInt4()) {
-            match_params[npatterns] = match_params[0];
-            match_params[npatterns].selector.precisions[0]
-                    = match_params[0].selector.precisions[0];
-            match_params[npatterns].selector.precisions[1] = "B";
-            npatterns++;
-        } else {
-            match_params[npatterns] = match_params[0];
-            match_params[npatterns].selector.precisions[0] = "B";
-            match_params[npatterns].selector.precisions[1]
-                    = match_params[0].selector.precisions[1];
-            npatterns++;
+    auto add_mode_matches = [&](bool has_mode, const char *(*match)(Type)) {
+        if (!has_mode) return;
+        auto &def = base.selector.precisions;
+        if (match(problem_.Ta)) {
+            match_params.push_back(base);
+            match_params.back().selector.precisions[0] = match(problem_.Ta);
+            match_params.back().selector.precisions[1] = def[1];
         }
-    }
-
-    if (fpmath_f16 && utils::everyone_is(Type::f32, problem_.Ta, problem_.Tb)) {
-        match_params[npatterns] = match_params[0];
-        match_params[npatterns].selector.precisions[0] = "[SH]";
-        match_params[npatterns].selector.precisions[1] = "[SH]";
-        npatterns++;
-    }
-
-    if (fpmath_f16
-            && (utils::one_of(Type::f32, problem_.Ta, problem_.Tb)
-                    || (problem_.Ta.isF8() || problem_.Tb.isF8()))
-            && (problem_.Ta.isInteger() || problem_.Tb.isInteger())) {
-        if (problem_.Ta.isInt8() || problem_.Ta.isInt4()) {
-            match_params[npatterns] = match_params[0];
-            match_params[npatterns].selector.precisions[0]
-                    = match_params[0].selector.precisions[0];
-            match_params[npatterns].selector.precisions[1] = "H";
-            npatterns++;
-        } else {
-            match_params[npatterns] = match_params[0];
-            match_params[npatterns].selector.precisions[0] = "H";
-            match_params[npatterns].selector.precisions[1]
-                    = match_params[0].selector.precisions[1];
-            npatterns++;
+        if (match(problem_.Tb)) {
+            match_params.push_back(base);
+            match_params.back().selector.precisions[0] = def[0];
+            match_params.back().selector.precisions[1] = match(problem_.Tb);
         }
-    }
+        if (match(problem_.Ta) && match(problem_.Tb)) {
+            match_params.push_back(base);
+            match_params.back().selector.precisions[0] = match(problem_.Ta);
+            match_params.back().selector.precisions[1] = match(problem_.Tb);
+        }
+    };
 
-    if (problem_.Ta.isInt4() && !(fpmath_f16 || fpmath_bf16)) {
-        match_params[npatterns] = match_params[0];
-        match_params[npatterns].selector.precisions[0] = "[FO]";
-        npatterns++;
-    }
+    add_mode_matches(fpmath_tf32, [](Type dt) -> const char * {
+        if (dt == Type::f32) { return "T"; }
+        return nullptr;
+    });
 
-    if (problem_.Tb.isInt4() && !(fpmath_f16 || fpmath_bf16)) {
-        match_params[npatterns] = match_params[0];
-        match_params[npatterns].selector.precisions[1] = "[FO]";
-        npatterns++;
-    }
+    add_mode_matches(fpmath_bf16, [](Type dt) -> const char * {
+        if (dt == Type::f32) { return "[SB]"; }
+        if (dt.isInt8() || dt.isInt4()) return "[OB]";
+        return nullptr;
+    });
+
+    add_mode_matches(fpmath_f16, [](Type dt) -> const char * {
+        if (dt == Type::f32) { return "[SH]"; }
+        if (dt.isInt8() || dt.isInt4()) return "[OH]";
+        return nullptr;
+    });
+
+    add_mode_matches(!(fpmath_f16 || fpmath_bf16), [](Type dt) -> const char * {
+        if (dt.isInt4()) return "[FO]";
+        return nullptr;
+    });
 
     EvaluateParams eval_params;
 
-    eval_params.sizes = match_params[0].sizes;
+    eval_params.sizes = base.sizes;
     eval_params.alpha = alpha;
     eval_params.beta = beta;
     eval_params.postOps = !problem_.postOps.empty();
@@ -590,8 +563,8 @@ status_t gen_gemm_nocopy_kernel_desc_t::select_kernel(compute::gpu_arch_t arch,
     eval_params.batch = (batch_dims > 0);
     eval_params.deterministic = (mode & mode_deterministic);
 
-    entry_ = select(
-            gemm_catalog, npatterns, match_params, eval_params, aux_params_);
+    entry_ = select(gemm_catalog, static_cast<int>(match_params.size()),
+            match_params.data(), eval_params, aux_params_);
 
     if (!entry_) return status::unimplemented;
 

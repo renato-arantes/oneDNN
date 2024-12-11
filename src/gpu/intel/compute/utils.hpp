@@ -70,11 +70,13 @@ public:
     }
 
     size_t &operator[](size_t idx) {
-        assert(idx < ndims_);
+        gpu_assert(idx < ndims_) << "range index " << idx
+                                 << " overflows range ndims of " << ndims_;
         return dims_[idx];
     }
     size_t operator[](size_t idx) const {
-        assert(idx < ndims_);
+        gpu_assert(idx < ndims_) << "range index " << idx
+                                 << " overflows range ndims of " << ndims_;
         return dims_[idx];
     }
     size_t ndims() const { return ndims_; }
@@ -94,6 +96,19 @@ public:
     bool operator!=(const range_t &rhs) const { return !operator==(rhs); }
 
     operator bool() const { return ndims_ > 0; }
+
+    std::string str() const {
+        if (ndims_ == 0) return "(nil)";
+
+        std::stringstream oss;
+        oss << "[";
+        for (size_t i = 0; i < ndims(); i++) {
+            if (i > 0) oss << ", ";
+            oss << dims_[i];
+        }
+        oss << "]";
+        return oss.str();
+    }
 
 private:
     size_t ndims_ = 0;
@@ -125,19 +140,10 @@ public:
 
     std::string str() const {
         std::stringstream oss;
-        oss << "gws = [";
-        for (size_t i = 0; i < ndims(); i++) {
-            if (i > 0) oss << ", ";
-            oss << global_range_[i];
-        }
-        oss << "] lws = ";
+        oss << "gws = " << global_range_.str();
+        oss << " lws = ";
         if (local_range_) {
-            oss << "[";
-            for (size_t i = 0; i < ndims(); i++) {
-                if (i > 0) oss << ", ";
-                oss << local_range_[i];
-            }
-            oss << "]";
+            oss << local_range_.str();
         } else {
             oss << "(nil)";
         }

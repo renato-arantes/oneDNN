@@ -330,8 +330,8 @@ int init_prim_ref(benchdnn_dnnl_wrapper_t<dnnl_primitive_t> &prim_ref,
 
     for (const auto &prim_ref_dt_i : prim_ref_dt) {
         prb_t prb_cpu {*prb, prb->dir, prim_ref_dt_i, tag::any, tag::any,
-                tag::any, {vdims_t(STRIDES_SIZE)}, DIRECT, cpu_attr,
-                prb->ctx_init, prb->ctx_exe, prb->mb};
+                tag::any, {vdims_t(STRIDES_SIZE)}, DIRECT, prb->mb, cpu_attr,
+                prb->ctx_init, prb->ctx_exe, prb->impl_filter};
 
         init_pd_args_t<prb_t> init_pd_args(
                 /* res = */ nullptr, get_cpu_engine(), &prb_cpu, prb->dir,
@@ -339,16 +339,19 @@ int init_prim_ref(benchdnn_dnnl_wrapper_t<dnnl_primitive_t> &prim_ref,
         init_pd(init_pd_args);
 
         benchdnn_dnnl_wrapper_t<dnnl_primitive_desc_t> pdw;
-        fetch_impl(pdw, init_pd_args, /* res = */ nullptr,
-                /* is_service_prim = */ true);
+        // `is_service_prim=true` prevents from filtering the implementation
+        // by name which is intended through a `get_prim_ref_impl_filter()`.
+        // As `fetch_impl` doesn't have any further logic related to it, it's
+        // safe to set it to `false`.
+        fetch_impl(pdw, init_pd_args, get_prim_ref_impl_filter(),
+                /* res = */ nullptr,
+                /* is_service_prim = */ false);
 
         // Prim desc wasn't created - try the next set...
         if (!pdw) continue;
-        // Reference impl was fetched - try the next set...
-        if (query_impl_info(pdw) == "ref:any") continue;
 
         auto st = dnnl_primitive_create(&prim_ref_, pdw);
-        // Primitive wan't created - try the next set...
+        // Primitive wasn't created - try the next set...
         if (st != dnnl_success) continue;
 
         BENCHDNN_PRINT(5, "CPU reference oneDNN implementation: %s\n",
@@ -390,9 +393,11 @@ void skip_unimplemented_prb(const prb_t *prb, res_t *res) {
         const bool is_f16_dst = prb->get_dt(DST) == dnnl_f16;
         const bool is_x8x8f16 = is_int8_src && is_int8_wei && is_f16_dst;
         const bool is_wei_zp = !prb->attr.zero_points.is_def(DNNL_ARG_WEIGHTS);
+        const bool is_non_s32_src_zp
+                = prb->attr.zero_points.get(DNNL_ARG_SRC).dt != dnnl_s32;
 
         if (is_f32f32x8 || is_bf16bf16x8 || is_x8x8f16 || !is_valid_f16
-                || is_wei_zp) {
+                || is_wei_zp || is_non_s32_src_zp) {
             res->state = SKIPPED;
             res->reason = skip_reason::case_not_supported;
             return;
@@ -468,7 +473,7 @@ std::vector<int> supported_exec_args(dir_t dir) {
 int init_ref_memory_args(dnn_mem_map_t &ref_mem_map, dnn_mem_map_t &mem_map,
         dnnl_primitive_t prim, const prb_t *prb, res_t *res,
         dnnl_primitive_t prim_ref) {
-    if (has_bench_mode_modifier(mode_modifier_t::no_host_memory)) return OK;
+    if (has_bench_mode_modifier(mode_modifier_t::no_ref_memory)) return OK;
 
     const auto &ref_engine = get_cpu_engine();
 

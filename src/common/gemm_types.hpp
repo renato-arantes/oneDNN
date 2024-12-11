@@ -20,6 +20,7 @@
 #include <assert.h>
 #include "common/c_types_map.hpp"
 #include "common/memory_desc.hpp"
+#include "common/opdesc.hpp"
 
 namespace dnnl {
 namespace impl {
@@ -49,20 +50,23 @@ const sum_ab_t sum_none = dnnl_sum_none;
 // A descriptor for a matrix multiplication (gemm) operation. To make the
 // interface consistent, the descriptor represent the GEMM operation in row
 // major.
-struct gemm_desc_t {
-    // The kind of primitive. Used for self identifying the primitive
-    // descriptor. Must be #dnnl_gemm.
-    dnnl_primitive_kind_t primitive_kind;
-    memory_desc_t a_desc;
-    memory_desc_t b_desc;
-    memory_desc_t c_desc;
-    memory_desc_t bias_desc;
+struct gemm_desc_t : public op_desc_t {
+    gemm_desc_t() : op_desc_t(primitive_kind::gemm) {}
+
+    std::unique_ptr<op_desc_t> clone() const override {
+        return utils::make_unique<gemm_desc_t>(*this);
+    }
+
+    memory_desc_t a_desc {};
+    memory_desc_t b_desc {};
+    memory_desc_t c_desc {};
+    memory_desc_t bias_desc {};
     // Type for accumulating A*B.
-    dnnl_data_type_t acc_type;
+    dnnl_data_type_t acc_type {};
     // Sum across k dimension in either A or B tensor
     // and output to sum_ab tensor.
-    sum_ab_t sum_ab;
-    dnnl_data_type_t sum_ab_type;
+    sum_ab_t sum_ab {};
+    dnnl_data_type_t sum_ab_type {};
 
     // These accessors are to be used by the GEMM implementation. Because the
     // GEMM implementation currently assumes column major. These accessors

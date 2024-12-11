@@ -39,10 +39,7 @@ namespace x64 {
 
 struct jit_sse41_1x1_convolution_fwd_t : public primitive_t {
     struct pd_t : public cpu_convolution_fwd_pd_t {
-        using dw_conv_pd_type = jit_sse41_dw_convolution_fwd_t::pd_t;
-        pd_t(const convolution_desc_t *adesc, const primitive_attr_t *attr,
-                const typename pd_t::base_class *hint_fwd_pd)
-            : cpu_convolution_fwd_pd_t(adesc, attr, hint_fwd_pd), jcp_() {}
+        using cpu_convolution_fwd_pd_t::cpu_convolution_fwd_pd_t;
 
         pd_t(const pd_t &other) : cpu_convolution_fwd_pd_t(other) {
             if (copy(other) != status::success) is_initialized_ = false;
@@ -68,6 +65,7 @@ struct jit_sse41_1x1_convolution_fwd_t : public primitive_t {
                     attr_.set_default_formats(dst_md(0)) == status::success,
                     VERBOSE_UNSUPPORTED_POSTOP);
 
+            // TODO: make `init_conf` assign initialized object to `jcp_`
             CHECK(jit_sse41_1x1_conv_kernel_f32::init_conf(jcp_, *desc(),
                     *src_md(), *weights_md(), *dst_md(), *attr(),
                     dnnl_get_max_threads()));
@@ -82,14 +80,14 @@ struct jit_sse41_1x1_convolution_fwd_t : public primitive_t {
 
         const memory_desc_t *dst_md(
                 int index = 0, bool user_input = false) const override {
-            return jcp_.with_dw_conv
+            return dw_conv_pd_ && jcp_.with_dw_conv
                     ? dw_conv_pd_->dst_md(index, user_input)
                     : cpu_convolution_fwd_pd_t::dst_md(index, user_input);
         }
 
         const memory_desc_t *arg_md(
                 int arg, bool user_input = false) const override {
-            if (jcp_.with_dw_conv) {
+            if (dw_conv_pd_ && jcp_.with_dw_conv) {
                 switch (arg) {
                     case DNNL_ARG_ATTR_POST_OP_DW | DNNL_ARG_SRC:
                         return cpu_convolution_fwd_pd_t::dst_md(0, user_input);
@@ -114,7 +112,7 @@ struct jit_sse41_1x1_convolution_fwd_t : public primitive_t {
             return convolution_fwd_pd_t::arg_usage(arg);
         }
 
-        jit_1x1_conv_conf_t jcp_;
+        jit_1x1_conv_conf_t jcp_ = utils::zero<decltype(jcp_)>();
         using dw_pd_t = jit_sse41_dw_convolution_fwd_t::pd_t;
         std::unique_ptr<dw_pd_t> dw_conv_pd_;
 
@@ -197,6 +195,35 @@ struct jit_sse41_1x1_convolution_fwd_t : public primitive_t {
             CHECK(get_depthwise_conv_desc(
                     cd_dw, src_md, attr_1x1, attr_dw, dw_po_index));
 
+            // The code below doesn't work because currently it requires `jcp_`
+            // member which is not available from the common interface. In turn,
+            // this means the common pd creation interface through an iterator
+            // can't be used and a specific convolution implementation's pd is
+            // required here. It restricts the usage of inherited
+            // `convolution_pd_t` constructor.
+            // ANCHOR: USING_INHERITED_IS_IMPOSSIBLE.
+            //
+            // ```cpp
+            // primitive_desc_iterator_t it(
+            //         engine, (op_desc_t *)&cd_dw, &attr_dw, nullptr);
+            // if (!it.is_initialized()) return status::out_of_memory;
+            // while (++it != it.end()) {
+            //     dw_conv_pd_ = *it;
+            //     break;
+            // }
+            // VDISPATCH_CONV_IC(dw_conv_pd_, "dw_conv_pd hasn't been created");
+            // ```
+            //
+            // ```compiler output
+            // error: ‘using element_type = struct dnnl::impl::primitive_desc_t’
+            // {aka ‘struct dnnl::impl::primitive_desc_t’} has no member named
+            // ‘jcp_’
+            // auto &jcp_dw = dw_conv_pd_->jcp_;
+            //                             ^~~~
+            // ```
+            //
+            // TODO: figure out the way to initialize fused conv through a
+            // normal interface without hacks accessing specific members.
             CHECK(safe_ptr_assign(
                     dw_conv_pd_, new dw_pd_t(&cd_dw, &attr_dw, nullptr)));
             CHECK(dw_conv_pd_->init(engine));

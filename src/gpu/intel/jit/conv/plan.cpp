@@ -1280,8 +1280,11 @@ struct fma_context_t {
         if (a_type.is_f16() && b_type.is_f16() && c_type.is_f32()) {
             return layout.retype(type_t::f32()).make_dense();
         }
-        if (layout.type().is_bf8())
-            return layout.make_dense().retype(type_t::f16());
+        if (layout.type().is_fp8()) {
+            auto alt_type = is_b ? a_type : b_type;
+            return layout.make_dense().retype(
+                    alt_type.is_fp8() ? type_t::f16() : alt_type);
+        }
 
         // mad with f16 requires aligned regioning for src1/src2.
         if (a_type.is_f16()) return layout.make_dense();
@@ -1309,7 +1312,7 @@ struct fma_context_t {
         bool is_a = (abc == abc_kind_t::a);
         bool is_b = (abc == abc_kind_t::b);
         auto type = (is_a ? a_type : b_type);
-        int type_size = (layout.type().is_bf8() ? 2 : type.size());
+        int type_size = (layout.type().is_fp8() ? 2 : type.size());
         if (is_dpas) {
             int sdepth = 8;
             int dword_size = 4;
@@ -1334,7 +1337,7 @@ struct fma_context_t {
                     layout_t(type, 0, (int)bmnks.size(), blocks));
             auto abc_layout
                     = mapper.map_from_bmnk(abc, bmnks, fma_layout, layout);
-            if (layout.type().is_bf8()) return abc_layout.retype(type_t::f16());
+            if (layout.type().is_fp8()) return abc_layout.retype(type_t::f16());
             return abc_layout;
         }
 
@@ -2104,7 +2107,7 @@ private:
         auto &src = g2s_load.reg_layout();
         auto &dst = g2s_store.reg_layout();
         reorder = create_reorder_plan(cfg_.hw(), src, dst);
-        if (reduce_mask && !cfg_.prb().deterministic) {
+        if (reduce_mask && cfg_.allow_global_reduction()) {
             *reduce_tile = to_reduce_tensor(abs_thr_tile, reduce_mask.mask);
             auto reduce_layout = to_reduce_layout(src, reduce_mask.mask);
             *reduce = create_reduce_plan(
@@ -2169,7 +2172,7 @@ private:
                 send_address_t::slm, abc, thr_view);
         load = create_send_plan(cfg_.exec_cfg(), thr_view, params);
         layout = load.reg_layout();
-        if (reduce_mask && cfg_.prb().deterministic) {
+        if (reduce_mask && !cfg_.allow_global_reduction()) {
             *reduce_tile = to_reduce_tensor(abs_thr_tile, reduce_mask.mask);
             auto reduce_layout = to_reduce_layout(layout, reduce_mask.mask);
             *reduce = create_reduce_plan(
@@ -2481,8 +2484,9 @@ private:
                 cfg_.zp_cfg().wei_zp_type, 0, std::vector<dim_t> {1, 1});
         view_t zp_wei_view(zp_wei_layout);
 
-        plan.init(cfg_, gemm_schedule_, zp_view, zp_wei_view, x2r.a_layout,
-                x2r.b_layout, fma.c_prb_layout);
+        plan.init(cfg_, x2r.a_load.send_params().hint_2d.enable, gemm_schedule_,
+                zp_view, zp_wei_view, x2r.a_layout, x2r.b_layout,
+                fma.c_prb_layout);
         return plan_status_t::success;
     }
 

@@ -39,6 +39,16 @@ bool sdp_decomp_config_t::initial_check(const std::shared_ptr<subgraph_t> &sg,
     dims wei1_user_dims = ltw(inputs[graph_inport[1]]).vdims();
     num_head_kv = wei1_user_dims[1];
 
+    // Check batch size compatibility.
+    dims wei2_user_dims = ltw(inputs[graph_inport[4]]).vdims();
+    if (batch_size != wei1_user_dims[0] || batch_size != wei2_user_dims[0]) {
+        return false;
+    }
+
+    // Check scale size
+    size_t scale_sz = ltw(inputs[graph_inport[2]]).size();
+    if (scale_sz != 1) return false;
+
 #if DNNL_CPU_RUNTIME == DNNL_RUNTIME_OMP
 // RATIO is an empirical value used to determine the numerical relationship
 // between batch_size, num_head_q and thread number to determine whether to use
@@ -422,9 +432,15 @@ impl::status_t sdp_decomp_config_t::record_input_offset(
                     graph::op_kind::Add, graph::op_kind::Select,
                     graph::op_kind::SoftMax};
     for (const auto &cur_op : sg->get_ops()) {
+        const auto &op_kind = cur_op->get_kind();
+        if (op_kind == graph::op_kind::DynamicDequantize
+                && cur_op->get_attr<std::string>(op_attr::qtype)
+                        == "per_group") {
+            return status::unimplemented;
+        }
         // both mm1 and mm2 are found.
         if (mm1 && mm2) break;
-        if (cur_op->get_kind() != graph::op_kind::MatMul) continue;
+        if (op_kind != graph::op_kind::MatMul) continue;
 
         auto post_op = get_post_op(cur_op);
         if (post_op && post_op_kind.count(post_op->get_kind())) {

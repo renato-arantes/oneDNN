@@ -641,6 +641,7 @@ dnnl_status_t brgemm_kernel_execute_postops_wrapper(const_dnnl_brgemm_t brgemm,
         const bool use_dst_as_acc, const void *src_ptr,
         const void *wei_packed_ptr, const std::vector<dnnl_dim_t> &offsets,
         void *acc_ptr, void *dst_ptr, void *scratchpad_ptr,
+        const_dnnl_ukernel_attr_params_t attr_params,
         const dnnl_stream_t &stream,
         const std::vector<dnnl_exec_arg_t> &dnnl_args) {
 
@@ -650,7 +651,7 @@ dnnl_status_t brgemm_kernel_execute_postops_wrapper(const_dnnl_brgemm_t brgemm,
                 offsets.data(), dst_ptr, scratchpad_ptr);
     } else {
         st = dnnl_brgemm_execute_postops(brgemm, src_ptr, wei_packed_ptr,
-                offsets.data(), acc_ptr, dst_ptr, scratchpad_ptr, nullptr);
+                offsets.data(), acc_ptr, dst_ptr, scratchpad_ptr, attr_params);
     }
     return st;
 }
@@ -887,6 +888,9 @@ void init_memory_args(
 
 int init_ref_memory_args(dnn_mem_map_t &ref_mem_map, dnn_mem_map_t &mem_map,
         const prb_t *prb, const kernel_args_t &kernel_args, res_t *res) {
+
+    if (has_bench_mode_modifier(mode_modifier_t::no_ref_memory)) return OK;
+
     const auto &ref_engine = get_cpu_engine();
 
     // Move cfg out of filling since its creation is not free.
@@ -996,6 +1000,7 @@ int scales_post_processing(dnn_mem_map_t &mem_map) {
         dims_t dims = {16};
         auto new_md = dnn_mem_t::init_md(1, dims.data(), dt, tag::abx);
         dnn_mem_t new_m(new_md, get_test_engine());
+        if (!new_m.is_mapped()) new_m.map();
         for (int64_t i = 0; i < new_m.nelems(); i++) {
             new_m.set_elem(i, val);
         }
@@ -1130,6 +1135,13 @@ int doit(const prb_t *prb, res_t *res) {
     // "Library" args are needed to get dst for comparison.
     // "Reference" are used as usual.
     args_t args(mem_map), ref_args(ref_mem_map);
+
+    // The implementation memory must be mapped to setup point arguments for
+    // brgemm implementation call. This assumes that mapping is effectively a
+    // no-op on the target device.
+    for (auto &kv : mem_map) {
+        if (!kv.second.is_mapped()) kv.second.map();
+    }
 
     const char *src_ptr = (const char *)mem_map.at(DNNL_ARG_SRC);
     const char *wei_ptr = (const char *)mem_map.at(DNNL_ARG_WEIGHTS);
@@ -1278,16 +1290,12 @@ int doit(const prb_t *prb, res_t *res) {
                 post_ops_data, scratchpad_ptr);
     }
 #else // !defined(DNNL_EXPERIMENTAL_UKERNEL)
-    if (prb->use_dst_as_acc()) {
-        DNN_SAFE(dnnl_brgemm_execute(brgemm, src_ptr, wei_packed_ptr,
-                         offsets.data(), dst_ptr, scratchpad_ptr),
-                WARN);
-    } else {
-        DNN_SAFE(dnnl_brgemm_execute_postops(brgemm, src_ptr, wei_packed_ptr,
-                         offsets.data(), acc_ptr, dst_ptr, scratchpad_ptr,
-                         attr_params),
-                WARN);
-    }
+    // `prb->use_dst_as_acc()=true` will make `dst_ptr=acc_ptr` and rest should
+    // be handled by API.
+    DNN_SAFE(dnnl_brgemm_execute_postops(brgemm, src_ptr, wei_packed_ptr,
+                     offsets.data(), acc_ptr, dst_ptr, scratchpad_ptr,
+                     attr_params),
+            WARN);
 #endif
     res->state = EXECUTED;
 
@@ -1305,8 +1313,8 @@ int doit(const prb_t *prb, res_t *res) {
 #else // !defined(DNNL_EXPERIMENTAL_UKERNEL)
     perf_function_t perf_func = std::bind(brgemm_kernel_execute_postops_wrapper,
             kernel_args.brgemm_, prb->use_dst_as_acc(), src_ptr, wei_packed_ptr,
-            offsets, acc_ptr, dst_ptr, scratchpad_ptr, std::placeholders::_1,
-            std::placeholders::_2);
+            offsets, acc_ptr, dst_ptr, scratchpad_ptr, attr_params_ptr,
+            std::placeholders::_1, std::placeholders::_2);
 #endif
 
     measure_perf(prb->ctx_exe, res, perf_func, args);

@@ -55,8 +55,6 @@ public:
 
     template <typename T>
     static status_t init_pd(T *pd, impl::engine_t *engine) {
-        bool enable_conv_v2 = gpu_utils::dev_getenv("enable_conv_v2", false);
-        if (enable_conv_v2) return status::unimplemented;
         try {
             using compute::compute_engine_t;
             auto *compute_engine = utils::downcast<compute_engine_t *>(engine);
@@ -181,10 +179,11 @@ public:
         if (data.zp_pd) zp_dst = layout_t(data.zp_pd->impl()->dst_md(), false);
 
         if (primitive->cache_blob()) {
-            tiler->set_cur_index(primitive->version() - 1);
+            tiler->set_cur_version(primitive->version());
         }
 
         for (int try_iter = 0; try_iter < max_tries; try_iter++) {
+            if (try_iter != 0) tiler->move_next(cfg);
             try {
                 cfg = data.pd_cfg;
                 cfg.set_pd(
@@ -259,7 +258,7 @@ public:
                     if (!tmp_kernels[i]) return status::runtime_error;
                 }
                 ok = true;
-                primitive->set_version(tiler->cur_index());
+                primitive->set_version(tiler->cur_version());
                 kernels_ = std::move(tmp_kernels);
                 break;
             } catch (ngen::out_of_registers_exception &err) {

@@ -75,6 +75,8 @@ Package selectGEMMMicrokernel(GEMMProtocol protocol, HWInformation hwInfo, SizeP
         problem.transpose();
         std::swap(localA, localB);
         std::swap(sizes.m, sizes.n);
+        std::swap(scaleA, scaleB);
+        std::swap(offsetA, offsetB);
         for (auto &req: reqs)
             req.transpose();
     }
@@ -198,11 +200,11 @@ Package selectGEMMMicrokernel(GEMMProtocol protocol, HWInformation hwInfo, SizeP
     interface.newArgument("local_id_m", DataType::d);
     interface.newArgument("local_id_n", DataType::d);
     if (slmPtr)            interface.newArgument("slm_base", ExternalArgumentType::LocalPtr);
-    if (scaleA)            interface.newArgument("a_scale", DataType::d);
-    if (offsetA)           interface.newArgument("a_offset", DataType::d);
+    if (scaleA)            interface.newArgument("a_scale_ptr", ExternalArgumentType::GlobalPtr);
+    if (offsetA)           interface.newArgument("ao_ptr", ExternalArgumentType::GlobalPtr);
     if (scaleA || offsetA) interface.newArgument("ldaq", DataType::d);
-    if (scaleB)            interface.newArgument("b_scale", DataType::d);
-    if (offsetB)           interface.newArgument("b_offset", DataType::d);
+    if (scaleB)            interface.newArgument("b_scale_ptr", ExternalArgumentType::GlobalPtr);
+    if (offsetB)           interface.newArgument("bo_ptr", ExternalArgumentType::GlobalPtr);
     if (scaleB || offsetB) interface.newArgument("ldbq", DataType::d);
 
     /* Update problem from strategy */
@@ -303,6 +305,9 @@ static inline bool getStrategyByHeuristics(HW hw, GEMMStrategy &strategy, bool l
     s.B_prefetch = s.B;
     s.A_prefetch.prefetch = s.B_prefetch.prefetch = true;
 
+    s.AO.newDP = s.A_scale.newDP = true;
+    s.BO.newDP = s.B_scale.newDP = true;
+
     if (!localA && block2DA) {
         if (!isPacked(problem.A.layout))
             s.A_prefetch.accessType = AccessType::Block2D;
@@ -341,8 +346,10 @@ static inline bool getStrategyByHeuristics(HW hw, GEMMStrategy &strategy, bool l
     if (localA && !localB)
         s.loadBFirst = true;
 
-    if (s.slmA || s.slmB)
+    if (s.slmA || s.slmB) {
         s.slmBuffers = 1;
+        s.unrollKSLM = std::max(int(s.slmA) * s.ka_load, int(s.slmB) * s.kb_load);
+    }
 
     adjustStrategy(hw, problem, strategy);
 

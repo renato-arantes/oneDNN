@@ -141,10 +141,9 @@ public:
         std::ostringstream oss;
         oss << (is_dpasw ? "dpasw" : is_dp4a() ? "dp4a" : "dpas");
         if (!is_dp4a()) {
-            oss << "." << sdepth << "x" << rcount;
-        } else {
-            oss << ".x" << exec_size;
+            oss << std::to_string(sdepth) << "x" << std::to_string(rcount);
         }
+        oss << ".x" << std::to_string(exec_size);
         return oss.str();
     }
 
@@ -250,7 +249,8 @@ public:
             const hw_t &hw, const type_t &a, const type_t &b, const type_t &c) {
         int max_size = max_exec_size;
         int max_exec_size_bytes = get_max_exec_size_bytes(hw);
-        int max_type_size = utils::one_of(type_t::bf8(), a, b, c)
+        int max_type_size = (utils::one_of(type_t::bf8(), a, b, c)
+                                    || utils::one_of(type_t::hf8(), a, b, c))
                 ? 2
                 : std::max(a.size(), std::max(b.size(), c.size()));
         return std::min(max_size, max_exec_size_bytes / max_type_size);

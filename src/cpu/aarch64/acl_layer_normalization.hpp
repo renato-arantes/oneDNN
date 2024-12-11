@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2023 Arm Ltd. and affiliates
+* Copyright 2023-2024 Arm Ltd. and affiliates
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -68,11 +68,6 @@ struct acl_layer_normalization_fwd_t : public primitive_t {
     struct pd_t : public cpu_layer_normalization_fwd_pd_t {
         using cpu_layer_normalization_fwd_pd_t::
                 cpu_layer_normalization_fwd_pd_t;
-        pd_t(const layer_normalization_desc_t *adesc,
-                const primitive_attr_t *attr,
-                const typename pd_t::base_class *hint_fwd_pd)
-            : cpu_layer_normalization_fwd_pd_t(adesc, attr, hint_fwd_pd)
-            , anp() {}
 
         DECLARE_COMMON_PD_T("acl", acl_layer_normalization_fwd_t);
 
@@ -81,9 +76,10 @@ struct acl_layer_normalization_fwd_t : public primitive_t {
             // dir and flags
             ACL_CHECK_SUPPORT(
                     !is_fwd(), "ACL lnorm supports forward propagation only");
-            ACL_CHECK_SUPPORT(is_training() && !use_global_stats(),
-                    "ACL only supports forward training with lnorm if stats "
-                    "are provided (use global stats)");
+            ACL_CHECK_SUPPORT(
+                    is_training(), "ACL supports inference only for lnorm");
+            ACL_CHECK_SUPPORT(use_global_stats(),
+                    "ACL does not support global stats with lnorm");
             ACL_CHECK_SUPPORT(use_scale() || use_shift(),
                     "ACL does not support lnorm scale and shift");
 
@@ -219,7 +215,7 @@ struct acl_layer_normalization_fwd_t : public primitive_t {
                             || X * C > acl_better_XC_per_thread * threads);
         }
 
-        acl_msdnorm_conf_t anp;
+        acl_msdnorm_conf_t anp = utils::zero<decltype(anp)>();
 
     }; // pd_t
 

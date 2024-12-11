@@ -317,7 +317,7 @@ public:
         // tmp0.s32            -> tmp0_0.u64
         // tmp1.s32 = tmp0.s32 -> tmp1.s32 = tmp0_0.u64
         if (!value.is_empty()) {
-            auto &value_type = expr_t(value).type();
+            auto value_type = expr_t(value).type();
             if (var.as<var_t>().type != value_type) {
                 auto var_old = var;
                 var = var_t::make(value_type, var.as<var_t>().name);
@@ -451,7 +451,11 @@ private:
                 [&](const expr_t &a, const expr_t &b) {
                     auto &ea = entries.at(a);
                     auto &eb = entries.at(b);
-                    return (ea.second - ea.first) < (eb.second - eb.first);
+                    int a_span = (ea.second - ea.first);
+                    int b_span = (eb.second - eb.first);
+                    if (a_span == b_span)
+                        return a.as<var_t>().name < b.as<var_t>().name;
+                    return a_span < b_span;
                 });
         // Use union-find to incrementally merge statements based on the common
         // buffers.

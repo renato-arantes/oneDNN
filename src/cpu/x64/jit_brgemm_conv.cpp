@@ -316,7 +316,7 @@ status_t brgemm_convolution_fwd_t<isa>::pd_t::add_brg_descriptor(int vM,
     CHECK(brgemm_desc_set_attr(&brg, brgattr));
 
     auto LDD = jcp_.oc_without_padding;
-    brg.with_sum = with_sum;
+    brg.with_sum = with_sum_;
     brg.with_weights_scale_adjust = jcp_.scale_adjust_factor != 1.0f;
     CHECK(brgemm_desc_set_postops(&brg, attr(), &dst_md_, LDD, jcp_.bia_dt));
     jcp_.amx_buf_size_per_thread = nstl::max(
@@ -497,10 +497,8 @@ status_t brgemm_convolution_fwd_t<isa>::pd_t::init(engine_t *engine) {
     // const variables used for address calculations
     src_w_sz = static_cast<dim_t>(IW) * jcp_.ngroups * jcp_.ic_without_padding;
     src_h_sz = IH * src_w_sz;
-    src_d_sz = ID * src_h_sz;
     dst_w_sz = static_cast<dim_t>(OW) * jcp_.oc_without_padding;
     dst_h_sz = OH * dst_w_sz;
-    dst_d_sz = OD * dst_h_sz;
     rd = jcp_.ic;
     if (jcp_.is_relo_wi())
         rd *= jcp_.kw;
@@ -598,7 +596,7 @@ status_t brgemm_convolution_fwd_t<isa>::pd_t::init(engine_t *engine) {
 
     const auto &p = attr()->post_ops_;
     const int sum_idx = p.find(primitive_kind::sum);
-    with_sum = (sum_idx != -1);
+    with_sum_ = (sum_idx != -1);
 
     // os_blocking is supported for exec_trans only
     assert(IMPLICATION(jcp_.exec_type != exec_trans, !jcp_.is_os_blocking));
@@ -728,6 +726,20 @@ status_t brgemm_convolution_fwd_t<isa>::pd_t::init(engine_t *engine) {
                 jcp_.scale_adjust_factor != 1.0f);
 
     return status::success;
+}
+
+template <cpu_isa_t isa>
+dim_t brgemm_convolution_fwd_t<isa>::get_src_base_offset(
+        const brgemm_thread_ctx_t &btc, const dim_t ic) const {
+    const auto &jcp = pd()->jcp_;
+    const memory_desc_wrapper src_d(pd()->src_md());
+
+    // The second arg in template means sub_offset0 = true
+    // See `blk_off` method definition.
+    const auto batch_offs = btc.n * src_d.blk_off<false, true>(1);
+    const auto group_offs
+            = btc.g * src_d.blk_off<false, true>(0, 1) * jcp.ic + ic;
+    return src_dsz * (src_d.off_l(0) + batch_offs + group_offs);
 }
 
 template <cpu_isa_t isa>
@@ -934,10 +946,8 @@ status_t brgemm_convolution_fwd_t<isa>::init(engine_t *engine) {
     // const variables used for address calculations
     src_w_sz = static_cast<dim_t>(IW) * jcp.ngroups * jcp.ic_without_padding;
     src_h_sz = IH * src_w_sz;
-    src_d_sz = ID * src_h_sz;
     dst_w_sz = static_cast<dim_t>(OW) * jcp.oc_without_padding;
     dst_h_sz = OH * dst_w_sz;
-    dst_d_sz = OD * dst_h_sz;
 
     const auto comp_buffer_os = jcp.exec_type != exec_vpad ? jcp.ow : 1;
     comp_ow_sz = static_cast<dim_t>(jcp.oc_block);
@@ -1526,6 +1536,10 @@ status_t brgemm_convolution_fwd_t<isa>::cal_compensation(
 
     const int max_ker_sz = adjusted_k.size();
     const auto comp_buffer_ow = jcp.exec_type != exec_vpad ? jcp.ow : 1;
+    // TODO: revise the thread distribution here because the work_amount may be
+    // insufficient
+    // TODO: revise comp_vpad_pbuffer_ generator to avoid huge code for cases
+    // with big ow
     const auto work_amount
             = static_cast<dim_t>(jcp.ngroups) * jcp.nb_oc * max_ker_sz;
     const auto is_small_shape = work_amount <= jcp.nthr
@@ -1886,7 +1900,10 @@ void brgemm_convolution_fwd_t<isa>::maybe_conv_inp(brgemm_thread_ctx_t &btc,
 
     const auto base_ih_buf = (jcp.copy_block_only ? 0 : ih_start)
             + (jcp.is_relo_whi() ? 0 : TP);
-    const auto base_inp_offset_start = static_cast<dim_t>(btc.n) * src_d_sz
+
+    const memory_desc_wrapper src_d(pd()->src_md());
+    const auto base_inp_offset_start = src_d.off_l(0)
+            + static_cast<dim_t>(btc.n) * src_d.blk_off<false, true>(1)
             + iw * jcp.ngroups * jcp.ic_without_padding + g_ic;
 
     if (jcp.is_relo_whi()) {
@@ -2020,7 +2037,6 @@ void brgemm_convolution_fwd_t<isa>::maybe_conv_inp(brgemm_thread_ctx_t &btc,
     const int g_oc = btc.g * jcp.oc + oc; \
     const int icb = btc.icc * jcp.nb_ic_blocking; \
     const int ic = icb * jcp.ic_block; \
-    const int g_ic = btc.g * jcp.ic + ic; \
     const int ow = btc.owb * jcp.ow_block; \
     const int oh = btc.ohb * jcp.oh_block; \
     const int iid = ndims_pick(btc.od * SD - FP, 0, 0); \
@@ -2050,8 +2066,13 @@ void brgemm_convolution_fwd_t<isa>::maybe_conv_inp(brgemm_thread_ctx_t &btc,
             = bias ? bias + (bias_d.blk_off(g_oc) * bia_dsz) : nullptr; \
     const auto nb_ic_b = nstl::min(jcp.nb_ic_blocking, jcp.nb_ic - icb) \
             - (is_ic_tail ? 1 : 0); \
-    char *const __restrict dst_base \
-            = btc.brgemm_ctx.dst + dst_dsz * (btc.n * dst_d_sz + g_oc); \
+    const memory_desc_wrapper dst_d(pd()->dst_md()); \
+    char *const __restrict dst_base = btc.brgemm_ctx.dst \
+            + dst_dsz \
+                    * (dst_d.off_l(0) + btc.n * dst_d.blk_off<false, true>(1) \
+                            + btc.g * dst_d.blk_off<false, true>(0, 1) \
+                                    * jcp.oc \
+                            + oc); \
     char *ptr_C; \
     char *ptr_D; \
     int kd_b(0), kd_e(0), kh_b(0), kh_e(0), k_l(0), iiw_b(0);
@@ -2072,7 +2093,7 @@ void brgemm_convolution_fwd_t<isa>::ker_base(brgemm_thread_ctx_t &btc) const {
 
     _pd->get_kw_range(ow, kw_s, kw_full_s, kw_full_f, kw_f);
 
-    const auto src_base = src + src_dsz * (btc.n * src_d_sz + g_ic);
+    const auto src_base = src + get_src_base_offset(btc, ic);
     const auto wei_base = weights
             + wei_dsz
                     * (btc.g * _pd->wei_g_stride
@@ -2219,7 +2240,6 @@ void brgemm_convolution_fwd_t<isa>::ker_trans(brgemm_thread_ctx_t &btc) const {
 
     BRGEMM_CONV_KER_HEADER;
 
-    MAYBE_UNUSED(g_ic);
     MAYBE_UNUSED(src);
 
     const auto wei_base = weights
@@ -2356,8 +2376,7 @@ void brgemm_convolution_fwd_t<isa>::ker_vpad(brgemm_thread_ctx_t &btc) const {
     BRGEMM_CONV_KER_HEADER;
     MAYBE_UNUSED(is_oh_tail);
 
-    const char *const __restrict src_base
-            = src + src_dsz * (btc.n * src_d_sz + g_ic);
+    const char *const __restrict src_base = src + get_src_base_offset(btc, ic);
     const char *const __restrict wei_base = weights
             + wei_dsz
                     * (btc.g * _pd->wei_g_stride

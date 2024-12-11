@@ -67,6 +67,10 @@ namespace impl {
 // Sanity check for 64 bits
 static_assert(sizeof(void *) == 8, "oneDNN supports 64-bit architectures only");
 
+// Note: if `f` has any explicit templated arguments, e.g., func<A, B>, then
+// compiler returns `error: macro "CHECK" passed 2 arguments, but takes just 1`.
+// The solution is to use an alias, e.g. `using func_alias = func<A, B>;` and
+// use `func_alias` in CHECK, then it compiles.
 #define CHECK(f) \
     do { \
         dnnl::impl::status_t _status_ = f; \
@@ -209,11 +213,30 @@ constexpr bool any_null(Args... ptrs) {
     return one_of(nullptr, ptrs...);
 }
 
+// For some unknown reason, GCC 11.x and beyond can't compile specific places
+// of the library that involve this routine. It's connected to the fact that
+// this function is inline and defined in a header.
+#if defined(__GNUC__) && __GNUC__ > 8 && !defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wrestrict"
+// /usr/include/bits/string_fortified.h:29:33: warning: ‘void* __builtin_memcpy(
+//     void*, const void*, long unsigned int)’ accessing 18446744056529682432 or
+//     more bytes at offsets 320 and 0 overlaps 9223372002495037441 bytes at
+//     offset -9223372019674906625 [-Wrestrict]
+#pragma GCC diagnostic ignored "-Wstringop-overflow"
+// warning: ‘void* __builtin_memcpy(void*, const void*, long unsigned int)’
+//     specified bound between 18446744056529682432 and 18446744073709551608
+//     exceeds maximum object size 9223372036854775807 [-Wstringop-overflow=]
+#endif
 template <typename T>
 inline void array_copy(T *dst, const T *src, size_t size) {
     for (size_t i = 0; i < size; ++i)
         dst[i] = src[i];
 }
+#if defined(__GNUC__) && __GNUC__ > 8 && !defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
+
 template <typename T>
 inline bool array_cmp(const T *a1, const T *a2, size_t size) {
     for (size_t i = 0; i < size; ++i)
@@ -830,6 +853,43 @@ private:
     uint8_t high : 4;
 };
 static_assert(sizeof(nibble2_t) == 1, "nibble2_t must be 1 byte");
+
+/// Iterates through a binary integer
+/// usage:
+///
+/// for(int idx : mask_iterator(13)) { // 13 == 1101
+///     printf("%d\t", idx);
+/// }
+/// output: 0  2  3
+class mask_iterator {
+    int mask_;
+    int index_;
+
+public:
+    using iterator_category = std::input_iterator_tag;
+    using difference_type = int;
+    using value_type = int;
+    using pointer = value_type *;
+    using reference = value_type &;
+    mask_iterator() : mask_(0), index_(0) {}
+    mask_iterator(int mask) : mask_(mask), index_(0) {
+        if ((mask_ & 0x1) == 0) { ++(*this); }
+    }
+    mask_iterator &begin() { return *this; }
+    mask_iterator end() const { return 0; }
+    value_type operator*() const { return index_; }
+    mask_iterator &operator++() {
+        do {
+            index_++;
+            mask_ >>= 1;
+        } while ((mask_ & 0x1) == 0 && mask_ != 0);
+        if (mask_ == 0) { index_ = 0; }
+        return *this;
+    }
+    bool operator!=(const mask_iterator &other) const {
+        return mask_ != other.mask_ || index_ != other.index_;
+    }
+};
 
 } // namespace impl
 } // namespace dnnl

@@ -133,11 +133,13 @@ void GEMMStrategy::preflight(HW hw, const GEMMProblem &problem)
     // Fused beta/post-op configuration.
     fuseBeta &= (kParallel || kParallelVariable);
     fusePostOps &= (kParallel || kParallelVariable);
+    relaxedAccumulation &= hasNativeAtomicAdd(hw, Tc_ext, problem.C, C);
 
     bool needsFusedPostOps = false;
 
     needsFusedPostOps |= (problem.cOffset == COffset::Post);
-    needsFusedPostOps |= (Tc.bits() != Tc_ext.bits());
+    if (!relaxedAccumulation)
+        needsFusedPostOps |= (Tc.bits() != Tc_ext.bits());
     for (size_t i = 0; i < problem.postOps.len(); i++)
         needsFusedPostOps |= (!problem.postOps[i].is_sum());
     if (problem.Ts != problem.Tc) {
@@ -308,6 +310,9 @@ void GEMMStrategy::preflight(HW hw, const GEMMProblem &problem)
     else if (prefetchC && C.atomic)
         C_prefetch.cachingR = makeL1Uncacheable(C_prefetch.cachingR);
 
+    if (prefetchABL3 && cWalkOrder == WalkOrder::HW2D)
+        cWalkOrder = WalkOrder::SimpleLinear;
+
     // Propagate tiling requests to strategy.
     int tileM_A, tileK_A, tileK_B, tileN_B;
     std::tie(tileM_A, tileK_A, tileK_B, tileN_B) = targetKernelTiling(hw, problem, *this);
@@ -379,9 +384,12 @@ void GEMMStrategy::preflight(HW hw, const GEMMProblem &problem)
     ukAlign = align_up(ukAlign, minUnrollKSLM * slmVersions);
 
     if (kInterleave) ukAlign = lcm(ukAlign, kInterleaveChunk);
+    if (repackC) ukAlign = lcm(ukAlign, repackC);
 
     if (problem.quantized2DA()) ukAlign = lcm(ukAlign, problem.aqGroupK);
     if (problem.quantized2DB()) ukAlign = lcm(ukAlign, problem.bqGroupK);
+    if (l3PrefetchA) ukAlign = lcm(ukAlign, ka_prefetchL3);
+    if (l3PrefetchB) ukAlign = lcm(ukAlign, kb_prefetchL3);
 
     unroll[LoopK] = align_up(unroll[LoopK], ukAlign);
 
@@ -392,6 +400,7 @@ void GEMMStrategy::preflight(HW hw, const GEMMProblem &problem)
         unroll[LoopK] = unrollKSLM = 32 / Ta_real;
 
     barrierFreq = align_up(barrierFreq, unroll[LoopK]);
+    prefetchABL3 = align_up(prefetchABL3, unroll[LoopK]);
 
     int kChunkA = (problem.A.tileC ? problem.A.tileC : problem.A.crosspack);
     int kChunkB = (problem.B.tileR ? problem.B.tileR : problem.B.crosspack);

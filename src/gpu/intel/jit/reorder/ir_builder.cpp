@@ -423,7 +423,7 @@ struct layout_normalization_t {
             return *this;
         }
 
-        iterator_t(int ndims, block_iterator_t it, block_iterator_t end)
+        iterator_t(dim_idx_t ndims, block_iterator_t it, block_iterator_t end)
             : curr_(it == end ? end : it + 1)
             , last_(it)
             , end_(end)
@@ -519,7 +519,7 @@ private:
     }
 
     type_t type_;
-    int ndims_;
+    dim_idx_t ndims_;
     expr_t offset_;
     blocks_t blocks_;
 };
@@ -767,7 +767,8 @@ bool reorder_ir_builder_t::try_build(const std::vector<int> &iter_blocks,
     bool has_post_ops = dst_md_ && attr_
             && (!attr_->post_ops_.has_default_values()
                     || !attr_->zero_points_.has_default_values()
-                    || !attr_->scales_.has_default_values());
+                    || !attr_->scales_.has_default_values()
+                    || !attr_->rounding_mode_.has_default_values());
 
     if (has_post_ops) {
         post_op_view_mapper_t view_mapper(dst_view);

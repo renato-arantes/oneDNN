@@ -22,6 +22,11 @@
 #include "gpu/intel/jit/gemm/gen_gemm_kernel.hpp"
 #include "gpu/intel/jit/gemm/include/microkernel_provider.hpp"
 
+#include <algorithm>
+#include <cstdio>
+#include <iostream>
+#include <vector>
+
 namespace dnnl {
 namespace impl {
 namespace gpu {
@@ -141,6 +146,31 @@ sdpa_config_t *choose_config_xehpc(dim_t head_size, dim_t seq, bool thin_q) {
     return nullptr;
 }
 
+/// Returns true if a common scale value is used for each slice of the tensor
+/// operation. For 4D case it's when the mask's two first bits are on and two
+/// last bits are off.
+/// Examples:
+///   | mask      | result  |
+///   |-----------+---------|
+///   |  0 (0000) | true    |
+///   | 12 (0011) | false   |
+///   |  3 (1100) | true    |
+///   |  1 (1000) | true    |
+///   |  8 (0001) | false   |
+bool with_quantize_common(const runtime_scales_t &scales) {
+    return !scales.has_default_values()
+            && (((scales.mask_ & 3) != 0 && (scales.mask_ & 12) == 0)
+                    || scales.mask_ == 0);
+}
+
+/// Returns true if a common zero points value is used for each slice of the
+/// tensor operation
+bool with_quantize_common(const zero_points_t &zp) {
+    int mask = zp.get(DNNL_ARG_WEIGHTS);
+    return !zp.has_default_values()
+            && (((mask & 3) != 0 && (mask & 12) == 0) || mask == 0);
+}
+
 } /* anonymous namespace */
 
 status_t micro_sdpa_t::pd_t::init_microkernels(impl::engine_t *engine) {
@@ -153,8 +183,8 @@ status_t micro_sdpa_t::pd_t::init_microkernels(impl::engine_t *engine) {
     arch_ = dev_info->gpu_arch();
     auto *d = desc();
 
-    VCONDCHECK(primitive, create, check, sdpa,
-            (dev_info->mayiuse_microkernels()), status::unimplemented,
+    VCONDCHECK(primitive, create, check, sdpa, mayiuse_microkernels(engine),
+            status::unimplemented,
             "Microkernels not supported by the OpenCL driver.");
 
     /* Retrieve pre-tuned kernel configuration */
@@ -190,17 +220,48 @@ status_t micro_sdpa_t::pd_t::init_microkernels(impl::engine_t *engine) {
                                                            : MatrixLayout::N;
     };
 
+    bool kq_common_scales = with_quantize_common(d->kq_scales);
+    bool kq_common_zp = with_quantize_common(d->kq_zero_points);
+
     /* Set up GEMMProblem structure for first GEMM: K^T * Q */
     GEMMProblem problem;
-    problem.Ta = problem.Ta_ext
-            = jit::convert_dnnl_to_kernel_type(key_md()->data_type);
-    problem.Tb = problem.Tb_ext
-            = jit::convert_dnnl_to_kernel_type(qry_md()->data_type);
+    problem.Ta_ext = jit::convert_dnnl_to_kernel_type(key_md()->data_type);
+    problem.Tb_ext = jit::convert_dnnl_to_kernel_type(qry_md()->data_type);
+    problem.Ta = problem.Tb = Type::f16;
     problem.Tc = problem.Tc_ext = Type::f32;
     problem.Ts = problem.Tc;
 
     auto problem_kq = problem;
     problem_kq.A.layout = convert_dnnl_to_kernel_layout(key_md());
+
+    /* Set up microkernel options */
+    micro::GEMMProtocol::Options opts_kq;
+    opts_kq.localB = true;
+    opts_kq.slmPtr = true;
+    if (with_key_scales() && !kq_common_scales) {
+        auto scale_dt = key_scales_dt();
+        problem_kq.Ta_scale = jit::convert_dnnl_to_kernel_type(scale_dt);
+        problem_kq.A_scale.alignment = uint8_t(types::data_type_size(scale_dt));
+        problem_kq.A_scale.layout = MatrixLayout::T;
+        problem_kq.aScale2D = true;
+    }
+    if (with_key_zp()) {
+        auto zp_dt = key_zp_dt();
+        problem_kq.Tao = jit::convert_dnnl_to_kernel_type(zp_dt);
+        problem_kq.AO.alignment = uint8_t(types::data_type_size(zp_dt));
+        problem_kq.AO.layout = MatrixLayout::T;
+        problem_kq.aoPtrDims = kq_common_zp ? 0 : 2;
+        problem_kq.aOffset = ABOffset::Calc;
+    }
+
+    if (with_key_scales() || with_key_zp()) {
+        problem_kq.aqGroupM = 1;
+        problem_kq.aqGroupK
+                = (kq_common_scales || kq_common_zp) ? 1 : key_group_size();
+    }
+    opts_kq.scaleA = with_key_scales() && !kq_common_scales;
+    opts_kq.offsetA = with_key_zp();
+
     problem_kq.B.layout = MatrixLayout::Pr;
     problem_kq.C.layout = MatrixLayout::T;
     problem_kq.A.setAlignment(alignmentForLD(d->head_size() * problem.Ta));
@@ -223,22 +284,51 @@ status_t micro_sdpa_t::pd_t::init_microkernels(impl::engine_t *engine) {
     reqs_kq.push_back(StrategyRequirement::WGM == config->wg_m_kq);
     reqs_kq.push_back(StrategyRequirement::WGN == config->wg_n_kq);
 
-    /* Set up microkernel options */
-    micro::GEMMProtocol::Options opts_kq;
-    opts_kq.localB = true;
-    opts_kq.slmPtr = true;
-
     /* Ask microkernel provider for microkernel */
     try {
         gemm_kq_ = selectGEMMMicrokernel(
                 opts_kq, hw_info, sizes, problem_kq, reqs_kq);
-    } catch (...) { return status::unimplemented; }
+    } catch (const std::runtime_error &ex) {
+        VDISPATCH_SDPA(false,
+                "gemm_kq microkernel generation failure with message: %s",
+                ex.what());
+    }
+
+    bool vs_common_scales = with_quantize_common(d->vs_scales);
+    bool vs_common_zp = with_quantize_common(d->vs_zero_points);
+
+    /* Set up microkernel options */
+    micro::GEMMProtocol::Options opts_vs;
+    opts_vs.localB = true;
+    opts_vs.slmPtr = true;
 
     /* Update for second GEMM: V*S */
     auto problem_vs = problem;
-    problem_vs.Ta = problem_vs.Ta_ext
-            = jit::convert_dnnl_to_kernel_type(val_md()->data_type);
+    problem_vs.Ta_ext = jit::convert_dnnl_to_kernel_type(val_md()->data_type);
     problem_vs.A.layout = convert_dnnl_to_kernel_layout(val_md());
+    if (with_value_scales() && !vs_common_scales) {
+        auto scale_dt = value_scales_dt();
+        problem_vs.Ta_scale = jit::convert_dnnl_to_kernel_type(scale_dt);
+        problem_vs.A_scale.alignment = uint8_t(types::data_type_size(scale_dt));
+        problem_vs.A_scale.layout = MatrixLayout::N;
+        problem_vs.aScale2D = true;
+    }
+    if (with_value_zp()) {
+        auto zp_dt = value_zp_dt();
+        problem_vs.Tao = jit::convert_dnnl_to_kernel_type(zp_dt);
+        problem_vs.AO.alignment = uint8_t(types::data_type_size(zp_dt));
+        problem_vs.AO.layout = MatrixLayout::N;
+        problem_vs.aoPtrDims = vs_common_zp ? 0 : 2;
+        problem_vs.aOffset = ABOffset::Calc;
+    }
+    if (with_value_scales() || with_value_zp()) {
+        problem_vs.aqGroupM
+                = (vs_common_scales || vs_common_zp) ? 1 : value_group_size();
+        problem_vs.aqGroupK = 1;
+    }
+    opts_vs.scaleA = with_value_scales() && !vs_common_scales;
+    opts_vs.offsetA = with_value_zp();
+
     problem_vs.B.layout = MatrixLayout::Pr;
     problem_vs.C.layout = MatrixLayout::N;
     problem_vs.A.setAlignment(alignmentForLD(d->head_size() * problem.Ta));
@@ -255,10 +345,6 @@ status_t micro_sdpa_t::pd_t::init_microkernels(impl::engine_t *engine) {
     reqs_vs.push_back(StrategyRequirement::WGM == config->wg_m_vs);
     reqs_vs.push_back(StrategyRequirement::WGN == config->wg_n_vs);
 
-    micro::GEMMProtocol::Options opts_vs;
-    opts_vs.localB = true;
-    opts_vs.slmPtr = true;
-
     /* Ask microkernel provider for microkernel */
     try {
         auto adjust_vs = [](GEMMStrategy &strategy) {
@@ -267,7 +353,11 @@ status_t micro_sdpa_t::pd_t::init_microkernels(impl::engine_t *engine) {
         };
         gemm_vs_ = selectGEMMMicrokernel(
                 opts_vs, hw_info, sizes, problem_vs, reqs_vs, adjust_vs);
-    } catch (...) { return status::unimplemented; }
+    } catch (const std::runtime_error &ex) {
+        VDISPATCH_SDPA(false,
+                "gemm_vs microkernel generation failure with message: %s",
+                ex.what());
+    }
 
     return status::success;
 }
@@ -301,6 +391,15 @@ status_t micro_sdpa_t::init(impl::engine_t *engine) {
     def_offsets(msk_off, kernel_ctx, "MSK", ndims);
     kernel_ctx.define_int("NDIMS", ndims);
 
+    def_data_type(kernel_ctx, key_mdw.data_type(), "KEY");
+    def_data_type(kernel_ctx, val_mdw.data_type(), "VAL");
+
+    def_data_type(kernel_ctx, pd()->key_scales_dt(), "KEY_ATTR_SCALES");
+    def_data_type(kernel_ctx, pd()->value_scales_dt(), "VAL_ATTR_SCALES");
+
+    def_data_type(kernel_ctx, pd()->key_zp_dt(), "KEY_ATTR_ZP");
+    def_data_type(kernel_ctx, pd()->value_zp_dt(), "VAL_ATTR_ZP");
+
     auto Q_num_heads_dim = qry_mdw.dims()[1];
     kernel_ctx.define_int("KV_GROUP_SIZE", Q_num_heads_dim / d->kv_head_number);
 
@@ -315,6 +414,44 @@ status_t micro_sdpa_t::init(impl::engine_t *engine) {
 
     kernel_ctx.define_int("TRANSPOSE_K",
             gemm_desc_t::get_trans(*pd()->key_md()) == dnnl_trans);
+
+    int kq_scale_mask = (static_cast<int>(pd()->with_key_scales()) << 1)
+            | static_cast<int>(with_quantize_common(d->kq_scales));
+    kernel_ctx.define_int("KEY_SCALES", kq_scale_mask);
+
+    int vs_scale_mask = (static_cast<int>(pd()->with_value_scales()) << 1)
+            | static_cast<int>(with_quantize_common(d->vs_scales));
+    kernel_ctx.define_int("VAL_SCALES", vs_scale_mask);
+
+    int kq_zp_mask = (static_cast<int>(pd()->with_key_zp()) << 1)
+            | static_cast<int>(with_quantize_common(d->kq_zero_points));
+    kernel_ctx.define_int("KEY_ZERO_POINTS", kq_zp_mask);
+
+    int vs_zp_mask = (static_cast<int>(pd()->with_value_zp()) << 1)
+            | static_cast<int>(with_quantize_common(d->vs_zero_points));
+    kernel_ctx.define_int("VAL_ZERO_POINTS", vs_zp_mask);
+
+    using namespace data_type;
+    auto elems_per_byte = [](data_type_t dt) {
+        switch (dt) {
+            case u4:
+            case s4: return 2;
+            default: return 1;
+        }
+    };
+    kernel_ctx.define_int(
+            "KEY_ELEMENTS_PER_BYTE", elems_per_byte(key_mdw.data_type()));
+    kernel_ctx.define_int(
+            "KEY_ZP_ELEMENTS_PER_BYTE", elems_per_byte(pd()->key_zp_dt()));
+    kernel_ctx.define_int(
+            "VAL_ELEMENTS_PER_BYTE", elems_per_byte(val_mdw.data_type()));
+    kernel_ctx.define_int(
+            "VAL_ZP_ELEMENTS_PER_BYTE", elems_per_byte(pd()->value_zp_dt()));
+
+    if (pd()->with_key_scales() || pd()->with_key_zp())
+        kernel_ctx.define_int("KEY_GROUP_SIZE", pd()->key_group_size());
+    if (pd()->with_value_scales() || pd()->with_value_zp())
+        kernel_ctx.define_int("VAL_GROUP_SIZE", pd()->value_group_size());
 
     def_data_type(kernel_ctx, d->scale_dt, "SCALE");
     kernel_ctx.define_int("INVERT_SCALE", d->invert_scale);
@@ -390,6 +527,14 @@ status_t micro_sdpa_t::execute(const exec_ctx_t &ctx) const {
     const auto &scale = CTX_IN_STORAGE(DNNL_ARG_SCALE);
     const auto &attn_mask = CTX_IN_STORAGE(DNNL_ARG_ATTN_MASK);
 
+    const auto &key_scales
+            = CTX_IN_STORAGE(DNNL_ARG_KEYS | DNNL_ARG_ATTR_SCALES);
+    const auto &key_zp
+            = CTX_IN_STORAGE(DNNL_ARG_KEYS | DNNL_ARG_ATTR_ZERO_POINTS);
+    const auto &value_scales
+            = CTX_IN_STORAGE(DNNL_ARG_VALUES | DNNL_ARG_ATTR_SCALES);
+    const auto &value_zp
+            = CTX_IN_STORAGE(DNNL_ARG_VALUES | DNNL_ARG_ATTR_ZERO_POINTS);
     const dim_t Q = pd()->desc()->queries();
     const dim_t K = pd()->desc()->keys();
     const dim_t D = pd()->desc()->head_size();
@@ -409,6 +554,10 @@ status_t micro_sdpa_t::execute(const exec_ctx_t &ctx) const {
     arg_list.set(6, (int)D);
     arg_list.set(7, (int)K);
     arg_list.set(8, (int)Q);
+    arg_list.set(9, key_scales);
+    arg_list.set(10, key_zp);
+    arg_list.set(11, value_scales);
+    arg_list.set(12, value_zp);
 
     compute::range_t lws = {(size_t)pd()->sg_size(), (size_t)sg_per_wg, 1};
     compute::range_t gws = lws;

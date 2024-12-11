@@ -26,8 +26,11 @@
 #include "bit_cast.hpp"
 #include "c_types_map.hpp"
 #include "dnnl_traits.hpp"
+#include "gemm_types.hpp"
 #include "memory_desc.hpp"
 #include "nstl.hpp"
+#include "opdesc.hpp"
+#include "sdpa_types.hpp"
 #include "utils.hpp"
 
 namespace dnnl {
@@ -346,10 +349,11 @@ inline bool blocking_desc_is_equal(const memory_desc_t &lhs_md,
     bool equal = lhs.inner_nblks == rhs.inner_nblks
             && array_cmp(lhs.inner_blks, rhs.inner_blks, lhs.inner_nblks)
             && array_cmp(lhs.inner_idxs, rhs.inner_idxs, lhs.inner_nblks);
-    if (ignore_strides) return equal;
 
     // Check the strides.
-    // Note: for dimensions of size `1` the stride doesn't really matter.
+    // Note: for dimensions of size `1` the stride doesn't really matter
+    if (ignore_strides) return equal;
+
     for (int d = 0; d < lhs_md.ndims; ++d) {
         if (lhs_md.dims[d] == 1 && lhs_md.padded_dims[d] == 1) continue;
         equal = equal && lhs.strides[d] == rhs.strides[d];
@@ -1183,9 +1187,19 @@ inline status_t memory_desc_init_by_md_and_dt(memory_desc_t &md,
  * Assumes a dense structure such as that returned by memory_desc_init_by_tag().
  * Strides must match those returned by memory_desc_init_by_tag(), with one
  * exception: the strides of unit dimensions are ignored in order to align with
- * memory descriptor equality comparisons and hashing.
- */
-inline bool memory_desc_matches_tag(const memory_desc_t &md, format_tag_t tag) {
+ * memory descriptor equality comparisons and hashing,
+ * the strides of unit dimensions are ignored.
+ * When strides are empty the dense structure is assumed (e.g., the one that
+ * memory_desc_init_by_tag() returns).
+ * When strides are not empty, standard strides check is overrided, and
+ * additional rules are applied:
+ * Strides might contain `0` value, indicating the stride must match the one
+ * that memory_desc_init_by_tag() returns.
+ * Strides might contain `-1` values, that would be ignored during the
+ * comparison. For instance, this can be used if a stride along minibatch
+ * doesn't matter. */
+inline bool memory_desc_matches_tag(const memory_desc_t &md, format_tag_t tag,
+        const dims_t strides = nullptr) {
     if (md.format_kind != format_kind::sparse) {
         if (md.format_kind != types::format_tag_to_kind(tag)) return false;
     }
@@ -1194,8 +1208,19 @@ inline bool memory_desc_matches_tag(const memory_desc_t &md, format_tag_t tag) {
     status_t status = memory_desc_init_by_tag(
             md_gold, md.ndims, md.dims, md.data_type, tag);
     if (status != status::success) return false;
+    bool equal = types::blocking_desc_is_equal(
+            md, md_gold, /* ignore_strides = */ (bool)strides);
+    if (!strides || !equal) return equal;
 
-    return types::blocking_desc_is_equal(md, md_gold);
+    const auto &blk = md.format_desc.blocking;
+    const auto &blk_gold = md_gold.format_desc.blocking;
+    for (int d = 0; d < md.ndims; ++d) {
+        dim_t stride = strides[d];
+        if (stride == -1) continue;
+        if (stride == 0) stride = blk_gold.strides[d];
+        if (blk.strides[d] != stride) return false;
+    }
+    return true;
 }
 
 /** returns matching tag (or undef if match is not found)
@@ -1252,38 +1277,6 @@ inline bool memory_desc_sanity_check(int ndims, const dims_t dims,
 inline bool memory_desc_sanity_check(const memory_desc_t &md) {
     return memory_desc_sanity_check(
             md.ndims, md.dims, md.data_type, format_kind::undef);
-}
-
-inline void copy_c_op_desc(op_desc_t *dst, const op_desc_t *src) {
-#define CASE_OP_DESC(pkind) \
-    case primitive_kind::pkind: dst->pkind = src->pkind; break;
-
-    switch ((int)src->kind) {
-        CASE_OP_DESC(batch_normalization);
-        CASE_OP_DESC(binary);
-        CASE_OP_DESC(convolution);
-        CASE_OP_DESC(deconvolution);
-        CASE_OP_DESC(eltwise);
-        CASE_OP_DESC(gemm);
-        CASE_OP_DESC(group_normalization);
-        CASE_OP_DESC(inner_product);
-        CASE_OP_DESC(layer_normalization);
-        CASE_OP_DESC(lrn);
-        CASE_OP_DESC(matmul);
-        CASE_OP_DESC(pooling);
-        CASE_OP_DESC(prelu);
-        CASE_OP_DESC(reduction);
-        CASE_OP_DESC(resampling);
-        CASE_OP_DESC(rnn);
-        CASE_OP_DESC(sdpa);
-        CASE_OP_DESC(shuffle);
-        CASE_OP_DESC(softmax);
-
-        // Internal descs
-        CASE_OP_DESC(zero_pad);
-        default: assert(!"unknown C primitive kind");
-    }
-#undef CASE_OP_DESC
 }
 
 } // namespace impl

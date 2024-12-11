@@ -379,8 +379,9 @@ private:
                         return a.size > b.size;
                     });
 
-            // Deterministic mode doesn't allow reduction splitting between threadgroups.
-            if (!prb.deterministic) {
+            // Do not filter out loops with disabled global reduction as all
+            // loops must be present.
+            if (cfg.allow_global_reduction()) {
                 // For XeHPG and earlier hardware use only linear loops with SLM
                 // pipelining to avoid overflowing icache. Prefetch pipeline can
                 // handle nested loops without fully unrolling them.
@@ -524,8 +525,8 @@ public:
         check_mask_ = 0;
         optional_check_mask_ = 0;
         set_check(optional_check_mask_, check_kind_t::limit_k_iter);
-        if (cfg_.prb().deterministic) {
-            set_check(check_kind_t::check_deterministic);
+        if (!cfg_.allow_global_reduction()) {
+            set_check(check_kind_t::check_global_reduction);
         } else {
             set_check(optional_check_mask_,
                     check_kind_t::check_k_slicing_utilization);
@@ -564,7 +565,7 @@ public:
         if (!check_bwd_d_optimize_ok(ctx)) return false;
         if (!check_layouts_ok(ctx)) return false;
         if (!check_k_slicing_utilization_ok(ctx)) return false;
-        if (!check_deterministic_ok(ctx)) return false;
+        if (!check_global_reduction_ok(ctx)) return false;
         if (!limit_m_iter_ok(ctx)) return false;
         if (!limit_n_iter_ok(ctx)) return false;
         if (!limit_k_iter_ok(ctx)) return false;
@@ -630,7 +631,7 @@ private:
         check_bwd_d_optimize,
         check_layouts,
         check_k_slicing_utilization,
-        check_deterministic,
+        check_global_reduction,
         limit_m_iter,
         limit_n_iter,
         limit_k_iter,
@@ -849,8 +850,8 @@ private:
         return true;
     }
 
-    bool check_deterministic_ok(const context_t &ctx) const {
-        if (!is_enabled(check_kind_t::check_deterministic)) return true;
+    bool check_global_reduction_ok(const context_t &ctx) const {
+        if (!is_enabled(check_kind_t::check_global_reduction)) return true;
         dim_t k = padded_gemm_shape_.get(pvars::k, 1);
         return ctx.k_loop * ctx.k_iter >= k;
     }
@@ -1064,8 +1065,10 @@ conv_blocking_scheme_list_t get_blocking_schemes_bwd_w_dw(
     bool k_is_ow = (k_iter_dim == pvars::ow);
     ret.add(k_is_mb, conv_schemes::bwd_w_dw_I_gn);
     ret.add(k_is_ow, conv_schemes::bwd_w_dw_I_gw);
-    ret.add(k_is_mb && cfg.prb().deterministic, conv_schemes::bwd_w_dw_I_gn_d);
-    ret.add(k_is_ow && cfg.prb().deterministic, conv_schemes::bwd_w_dw_I_gw_d);
+    ret.add(k_is_mb && !cfg.allow_global_reduction(),
+            conv_schemes::bwd_w_dw_I_gn_d);
+    ret.add(k_is_ow && !cfg.allow_global_reduction(),
+            conv_schemes::bwd_w_dw_I_gw_d);
     return ret;
 }
 
@@ -1125,8 +1128,8 @@ conv_blocking_scheme_list_t get_blocking_schemes_bwd_w(
     ret.add(k_is_mb && small_ic, conv_schemes::bwd_w_T_io_I_kon);
     ret.add(k_is_mb && small_ic, conv_schemes::bwd_w_T_io_I_ikon);
     ret.add(k_is_ow && small_ic, conv_schemes::bwd_w_T_io_I_ikow);
-    ret.add(cfg.prb().deterministic, conv_schemes::bwd_w_T_io_I_ion_d);
-    ret.add(cfg.prb().deterministic, conv_schemes::bwd_w_T_io_I_iow_d);
+    ret.add(!cfg.allow_global_reduction(), conv_schemes::bwd_w_T_io_I_ion_d);
+    ret.add(!cfg.allow_global_reduction(), conv_schemes::bwd_w_T_io_I_iow_d);
     return ret;
 }
 
@@ -1262,12 +1265,9 @@ public:
         maybe_rescore();
     }
 
-    bool can_move_next() const { return params_gen_.can_move_next(); }
+    bool is_valid() const { return params_gen_.is_valid(); }
 
-    void move_next() {
-        ir_assert(can_move_next());
-        params_gen_.move_next();
-    }
+    void move_next() { params_gen_.move_next(); }
 
     int cur_index() const { return params_gen_.cur_index(); }
 
@@ -1430,6 +1430,13 @@ std::unordered_map<const impl::primitive_t *, conv_tuner_t::primitive_info_t>
 
 std::mutex conv_tuner_t::mutex_;
 
+enum class grf_mode_policy_t {
+    // Try 128 GRF mode based on heuristics.
+    try_small_grf = 0,
+    // Use default_regs().
+    _default = 1
+};
+
 class conv_tiler_impl_t {
 public:
     conv_tiler_impl_t() = default;
@@ -1452,30 +1459,46 @@ public:
 
     bool is_tuning_mode() const { return tuner_; }
 
-    bool can_move_next() const {
-        if (is_tuning_mode()) return tuner_->can_move_next();
-        return params_gen_.can_move_next();
+    bool is_valid() const {
+        if (is_tuning_mode()) return tuner_->is_valid();
+        return params_gen_.is_valid();
     }
 
-    int cur_index() const {
-        if (is_tuning_mode()) return tuner_->cur_index();
-        return params_gen_.cur_index();
+    void move_next(const conv_config_t &cfg) {
+        if (is_tuning_mode()) {
+            tuner_->move_next();
+            return;
+        }
+        if (grf_mode_policy_ == grf_mode_policy_t::try_small_grf
+                && cfg.regs() != default_regs(cfg)) {
+            grf_mode_policy_ = grf_mode_policy_t::_default;
+            return;
+        }
+        grf_mode_policy_ = grf_mode_policy_t::try_small_grf;
+        params_gen_.move_next();
     }
 
-    void set_cur_index(int idx) {
+    int32_t cur_version() const {
+        return pack_version(is_tuning_mode() ? tuner_->cur_index()
+                                             : params_gen_.cur_index(),
+                grf_mode_policy_);
+    }
+
+    void set_cur_version(int32_t version) {
         ir_assert(!is_tuning_mode());
-        return params_gen_.set_cur_index(idx);
+        int idx;
+        unpack_version(version, idx, grf_mode_policy_);
+        params_gen_.set_cur_index(idx);
     }
 
     void set_params(conv_config_t &cfg) {
         init_regs(cfg);
         if (is_tuning_mode()) {
-            tuner_->move_next();
             tuner_->set_params(cfg);
         } else {
-            if (!try_small_grf_) params_gen_.move_next();
             params_gen_.set_params(cfg);
-            maybe_try_small_grf(cfg);
+            if (grf_mode_policy_ == grf_mode_policy_t::try_small_grf)
+                maybe_try_small_grf(cfg);
         }
     }
 
@@ -1499,6 +1522,16 @@ public:
     }
 
 private:
+    static int32_t pack_version(int idx, grf_mode_policy_t policy) {
+        return idx * 2 + static_cast<int>(policy);
+    }
+
+    static void unpack_version(
+            int32_t version, int &idx, grf_mode_policy_t &policy) {
+        idx = version / 2;
+        policy = static_cast<grf_mode_policy_t>(version % 2);
+    }
+
     void init(const conv_config_t &cfg) {
         if (cfg.loop_dims().is_overridden()
                 || cfg.thread_group_dims().is_overridden()
@@ -1564,6 +1597,8 @@ private:
     }
 
     void maybe_try_small_grf(conv_config_t &cfg) {
+        if (cfg.regs() == 128 || cfg.exec_cfg_param().is_overridden("regs"))
+            return;
         auto try_cfg = cfg;
         init_walk_order(try_cfg);
         init_kernel_grid(try_cfg);
@@ -1576,14 +1611,7 @@ private:
                         try_cfg.exec_cfg(), kg_elems, tg_elems));
         int wave_util = static_cast<int>(conv_config_t::get_wave_utilization(
                 cfg.exec_cfg(), kg_elems, tg_elems));
-        if (wave_util > 90 && new_wave_util >= wave_util && !try_small_grf_
-                && cfg.regs() > 128
-                && !cfg.exec_cfg_param().is_overridden("regs")) {
-            cfg.set_regs(128);
-            try_small_grf_ = true;
-        } else {
-            try_small_grf_ = false;
-        }
+        if (wave_util > 90 && new_wave_util >= wave_util) cfg.set_regs(128);
     }
 
     void print_info(double init_time_ms) {
@@ -1597,7 +1625,7 @@ private:
     params_generator_t params_gen_;
     conv_tuner_t *tuner_ = nullptr;
     int grf_usage_limit_ = 0;
-    bool try_small_grf_ = false;
+    grf_mode_policy_t grf_mode_policy_ = grf_mode_policy_t::try_small_grf;
 };
 
 conv_tiler_t::conv_tiler_t(const conv_config_t &cfg)
@@ -1611,16 +1639,20 @@ bool conv_tiler_t::is_tuning_mode() const {
     return impl_->is_tuning_mode();
 }
 
-bool conv_tiler_t::can_move_next() const {
-    return impl_->can_move_next();
+bool conv_tiler_t::is_valid() const {
+    return impl_->is_valid();
 }
 
-int conv_tiler_t::cur_index() const {
-    return impl_->cur_index();
+void conv_tiler_t::move_next(const conv_config_t &cfg) {
+    impl_->move_next(cfg);
 }
 
-void conv_tiler_t::set_cur_index(int idx) {
-    impl_->set_cur_index(idx);
+int32_t conv_tiler_t::cur_version() const {
+    return impl_->cur_version();
+}
+
+void conv_tiler_t::set_cur_version(int32_t version) {
+    impl_->set_cur_version(version);
 }
 
 void conv_tiler_t::set_params(conv_config_t &cfg) {

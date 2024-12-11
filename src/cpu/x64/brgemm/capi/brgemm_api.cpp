@@ -120,6 +120,11 @@ status_t brgemm_t::finalize() {
         VCHECK_BRGEMM_STATUS(status, false, "D_md creation failed");
     }
 
+    // This one is not used anywhere in implementation, but, maybe, could be
+    // used in the future in fpmath mode if users would like to override the
+    // default accumulation data type.
+    UNUSED(c_dt_);
+
     status = brgemm_desc_set_postops(
             &brgemm_desc_, &attr_, &D_md, ldd_, data_type::undef);
     if (status != status::success) {
@@ -153,6 +158,10 @@ pack_type_t brgemm_t::get_B_pack_type() const {
 
 size_t brgemm_t::get_scratchpad_size() const {
     return brgemm_desc_.get_wsp_buffer_size();
+}
+
+bool brgemm_t::is_execute_postops_valid() const {
+    return brgemm_desc_.are_post_ops_applicable();
 }
 
 status_t brgemm_t::set_hw_context() const {
@@ -214,6 +223,17 @@ status_t brgemm_t::execute(const void *A_ptr, const void *B_ptr,
         const dim_t *A_B_offsets, const void *C_ptr, void *D_ptr,
         void *scratchpad_ptr, const attr_params_t *attr_params) const {
     if (attr_params == nullptr) return status::invalid_arguments;
+
+    if (!brgemm_desc_.are_post_ops_applicable()) {
+        if (C_ptr == D_ptr) {
+            return execute(A_ptr, B_ptr, A_B_offsets, const_cast<void *>(C_ptr),
+                    scratchpad_ptr);
+        } else {
+            VCHECK_BRGEMM_STATUS(status::runtime_error, false,
+                    "the kernel won't return correct results with this "
+                    "execute_with_postops call.");
+        }
+    }
 
     const auto batch_size = brgemm_desc_.brgattr.max_bs;
     std::vector<brgemm_batch_element_t> v_batch_element(batch_size);
@@ -288,12 +308,6 @@ status_t brgemm_t::execute(const void *A_ptr, const void *B_ptr,
                 = cpu::io::load_float_value(data_type::f32, dst_scales_ptr, 0);
         utils::array_set(dst_scales_buf, 1.f / s, 16);
         post_ops_data.dst_scales = dst_scales_buf;
-    }
-
-    if (D_ptr && c_dt_ == d_dt_
-            && attr_.has_default_values(
-                    primitive_attr_t::skip_mask_t::fpmath_mode)) {
-        C_ptr = D_ptr;
     }
 
     if (get_verbose(verbose_t::exec_profile, component_t::ukernel)) {
@@ -604,6 +618,14 @@ status_t dnnl_brgemm_get_scratchpad_size(const brgemm_t *brgemm, size_t *size) {
     if (brgemm == nullptr) return invalid_arguments;
 
     if (size) *size = brgemm->get_scratchpad_size();
+    return status::success;
+}
+
+status_t dnnl_brgemm_is_execute_postops_valid(
+        const brgemm_t *brgemm, int *valid) {
+    if (brgemm == nullptr) return invalid_arguments;
+
+    if (valid) *valid = static_cast<int>(brgemm->is_execute_postops_valid());
     return status::success;
 }
 

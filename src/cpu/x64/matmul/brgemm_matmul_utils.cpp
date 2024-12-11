@@ -296,6 +296,7 @@ status_t brgemm_matmul_conf_utils_t::set_or_check_B_tag(memory_desc_t &B_md,
                 ? get_default_n_block(format_tag::undef)
                 : bgmmc.N_blk;
         bgmmc.wei_tag = blocked_B_layouts_allowed && !bgmmc.is_runtime_N
+                        && !bgmmc.is_int4_weights
                 ? this->pick_blocked_B_layout(default_n_block)
                 : plain_tensor_layout_tag;
         VCONDCHECK_BG(
@@ -311,6 +312,7 @@ status_t brgemm_matmul_conf_utils_t::set_or_check_B_tag(memory_desc_t &B_md,
         }
     } else {
         bgmmc.wei_tag = blocked_B_layouts_allowed && !bgmmc.is_runtime_N
+                        && !bgmmc.is_int4_weights
                 ? memory_desc_matches_one_of_tag(B_md, plain_tensor_layout_tag,
                         transposed_tensor_layout_tag, blocked_64n_B_layout_tag,
                         blocked_48n_B_layout_tag, blocked_32n_B_layout_tag,
@@ -454,7 +456,7 @@ status_t brgemm_matmul_conf_utils_t::set_B_flags(memory_desc_t &B_md) const {
 format_tag_t brgemm_matmul_conf_utils_t::pick_blocked_B_layout(
         int n_blk) const {
     if (bgmmc.ndims > 3) return format_tag::undef;
-    if (this->is_int8()) switch (n_blk) {
+    if (this->is_int8() || this->is_f8()) switch (n_blk) {
             case 64: return bgmmc.ndims == 3 ? aCB16b64c4b : BA16a64b4a;
             case 48: return bgmmc.ndims == 3 ? aCB16b48c4b : BA16a48b4a;
             case 32: return bgmmc.ndims == 3 ? aCB16b32c4b : BA16a32b4a;
@@ -890,6 +892,7 @@ float compute_blocking_heuristic_avx512(brgemm_matmul_conf_t &bgmmc,
         // Parallelize across K for shapes with big 'K' dimension
         bool bwd_w_par_k_blk = bgmmc.batch == 1
                 && bm_conf_utils.check_is_transposed(bgmmc.src_tag)
+                && !bm_conf_utils.is_int8()
                 && IMPLICATION(bm_conf_utils.is_bf16(), math::is_pow2(matmul.K))
                 && matmul.K >= 2048;
         if (bwd_w_par_k_blk) {
@@ -1248,6 +1251,7 @@ status_t init_brgemm_matmul_conf(cpu_isa_t isa, brgemm_matmul_conf_t &bgmmc,
     bgmmc.brg_type = brgemm_addr;
 
     bgmmc.src_dt = src_d.data_type();
+    bgmmc.orig_src_dt = src_d.data_type();
     bgmmc.dst_dt = dst_d.data_type();
     bgmmc.wei_dt = weights_d.data_type();
     bgmmc.orig_wei_dt = weights_d.data_type();
@@ -1654,6 +1658,9 @@ status_t init_conf(brgemm_matmul_conf_t &conf, dim_t batch, dim_t M, dim_t K,
     const auto vnni_granularity = data_type_vnni_granularity(out_type);
     if (vnni_granularity <= 0) return status::invalid_arguments;
 
+    // Zero initialize the `conf` to avoid access to 'garbage' in members.
+    conf = brgemm_matmul_conf_t();
+
     const bool is_bf16_with_int_wei = out_type == data_type::bf16
             && utils::one_of(in_type, data_type::s8, data_type::u8,
                     data_type::s4, data_type::u4);
@@ -1666,6 +1673,7 @@ status_t init_conf(brgemm_matmul_conf_t &conf, dim_t batch, dim_t M, dim_t K,
     conf.is_bf32 = false;
     conf.batch = batch;
     conf.src_dt = conf.wei_dt = out_type;
+    conf.orig_src_dt = conf.orig_wei_dt = in_type;
     // Note: will need to change `tr_a_dt_sz` for copyA in cases where src_dt != dst_dt
     conf.a_dt_sz = conf.tr_a_dt_sz = types::data_type_size(conf.src_dt);
     conf.N = N;
@@ -1688,7 +1696,6 @@ status_t init_conf(brgemm_matmul_conf_t &conf, dim_t batch, dim_t M, dim_t K,
         conf.transposed_B = utils::one_of(in_tag, ba, acb);
         conf.is_bf16_with_int_wei = is_bf16_with_int_wei;
         conf.with_wei_decompression = with_wei_decompression;
-        conf.orig_wei_dt = in_type;
         conf.wei_tag = in_tag;
         conf.wei_n_blk = conf.N_blk = conf.LDB = n_blk;
         conf.N_tail = conf.N % conf.N_blk;
@@ -1827,10 +1834,11 @@ void init_aux_values(brgemm_matmul_conf_t &bgmmc,
     bgmmc.has_zero_point_b = bgmmc.wei_zp_type != brgemm_broadcast_t::none;
     bgmmc.has_zero_point_c = bgmmc.dst_zp_type != brgemm_broadcast_t::none;
     bgmmc.post_ops_applicable = one_of(true, bgmmc.with_sum, bgmmc.with_bias,
-            bgmmc.with_scales, bgmmc.with_eltwise, bgmmc.with_binary,
-            bgmmc.acc_dt != bgmmc.dst_dt, bgmmc.s8s8_compensation_required,
-            bgmmc.has_zero_point_a, bgmmc.has_zero_point_b,
-            bgmmc.has_zero_point_c, bgmmc.with_dst_scales);
+            bgmmc.with_scales && !bgmmc.apply_scales_in_buffer_b,
+            bgmmc.with_eltwise, bgmmc.with_binary, bgmmc.acc_dt != bgmmc.dst_dt,
+            bgmmc.s8s8_compensation_required, bgmmc.has_zero_point_a,
+            bgmmc.has_zero_point_b, bgmmc.has_zero_point_c,
+            bgmmc.with_dst_scales);
 
     bgmmc.zp_a_comp_shift_n = bgmmc.wei_n_blk;
     bgmmc.zp_a_comp_elems_per_thr

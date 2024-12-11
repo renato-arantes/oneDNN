@@ -78,11 +78,12 @@ macro(platform_gnu_nowarn_ccxx_flags var gnu_version)
     append(${var} "-Wno-strict-overflow")
     # suppress false positive warnings about uninitialized variables
     append(${var} "-Wno-maybe-uninitialized")
-    # suppress false positive warnings with 10.x: GCC Bugzilla – Bug 96963
+    # suppress false positive warnings with 9.x+: GCC Bugzilla – Bug 96963
     # assume 0.0 is unknown version - always suppress the warning
     if(${gnu_version} VERSION_EQUAL 0.0 OR
-        (${gnu_version} VERSION_GREATER 10.0 AND ${gnu_version} VERSION_LESS 11.0))
+        ${gnu_version} VERSION_GREATER 9.0)
         append(${var} "-Wno-stringop-overflow")
+        append(${var} "-Wno-array-bounds")
     endif()
 endmacro()
 
@@ -438,7 +439,10 @@ if (DNNL_TARGET_ARCH STREQUAL "RV64")
     # Check if the RVV Intrinsics can be compiled with the current toolchain and flags
     include(CheckCXXSourceCompiles)
     check_cxx_source_compiles("#include <riscv_vector.h>
-                               int main() { return 0; };"
+                               int main() { 
+                                size_t size = 64;
+                                return vsetvl_e32m2(size); 
+                               };"
                                CAN_COMPILE_RVV_INTRINSICS
     )
     # set CAN_COMPILE_RVV_INTRINSICS to TRUE / FALSE instead of 1 / "" (Undefined)

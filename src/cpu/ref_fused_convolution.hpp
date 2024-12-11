@@ -74,13 +74,7 @@ struct ref_fused_convolution_fwd_t : public primitive_t {
     };
 
     struct pd_t : public cpu_convolution_fwd_pd_t {
-        pd_t(const convolution_desc_t *adesc, const primitive_attr_t *attr,
-                const typename pd_t::base_class *hint_fwd_pd)
-            : cpu_convolution_fwd_pd_t(adesc, attr, hint_fwd_pd) {
-            name_ = "ref_fused_convolution:any";
-        }
-
-        pd_t(const pd_t &other) = default;
+        using cpu_convolution_fwd_pd_t::cpu_convolution_fwd_pd_t;
 
         DECLARE_COMMON_PD_T(name_.c_str(), ref_fused_convolution_fwd_t);
 
@@ -99,21 +93,29 @@ struct ref_fused_convolution_fwd_t : public primitive_t {
 
         const memory_desc_t *src_md(
                 int index = 0, bool user_input = false) const override {
+            if (op_pds_.empty())
+                return cpu_convolution_fwd_pd_t::src_md(index, user_input);
             return op_pds_.front()->src_md(index, user_input);
         }
 
         const memory_desc_t *dst_md(
                 int index = 0, bool user_input = false) const override {
+            if (op_pds_.empty())
+                return cpu_convolution_fwd_pd_t::dst_md(index, user_input);
             return op_pds_.back()->dst_md(index, user_input);
         }
 
         const memory_desc_t *weights_md(
                 int index = 0, bool user_input = false) const override {
+            if (op_pds_.empty())
+                return cpu_convolution_fwd_pd_t::weights_md(index, user_input);
             return op_pds_.front()->weights_md(index, user_input); // for now
         }
 
         const memory_desc_t *arg_md(
                 int arg, bool user_input = false) const override {
+            if (op_pds_.empty())
+                return cpu_convolution_fwd_pd_t::arg_md(arg, user_input);
             // Binary post-op:
             // format_tag::any should be supported here since output dst_md
             // may be different from the intermediate one and they should be
@@ -175,7 +177,7 @@ struct ref_fused_convolution_fwd_t : public primitive_t {
         std::vector<arg_cache_t> args_;
 
     private:
-        std::string name_;
+        std::string name_ = "ref_fused_convolution:any";
         const unsigned int max_fusions_ = 1;
 
         status_t append_op(std::shared_ptr<primitive_desc_t> &op_pd,

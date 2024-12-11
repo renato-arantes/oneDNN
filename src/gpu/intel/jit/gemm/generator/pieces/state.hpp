@@ -261,6 +261,7 @@ struct GEMMState : public CommonState {
     GRFMultirange Ao_regs, Bo_regs;                         // Outgoing data to copy to SLM.
     GRFMultirange Ao_regsRem, Bo_regsRem;
     GRFMultirange As_regs, Bs_regs;                         // A row sums/B column sums.
+    GRFMultirange Asr_regs, Bsr_regs;                       // A row sums/B column sums to be repacked.
     GRFMultirange Ap_regs, Bp_regs, Cp_regs;                // A/B/C prefetch registers.
     GRFMultirange A_offsetRegs, B_offsetRegs;               // A/B offsets (grouped).
     GRFMultirange A_scaleRegs, B_scaleRegs;                 // A/B scales (grouped).
@@ -269,6 +270,7 @@ struct GEMMState : public CommonState {
     std::vector<MaskAssignment> AB_masks, AB_masksCoop;
     ngen::GRFRange broadcast_regs;
     std::vector<ngen::GRFRange> tempMul_regs;
+    ngen::Subregister groupIDMN;                            // d
     ngen::Subregister i0, j0, h0;                           // d
     ngen::Subregister wgI0, wgJ0;                           // d
     ngen::Subregister threadK0, k0Rem, wgK;                 // ud
@@ -327,6 +329,7 @@ struct GEMMState : public CommonState {
     std::vector<RegisterBlock> Ai_layoutRem, Bi_layoutRem;
     std::vector<RegisterBlock> Ao_layout, Bo_layout;
     std::vector<RegisterBlock> As_layout, Bs_layout;
+    std::vector<RegisterBlock> Asr_layout, Bsr_layout;
     std::vector<RegisterBlock> Ap_layout, Bp_layout, Cp_layout;
     std::vector<RegisterBlock> Ap_layoutAlt, Bp_layoutAlt;
     std::vector<RegisterBlock> A_offsetLayout, B_offsetLayout;
@@ -372,6 +375,7 @@ struct GEMMState : public CommonState {
     bool repackA = false, repackB = false;
     bool repackARem = false, repackBRem = false;
     int ka_repack, ka_repackRem, kb_repackRem;
+    int cRepackPeriod = 0;
     bool remActiveA, remActiveB, remActiveSLM;
     std::vector<MaskAssignment> kMasksA, kMasksB, kMasksAi, kMasksBi;
     int initSLMKOffset = 0;
@@ -382,6 +386,11 @@ struct GEMMState : public CommonState {
     ngen::GRF emulate64TempSave[2];
     bool simd32KMasks = false;
     int lastThresh = 0;
+    ngen::Subregister nextGroupIDM, nextGroupIDN;
+    ngen::Subregister nextFlagL3PFA, nextFlagL3PFB;
+    ngen::FlagRegister flagL3PFA, flagL3PFB;
+    std::vector<RegisterBlock> Apl3_layout, Bpl3_layout;
+    std::vector<ngen::GRFRange> Apl3_addrs, Bpl3_addrs;
 
     std::vector<ngen::Subregister> effBinary;
 

@@ -192,6 +192,7 @@ int execute(const prb_t *prb, const args_t &args, res_t *res) {
     int ret = pad.reorder(src);
     if (ret != OK) { res->state = FAILED; }
     // update output shape with dense stride
+    dnnl_memory_desc_destroy(pad.md_);
     dnnl_memory_desc_create_with_string_tag(&pad.md_, dst.ndims(), dst.dims(),
             dst.dt(), normalize_tag(tag::abx, dst.ndims()).c_str());
     ret = dst.reorder(pad);
@@ -272,7 +273,7 @@ void init_memory_args(dnn_mem_map_t &mem_map, const prb_t *prb,
 
 int init_ref_memory_args(dnn_mem_map_t &ref_mem_map, dnn_mem_map_t &mem_map,
         const prb_t *prb, res_t *res) {
-    if (has_bench_mode_modifier(mode_modifier_t::no_host_memory)) return OK;
+    if (has_bench_mode_modifier(mode_modifier_t::no_ref_memory)) return OK;
 
     switch (prb->alg) {
         case SELECT:

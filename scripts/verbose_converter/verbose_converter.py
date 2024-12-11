@@ -17,7 +17,6 @@
 
 import argparse
 import logging
-import os
 import sys
 from argparse import RawTextHelpFormatter
 from typing import IO, Dict, Iterable, List
@@ -25,14 +24,20 @@ from typing import IO, Dict, Iterable, List
 from src.benchdnn_generator import InputGenerator  # type: ignore
 from src.breakdown_generator import BreakdownGenerator  # type: ignore
 from src.dnnl_parser import LogParser  # type: ignore
-from src.utils import check_version, dedent  # type: ignore
+from src.utils import check_version  # type: ignore
 
+default_events = "exec", "create"
+stream_handler = logging.StreamHandler(sys.stderr)
+fmt = logging.Formatter(fmt="{levelname}: {name}: {message}", style="{")
+# workaround for nvim-treesitter indent bug: }
+stream_handler.setFormatter(fmt)
 logger = logging.getLogger("verbose_converter")
 logger.setLevel(logging.CRITICAL + 10)  # off
+logger.addHandler(stream_handler)
 
 
 def one_line(multiline: str):
-    return dedent(multiline).replace(os.sep, " ")
+    return " ".join(map(str.strip, multiline.split("\n"))).strip()
 
 
 class ConverterError(RuntimeError):
@@ -50,7 +55,7 @@ def convert(
     generator: str,
     split_output: bool,
     agg_keys: List[str],
-    events: Iterable[str] = ("create", "exec"),
+    events: Iterable[str] = default_events,
 ) -> Dict[str, str]:
     if not check_version():
         raise ConverterError("Unsupported Python version")
@@ -71,6 +76,15 @@ def convert(
     elif action == "generate":
         logger.info("Generating output ...")
         if generator == "benchdnn":
+            if "create_nested" in events:
+                logger.warning(
+                    one_line(
+                        """
+                        Benchdnn arguments generated from create_nested events
+                        may not work!
+                        """
+                    )
+                )
             return generate(InputGenerator(logger), log_parser, split_output)
         elif generator == "breakdown":
             return generate(BreakdownGenerator(logger), log_parser, agg_keys)
@@ -104,7 +118,7 @@ def main() -> int:
         "aux",
         "shapes",
     ]
-    event_opts = ["exec", "create"]
+    event_opts = list(default_events) + ["create_nested"]
     args_parser = argparse.ArgumentParser(
         description="oneDNN log converter", formatter_class=RawTextHelpFormatter
     )
@@ -162,7 +176,7 @@ def main() -> int:
         "-e",
         "--events",
         nargs="+",
-        default=event_opts,
+        default=list(default_events),
         help=one_line(
             f"""
              events to parse (default: create and exec). Values: {event_opts}.
@@ -172,6 +186,7 @@ def main() -> int:
     args = args_parser.parse_args()
 
     # validate options
+    logger.setLevel(logging.ERROR)
     try:
         validate_option(args.action, action_opts, "Unknown action value")
         validate_option(
@@ -181,6 +196,8 @@ def main() -> int:
         validate_option(
             args.generator, generator_opts, "Unknown generator value"
         )
+        for event in args.events:
+            validate_option(event, event_opts, "Unknown event")
     except ConverterError as e:
         logger.error(str(e))
         return 1
@@ -192,7 +209,7 @@ def main() -> int:
             for line in sys.stdin:
                 input_data.append(line)
         else:
-            logger.warn("No input was provided to the script")
+            logger.warning("No input was provided to the script")
             args_parser.print_help()
     else:
         try:
@@ -206,8 +223,8 @@ def main() -> int:
         if args.generator == "breakdown"
         else [args.events]
     )
-    verbose_level = [logging.WARN, logging.INFO][args.verbose_level]
-    logger.setLevel(verbose_level)
+    verbosity_levels = [logging.WARNING, logging.INFO]
+    logger.setLevel(verbosity_levels[args.verbose_level])
 
     for events in event_sets:
         try:

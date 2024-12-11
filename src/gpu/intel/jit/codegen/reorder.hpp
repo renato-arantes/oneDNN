@@ -519,6 +519,12 @@ void emit_reorder_1d_tile(ngen::HW hw, GeneratorT *host,
                 if (dst_bf8 || dst_hf8) {
                     auto t1 = tmp1.subregister(0, ngen::DataType::hf);
                     auto t2 = tmp2.subregister(0, conv_src);
+                    if (s.getByteOffset() != 0) {
+                        plan(mov, esize,
+                                t2.reinterpret(0, src_raw)(conv_src_stride),
+                                s.reinterpret(0, src_raw)(conv_src_stride));
+                        s = t2;
+                    }
                     plan(mov, esize, t1.reinterpret(0, src_raw)(1),
                             s.reinterpret(0, src_raw)(conv_src_stride));
                     plan(mov, esize, t2.reinterpret(0, dst_type)(1),
@@ -561,9 +567,15 @@ void emit_reorder_1d_tile(ngen::HW hw, GeneratorT *host,
                     0, ngen::DataType::hf);
             dst = std::move(tmp_dst);
         }
-        if (do_pre_reorder)
+        if (do_pre_reorder) {
+            const int src_nregs
+                    = utils::div_up(width * 2 * src_stride, grf_size);
+            auto tmp_src = lex_scope.alloc_reg_buf_data(src_nregs).format(
+                    0, src_type);
             emit_reorder_1d_tile(
-                    hw, host, scope, width, src, src_stride, src, 1);
+                    hw, host, scope, width, src, src_stride, tmp_src, 1);
+            src = std::move(tmp_src);
+        }
         auto tmp1 = lex_scope.alloc_reg_buf_data(step_nregs);
         auto tmp2 = lex_scope.alloc_reg_buf_data(step_nregs);
         for (int i = 0; i < width; i += step) {
@@ -578,18 +590,29 @@ void emit_reorder_1d_tile(ngen::HW hw, GeneratorT *host,
                     s.reinterpret(0, ngen::DataType::ub)(1), 7);
             host->and_(esize, tmp2.subregister(0, ngen::DataType::uw)(1),
                     tmp2.subregister(0, ngen::DataType::uw)(1), 0x3F80);
-            host->cmp(esize | host->eq | host->f0[0], host->null.uw(),
-                    tmp2.subregister(0, ngen::DataType::uw)(1), 0x3F80);
+
+            host->xor_(esize, tmp1.subregister(0, ngen::DataType::uw)(1),
+                    tmp1.subregister(0, ngen::DataType::uw)(1), 0x7F00);
             host->mul(esize, tmp2.subregister(0, ngen::DataType::hf)(1),
                     tmp2.subregister(0, ngen::DataType::hf)(1),
                     ngen::Immediate::hf(0x5c00));
-            host->mov(esize | host->f0[0],
-                    tmp2.subregister(0, ngen::DataType::uw)(1), 0x7C01);
-            host->csel(esize | host->gt,
+            host->csel(esize | host->ze,
                     tmp2.subregister(0, ngen::DataType::hf)(1),
+                    ngen::Immediate::hf(0x7C01),
                     tmp2.subregister(0, ngen::DataType::hf)(1),
-                    -tmp2.subregister(0, ngen::DataType::hf)(1),
                     tmp1.subregister(0, ngen::DataType::hf)(1));
+            if (hw >= ngen::HW::XeHPG) {
+                host->bfn(esize, 0xCA,
+                        tmp2.subregister(0, ngen::DataType::uw)(1),
+                        tmp2.subregister(0, ngen::DataType::uw)(1),
+                        tmp1.subregister(0, ngen::DataType::uw)(1), 0x8000);
+            } else {
+                host->and_(esize, tmp1.subregister(0, ngen::DataType::uw)(1),
+                        tmp1.subregister(0, ngen::DataType::uw)(1), 0x8000);
+                host->or_(esize, tmp2.subregister(0, ngen::DataType::uw)(1),
+                        tmp2.subregister(0, ngen::DataType::uw)(1),
+                        tmp1.subregister(0, ngen::DataType::uw)(1));
+            }
             host->mov(esize, d.reinterpret(0, ngen::DataType::uw)(dst_stride),
                     tmp2.subregister(0, ngen::DataType::uw)(1));
         }
@@ -628,7 +651,7 @@ void emit_reorder_1d_tile(ngen::HW hw, GeneratorT *host,
             auto s = src.subregister(i, esize, src_type_size);
             auto d = dst.subregister(i, esize, dst_stride);
             // get sign bits
-            host->and_(esize | host->nz | host->f2[0], host->null.uw(),
+            host->and_(esize | host->nz | host->f0[1], host->null.uw(),
                     s.reinterpret(0, ngen::DataType::uw)(1), 0x8000);
             // multiply by hf 128 to force overflow of exponent
             host->mul(esize, s.reinterpret(0, ngen::DataType::hf)(1),
@@ -656,7 +679,7 @@ void emit_reorder_1d_tile(ngen::HW hw, GeneratorT *host,
             host->mov(esize | host->f0[0],
                     s.reinterpret(0, ngen::DataType::uw)(1), 0x7F);
             // handle sign.
-            host->or_(esize | host->f2[0],
+            host->or_(esize | host->f0[1],
                     s.reinterpret(0, ngen::DataType::uw)(1),
                     s.reinterpret(0, ngen::DataType::uw)(1), 0x80);
 
@@ -1036,8 +1059,6 @@ void emit_reorder_1d_tile(ngen::HW hw, GeneratorT *host,
         auto step_size = step * src_type_size * src_stride;
         auto tmp_regs = utils::div_up(step_size, grf_size);
         auto tmp = lex_scope.alloc_reg_buf_data(tmp_regs);
-        auto tmp2_regs = utils::div_up(step * dst_type_size, grf_size);
-        auto tmp2 = lex_scope.alloc_reg_buf_data(tmp2_regs);
         for (int i = 0; i < width; i += step) {
             step = std::min(step, width - i);
             step = utils::rnd_down_pow2(step);
@@ -1046,17 +1067,13 @@ void emit_reorder_1d_tile(ngen::HW hw, GeneratorT *host,
                     esize, src_stride);
             auto d = dst.format(i * dst_stride_bytes, ngen::DataType::invalid,
                     esize, dst_stride);
-            auto d_old = d;
-            bool d_half_grf_aligned
-                    = utils::one_of(d.byte_offset(), 0, grf_size / 2);
-            if (!d_half_grf_aligned) { d = tmp2.format(0, dst_type, esize); }
-            if (s.offset() != 0) {
-                auto t = tmp.format(0, src_type, esize, src_stride);
+            if (2 * (d.offset() % 16) != s.offset() && hw >= ngen::HW::XeHPC) {
+                auto t = tmp.format(
+                        4 * (d.offset() % 16), src_type, esize, src_stride);
                 plan(mov, esize, t, s);
                 s = std::move(t);
             }
             plan(mov, esize, d, s);
-            if (!d_half_grf_aligned) plan(mov, esize, d_old, d);
         }
         return;
     }

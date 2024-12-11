@@ -156,7 +156,6 @@ status_t conv_problem_t::init(
     bia_data_type = conv_pd->invariant_bia_md()->data_type;
     dst_data_type = conv_pd->invariant_dst_md()->data_type;
     fpmath_mode = attr->fpmath_.mode_;
-    deterministic = attr->deterministic_;
 
     ndims = conv_pd->ndims();
 
@@ -272,6 +271,7 @@ int prim_config_t::sort_key(const param_t *param) const {
     return (int)(sizeof(ordered_params) / sizeof(ordered_params[0]));
 }
 
+const bool allow_global_reduction_param_t::default_value = true;
 const bwd_d_optimize_kind_t bwd_d_optimize_kind_param_t::default_value
         = bwd_d_optimize_kind_t::none;
 const bool pad_slm_param_t::default_value = true;
@@ -730,10 +730,10 @@ status_t init_tensor_layouts(
 
     if (prb.is_bwd_w) {
         if (utils::one_of(prb.wei_data_type, data_type::bf16, data_type::f16,
-                    data_type::f8_e5m2))
+                    data_type::f8_e5m2, data_type::f8_e4m3))
             wei_layout = wei_layout.retype(type_t::f32());
         if (utils::one_of(prb.bia_data_type, data_type::bf16, data_type::f16,
-                    data_type::f8_e5m2))
+                    data_type::f8_e5m2, data_type::f8_e4m3))
             bia_layout = bia_layout.retype(type_t::f32());
     }
 
@@ -773,31 +773,34 @@ bool hw_ok(const hw_t &hw) {
     return true;
 }
 
-bool data_types_ok(const conv_problem_t &prb, const hw_t &hw) {
+bool data_types_ok(
+        const conv_problem_t &prb, const hw_t &hw, impl::engine_t *engine) {
     auto src = prb.src_data_type;
     auto wei = prb.wei_data_type;
     auto dst = prb.dst_data_type;
     auto bia = prb.bia_data_type;
-    bool is_bf8 = utils::one_of(data_type::f8_e5m2, src, wei, dst, bia);
-    bool is_hf8 = utils::one_of(data_type::f8_e4m3, src, wei, dst, bia);
-    if (!prb.is_f64_conv() && utils::one_of(data_type::f64, src, wei, dst, bia))
+    bool is_fp8 = utils::one_of(data_type::f8_e5m2, src, wei, dst, bia)
+            || utils::one_of(data_type::f8_e4m3, src, wei, dst, bia);
+    if (!prb.is_f64_accumulator()
+            && utils::one_of(data_type::f64, src, wei, dst, bia))
         return false;
-    if (prb.is_f64_conv()
-            && (utils::one_of(hw.to_ngen(), ngen::HW::XeLP, ngen::HW::XeHPG)
-                    && !hw.has_fp64_atomic_support()))
+    auto *compute_engine
+            = utils::downcast<const compute::compute_engine_t *>(engine);
+    auto *device_info = compute_engine->device_info();
+    if (prb.is_f64_accumulator() && !device_info->has_native(data_type::f64))
         return false;
-    if (is_bf8
+    if (is_fp8
             && !(utils::one_of(hw, ngen::HW::XeHPC) && hw.systolic_support()))
         return false;
-    if (is_hf8) return false;
     if (prb.is_fwd) return true;
     if (prb.is_bwd_d) return true;
     if (prb.is_bwd_w) {
         bool ok = true;
         data_type_t default_acc_type
                 = src == data_type::f64 ? data_type::f64 : data_type::f32;
-        ok &= utils::one_of(src, data_type::f8_e5m2, data_type::bf16,
-                data_type::f16, data_type::f32, data_type::f64);
+        ok &= utils::one_of(src, data_type::f8_e5m2, data_type::f8_e4m3,
+                data_type::bf16, data_type::f16, data_type::f32,
+                data_type::f64);
         ok &= (dst == src);
         ok &= (utils::one_of(wei, src, default_acc_type)
                 || (utils::one_of(src, data_type::f8_e4m3, data_type::f8_e5m2)
@@ -844,13 +847,14 @@ bool post_ops_ok(const conv_problem_t &prb, const hw_t &hw) {
     auto *attr = prb.attr;
 
     // No post-ops are supported for f64
-    if (prb.is_f64_conv() && !attr->has_default_values()) return false;
+    if (prb.is_f64_accumulator() && !attr->has_default_values()) return false;
 
     using sm = primitive_attr_t::skip_mask_t;
     auto attr_skip_mask = sm::fpmath_mode;
     if (prb.is_fwd || prb.is_bwd_d) {
         attr_skip_mask |= sm::post_ops | sm::sum_dt | sm::zero_points_runtime
-                | sm::zero_points_runtime_data_type | sm::scales_runtime;
+                | sm::zero_points_runtime_data_type | sm::scales_runtime
+                | sm::rounding_mode;
         if (!attr->has_default_values(attr_skip_mask)) return false;
     } else {
         if (!attr->has_default_values(attr_skip_mask)) return false;
@@ -945,7 +949,7 @@ status_t init_vec_size(conv_config_t &cfg) {
     }
     // SIMD32 produces invalid layouts in bwd_w.
     if (prb.is_bwd_w && !cfg.is_dpas_or_dpasw_fma()) {
-        if (prb.is_f64_conv()) {
+        if (prb.is_f64_accumulator()) {
             vec_size = std::min(vec_size, 8);
         } else {
             vec_size = std::min(vec_size, 16);
@@ -1010,6 +1014,17 @@ bwd_d_optimize_kind_t bwd_d_optimize_kind_hint(const conv_problem_t &prb) {
     return hint;
 }
 
+void init_global_reduction(conv_config_t &cfg) {
+    if (cfg.allow_global_reduction_param().is_overridden()) return;
+    auto &prb = cfg.prb();
+    auto *attr = prb.conv_pd->attr();
+    bool value = true;
+    if (attr->deterministic_) value = false;
+    if (prb.is_f64_accumulator() && !cfg.hw().has_fp64_atomic_support())
+        value = false;
+    cfg.set_allow_global_reduction(value);
+}
+
 // Enable optimization for strided BWD_D convolution.
 void init_bwd_d_optimize(conv_config_t &cfg) {
     if (cfg.bwd_d_optimize_kind_param().is_overridden()) return;
@@ -1023,7 +1038,8 @@ status_t init_pd_time_cfg(const conv_problem_t &prb, conv_config_t &cfg,
     hw_t hw(engine);
 
     VDISPATCH_CHECK(pd, engine, hw_ok(hw), VERBOSE_UNSUPPORTED_ISA);
-    VDISPATCH_CHECK(pd, engine, data_types_ok(prb, hw), VERBOSE_UNSUPPORTED_DT);
+    VDISPATCH_CHECK(
+            pd, engine, data_types_ok(prb, hw, engine), VERBOSE_UNSUPPORTED_DT);
     VDISPATCH_CHECK(
             pd, engine, post_ops_ok(prb, hw), VERBOSE_UNSUPPORTED_POSTOP);
     VDISPATCH_CHECK(
@@ -1045,6 +1061,7 @@ status_t init_pd_time_cfg(const conv_problem_t &prb, conv_config_t &cfg,
     VDISPATCH_CHECK(
             pd, engine, post_op_layouts_ok(prb), VERBOSE_UNSUPPORTED_POSTOP);
 
+    init_global_reduction(cfg);
     init_bwd_d_optimize(cfg);
 
     return status::success;
@@ -1052,7 +1069,8 @@ status_t init_pd_time_cfg(const conv_problem_t &prb, conv_config_t &cfg,
 
 bool pipeline_unroll_hint(const conv_problem_t &prb, fma_kind_t fma_kind,
         const exec_config_t &exec_cfg,
-        bwd_d_optimize_kind_t bwd_d_optimize_kind) {
+        bwd_d_optimize_kind_t bwd_d_optimize_kind,
+        bool allow_global_reduction) {
     bool do_unroll = true;
     if (prb.is_fwd) {
         const int max_unroll = exec_cfg.hw() <= ngen::HW::XeLP ? 4 : 9;
@@ -1072,9 +1090,10 @@ bool pipeline_unroll_hint(const conv_problem_t &prb, fma_kind_t fma_kind,
                         != bwd_d_optimize_kind_t::skip_strided_dhw)
             do_unroll = false;
     } else if (prb.is_bwd_w) {
-        // Deterministic mode requires to have full reduction in one thread which may result in multiple nested loops
-        // with large bounds so disable unrolling to avoid code size blow-up.
-        if (prb.deterministic) do_unroll = false;
+        // Disabled global reduction requires to have full reduction in one
+        // thread which may result in multiple nested loops with large bounds
+        // so disable unrolling to avoid code size blow-up.
+        if (!allow_global_reduction) do_unroll = false;
     }
     // Unrolling with mad or dp4a results in too large kernels.
     if (utils::one_of(fma_kind, fma_kind_t::mad, fma_kind_t::dp4a)
@@ -1086,8 +1105,9 @@ bool pipeline_unroll_hint(const conv_problem_t &prb, fma_kind_t fma_kind,
 void init_pipeline(conv_config_t &cfg) {
     if (cfg.pipeline().is_overridden()) return;
 
-    bool do_unroll = pipeline_unroll_hint(cfg.prb(), cfg.fma_kind(),
-            cfg.exec_cfg(), cfg.bwd_d_optimize_kind());
+    bool do_unroll
+            = pipeline_unroll_hint(cfg.prb(), cfg.fma_kind(), cfg.exec_cfg(),
+                    cfg.bwd_d_optimize_kind(), cfg.allow_global_reduction());
     if (cfg.plan().reuse_headers) do_unroll = false;
     cfg.pipeline().set(do_unroll, cfg.plan().reuse_headers);
 }
@@ -1756,13 +1776,14 @@ status_t init_cfg(conv_config_t &cfg, const primitive_t *prim) {
     static std::mutex tune_mutex;
     std::unique_lock<std::mutex> lock(tune_mutex, std::defer_lock_t());
     if (cfg.tiler().is_tuning_mode()) lock.lock();
-    while (cfg.tiler().can_move_next()) {
+    while (cfg.tiler().is_valid()) {
         auto try_cfg = cfg;
         auto status = try_init_cfg(try_cfg);
         if (status == status::success) {
             cfg = std::move(try_cfg);
             return status::success;
         }
+        cfg.tiler().move_next(cfg);
     }
     return status::runtime_error;
 }

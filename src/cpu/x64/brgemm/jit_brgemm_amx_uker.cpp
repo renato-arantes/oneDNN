@@ -263,6 +263,9 @@ private:
         virtual bool operator==(const dim_iteration_t &rhs) const {
             return blocks == rhs.blocks;
         }
+        virtual bool operator!=(const dim_iteration_t &rhs) const {
+            return !operator==(rhs);
+        }
 
         size_t pos(size_t b) const {
             assert(b < blocks.size());
@@ -307,12 +310,19 @@ private:
         bd_iteration_t *similar {nullptr};
         Label lstart;
 
-        virtual bool operator==(const bd_iteration_t &rhs) const {
+        bool operator==(const dim_iteration_t &_rhs) const override {
+            // `downcast` will catch a type mismatch in debug mode.
+            // Note: it supports only a pointer type so far.
+            const bd_iteration_t &rhs
+                    = *utils::downcast<const bd_iteration_t *>(&_rhs);
             bool res = dim_iteration_t::operator==(rhs)
                     && A_shift == rhs.A_shift && C_shift == rhs.C_shift
                     && D_shift == rhs.D_shift && bd_mask == rhs.bd_mask
                     && zp_comp_pad_a_shift == rhs.zp_comp_pad_a_shift;
             return res;
+        }
+        bool operator!=(const dim_iteration_t &_rhs) const override {
+            return !operator==(_rhs);
         }
     };
 
@@ -2571,11 +2581,7 @@ void jit_brgemm_amx_uker_base_t::generate() {
             && brg.brgattr.bd_mask_level == 0;
     need_to_apply_alpha_beta_
             = (brg.beta != 0.f && !may_load_accumulators_) || brg.alpha != 1.f;
-    const bool has_zero_points = !everyone_is(brgemm_broadcast_t::none,
-            brg.zp_type_a, brg.zp_type_b, brg.zp_type_c);
-    are_post_ops_applicable_ = one_of(true, brg.with_eltwise, brg.with_binary,
-            brg.with_scales, brg.with_bias, brg.with_sum, brg.dt_d != brg.dt_c,
-            has_zero_points, brg.with_dst_scales);
+    are_post_ops_applicable_ = brg.are_post_ops_applicable();
 
     // second level blocking eligible only if we don't use store by vectors for now
     assert(IMPLICATION(are_post_ops_applicable_ || need_to_apply_alpha_beta_

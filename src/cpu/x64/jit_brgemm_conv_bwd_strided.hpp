@@ -44,11 +44,7 @@ template <cpu_isa_t isa>
 struct brgemm_convolution_bwd_strided_t : public primitive_t {
 
     struct pd_t : public cpu_convolution_bwd_data_pd_t {
-        pd_t(const convolution_desc_t *adesc, const primitive_attr_t *attr,
-                const typename pd_t::hint_class *hint_fwd_pd)
-            : cpu_convolution_bwd_data_pd_t(adesc, attr, hint_fwd_pd) {}
-
-        ~pd_t() = default;
+        using cpu_convolution_bwd_data_pd_t::cpu_convolution_bwd_data_pd_t;
 
         DECLARE_COMMON_PD_T(JIT_IMPL_NAME_HELPER("brgconv_strided:", isa, ""),
                 brgemm_convolution_bwd_strided_t);
@@ -58,20 +54,53 @@ struct brgemm_convolution_bwd_strided_t : public primitive_t {
         int brgs_sz_;
         std::shared_ptr<brgemm_containers::brgemm_desc_container_t> brgs_;
 
-        jit_brgemm_conv_conf_t jcp_;
+        jit_brgemm_conv_conf_t jcp_ = utils::zero<decltype(jcp_)>();
         // batch size info
         const int first_bs = 0;
-        int get_brg_idx(int bs, int m, bool do_initialization, bool is_N_tail,
+
+        // need custom hasher to use array as key in unordered_map
+        template <int asize>
+        struct ahasher {
+            size_t operator()(const std::array<int, asize> &a) const {
+                size_t seed = 0;
+                for (auto e : a)
+                    seed = hash_combine(seed, e);
+                return seed;
+            }
+        };
+        template <int asize>
+        using Arrmap = std::unordered_map<std::array<int, asize>, int,
+                ahasher<asize>>;
+
+        int brg_indices_c {0};
+        Arrmap<4> brg_indices;
+
+        int get_brg_idx(int m, bool do_initialization, bool is_N_tail,
                 bool is_K_tail) const {
-            const int bs_c = 1;
-            auto bs_idx = 0;
-            return (((m * bs_c + bs_idx) * 2
-                            + static_cast<int>(do_initialization))
-                                   * 2
-                           + static_cast<int>(is_N_tail))
-                    * 2
-                    + static_cast<int>(is_K_tail);
+            const auto brg_idx = brg_indices.find(
+                    {m, is_N_tail, is_K_tail, do_initialization});
+            if (brg_idx == brg_indices.end()) return -1;
+            return brg_idx->second;
         }
+
+        int get_any_brg_idx(bool is_N_tail, bool is_K_tail) const {
+            // return first defined brgemm_descriptor for specified parameters
+            for (const auto &key_value_pair : brg_indices) {
+                const bool i_N = key_value_pair.first[1];
+                const bool i_K = key_value_pair.first[2];
+                if ((jcp_.N == jcp_.N_tail || is_N_tail == i_N)
+                        && (jcp_.K == jcp_.K_tail || is_K_tail == i_K))
+                    return key_value_pair.second;
+            }
+            return 0;
+        }
+
+        status_t add_brg_descriptor(
+                int M, bool is_N_tail, bool is_K_tail, bool do_init);
+        void get_kw_range(int iw, int iw_raw, int &kw_s, int &kw_full_s,
+                int &kw_full_e, int &kw_e) const;
+        void get_iw_range(
+                int iw, int iw_raw, int kw, int &ow_s, int &ow_e) const;
     };
 
     brgemm_convolution_bwd_strided_t(const pd_t *apd)
@@ -157,10 +186,6 @@ private:
         return utils::div_up(IW, SW) * (iw % SW) + iw / SW;
     }
 
-    void get_kw_range(int iw, int iw_raw, int &kw_s, int &kw_full_s,
-            int &kw_full_e, int &kw_e) const;
-    void get_iw_range(int iw, int iw_raw, int kw, int &ow_s, int &ow_e) const;
-
     void ker_base(brgemm_bwd_thread_ctx_t &btc) const;
     void ker_trans(brgemm_bwd_thread_ctx_t &btc, char *inp_buffer) const;
 
@@ -188,7 +213,7 @@ private:
 
     status_t add_po_kernel(brgemm_desc_t *bcfg, int ker_idx, bool is_init);
     void add_po_kernels(int i_N, int init_bcast_dim, int po_bcast_dim);
-    status_t add_brg_kernel(int bs, int M, int i_N, int i_K, int i_init);
+    status_t add_brg_kernel(int brg_idx);
 
     void cal_compensation(const char *__restrict weights,
             int32_t *src_zp_buffer, int32_t *s8s8_comp_buffer) const;

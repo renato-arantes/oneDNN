@@ -214,7 +214,7 @@ inline status_t init_tag(format_tag_t &tag, memory_desc_t &md,
             tag = format_tag::undef;
         }
     } else {
-        tag = mdw.matches_one_of_tag(tag_value);
+        tag = mdw.mb_stride_relaxed_match(tag_value);
     }
 
     VDISPATCH_CONV_IC(tag == tag_value, VERBOSE_UNSUPPORTED_TAG);
@@ -2296,12 +2296,18 @@ status_t init_conf(jit_brgemm_conv_conf_t &jcp, cpu_isa_t isa,
 
     // For padding shapes, we calculate the comp along with the computation
     // inside brgemm kernel when output size is small to get optimal perf
-    // Or we calculate the comp using brgemm_coomp_pad kernel
+    // For shapes with large ow we calculate the comp inside brgemm kernel too
+    // because current implementation of brgemm_comp_pad kernel unrolled by ow
+    // so not optimal for large ow.
+    // Otherwise we calculate the comp using brgemm_comp_pad kernel
     const auto output_sz = static_cast<dim_t>(jcp.mb) * jcp.ngroups * jcp.oc
             * jcp.od * jcp.oh * jcp.ow;
+    // TODO: revise below condition to avoid limitation for big ow
+    const auto shape_for_brgemm_kernel
+            = (output_sz <= 8192 && jcp.oc < 512) || jcp.ow > 128;
+    const auto is_relo = jcp.is_relo() && jcp.relo_conv_weights;
     jcp.req_brg_comp_pad = compensation_w_padding && jcp.exec_type != exec_trans
-            && IMPLICATION(!(jcp.is_relo() && jcp.relo_conv_weights),
-                    output_sz <= 8192 && jcp.oc < 512);
+            && IMPLICATION(!is_relo, shape_for_brgemm_kernel);
     jcp.req_cal_comp_pad = compensation_w_padding && !jcp.req_brg_comp_pad
             && IMPLICATION(jcp.exec_type == exec_vpad,
                     jcp.t_pad > 0 || jcp.b_pad > 0 || jcp.f_pad > 0

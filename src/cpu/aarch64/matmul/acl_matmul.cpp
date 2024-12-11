@@ -15,6 +15,7 @@
 *******************************************************************************/
 
 #include "cpu/aarch64/matmul/acl_matmul.hpp"
+#include <mutex>
 
 namespace dnnl {
 namespace impl {
@@ -76,12 +77,18 @@ status_t acl_matmul_t::pd_t::init(engine_t *engine) {
             = utils::everyone_is(data_type::bf16, src_md()->data_type,
                       weights_md()->data_type, dst_md()->data_type)
             && platform::has_data_type_support(data_type::bf16);
+    const bool is_bf16f32_ok
+            = utils::everyone_is(data_type::bf16, src_md()->data_type,
+                      weights_md()->data_type)
+            && utils::everyone_is(data_type::f32, dst_md()->data_type)
+            && platform::has_data_type_support(data_type::bf16);
 
     // we need to save this state as it can change inside set_default_formats()
     weights_format_kind_ = weights_md_.format_kind;
 
     VDISPATCH_MATMUL(is_dense_format_kind(), VERBOSE_UNSUPPORTED_SPARSE_CFG);
-    VDISPATCH_MATMUL(utils::one_of(true, is_fp32_ok, is_fp16_ok, is_bf16_ok),
+    VDISPATCH_MATMUL(utils::one_of(true, is_fp32_ok, is_fp16_ok, is_bf16_ok,
+                             is_bf16f32_ok),
             VERBOSE_UNSUPPORTED_DT_CFG);
     VDISPATCH_MATMUL(!has_zero_dim_memory(), VERBOSE_EMPTY_TENSOR, "");
     VDISPATCH_MATMUL(set_default_formats(), VERBOSE_UNSUPPORTED_TAG);
@@ -164,12 +171,20 @@ status_t acl_matmul_t::pd_t::init(engine_t *engine) {
 
 template <bool IsFixedFormat>
 status_t acl_matmul_t::execute_forward(const exec_ctx_t &ctx) const {
-
     status_t status = status::success;
     auto src_base = CTX_IN_MEM(const data_t *, DNNL_ARG_SRC);
     auto wei_base = CTX_IN_MEM(const data_t *, DNNL_ARG_WEIGHTS);
 
-    auto amp = pd()->amp_;
+    const auto &amp = pd()->amp_;
+
+    std::unique_lock<std::mutex> locker {mtx_, std::defer_lock};
+
+    // Some of the underlying kernels used by ACL still require some state and
+    // are not safe to be called in parallel with different execution contexts.
+    // Eventually when all kernels are truly stateless, this guard can be
+    // removed.
+    if (!acl_obj_->asm_gemm.has_stateless_impl()) { locker.lock(); }
+
     bool is_transA = amp.is_transA;
     bool is_transB = amp.is_transB;
     bool do_transC = amp.do_transC;

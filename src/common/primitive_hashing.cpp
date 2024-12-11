@@ -30,7 +30,7 @@ namespace primitive_hashing {
 key_t::key_t(const engine_t *engine, const op_desc_t *op_desc,
         const primitive_attr_t *attr, int pd_iterator_offset,
         const std::vector<memory_desc_t> &hint_mds, int skip_idx)
-    : primitive_kind_(op_desc->kind)
+    : primitive_kind_(op_desc->primitive_kind)
     , op_desc_(op_desc)
     , attr_(attr)
     , pd_iterator_offset_(pd_iterator_offset)
@@ -55,14 +55,20 @@ bool key_t::operator==(const key_t &rhs) const {
         && pd_iterator_offset_ == rhs.pd_iterator_offset_
         && impl_nthr_ == rhs.impl_nthr_
         && skip_idx_ == rhs.skip_idx_
-        && (*attr_) == (*rhs.attr_);
+        && (*attr_) == (*rhs.attr_)
+        && std::equal(
+            hint_mds_.begin(), hint_mds_.end(), rhs.hint_mds_.begin());
 
-    if (!ret) return false;
+    if (!ret) {
+        // ANCHOR: HASHING_DEBUGINFO_16.
+        VDEBUGINFO(16, primitive, hashing, "operator==,ret=%d", ret);
+        return ret;
+    }
 
 #define CASE(pkind) \
     case primitive_kind::pkind: \
-        ret = cast_to_desc<pkind##_desc_t>(op_desc_) \
-                == cast_to_desc<pkind##_desc_t>(rhs.op_desc_); \
+        ret = *op_desc_t::to_desc<pkind##_desc_t>(op_desc_) \
+                == *op_desc_t::to_desc<pkind##_desc_t>(rhs.op_desc_); \
         break;
 
         switch ((int)primitive_kind_) {
@@ -71,8 +77,8 @@ bool key_t::operator==(const key_t &rhs) const {
             CASE(concat)
             // Use a custom comparison function that ignores alg_kind.
             case primitive_kind::convolution:
-                ret = compare_conv_opdesc(cast_to_desc<convolution_desc_t>(op_desc_),
-                cast_to_desc<convolution_desc_t>(rhs.op_desc_));
+                ret = compare_conv_opdesc(*op_desc_t::to_desc<convolution_desc_t>(op_desc_),
+                *op_desc_t::to_desc<convolution_desc_t>(rhs.op_desc_));
             break;
             CASE(deconvolution)
             CASE(eltwise)
@@ -98,10 +104,9 @@ bool key_t::operator==(const key_t &rhs) const {
 #undef CASE
     // clang-format on
 
-    if (!ret) return false;
-
-    return std::equal(
-            hint_mds_.begin(), hint_mds_.end(), rhs.hint_mds_.begin());
+    // ANCHOR: HASHING_DEBUGINFO_16.
+    VDEBUGINFO(16, primitive, hashing, "operator==,ret=%d", ret);
+    return ret;
 }
 
 // Combine hash of each memory_desc_t data member

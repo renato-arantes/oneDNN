@@ -29,6 +29,8 @@
 /// oneDNN namespace
 namespace dnnl {
 
+#ifdef DNNL_EXPERIMENTAL_UKERNEL
+
 /// @addtogroup dnnl_api_utils
 /// @{
 
@@ -58,6 +60,8 @@ struct handle_traits<dnnl_ukernel_attr_params_t> {
 /// @endcond
 
 /// @} dnnl_api_utils
+
+#endif
 
 /// @addtogroup dnnl_api_ukernel Ukernels
 /// Collection of ukernels
@@ -293,6 +297,21 @@ struct brgemm : public handle<dnnl_brgemm_t> {
         return size;
     }
 
+    /// Returns the flag indicating when the call to execute with post
+    /// operations is valid.
+    ///
+    /// `True` is for a valid call, `false`, otherwise.
+    bool is_execute_postops_valid() const {
+        int valid;
+        dnnl_status_t status
+                = dnnl_brgemm_is_execute_postops_valid(get(), &valid);
+        if (status != dnnl_success)
+            error::wrap_c_api(status,
+                    "could not query a flag for execute postops from a BRGeMM "
+                    "ukernel object");
+        return static_cast<bool>(valid);
+    }
+
     /// Initializes the hardware-specific context. Affects the global state for
     /// all BRGeMM ukernel objects. If no initialization required, returns.
     void set_hw_context() const {
@@ -353,7 +372,7 @@ struct brgemm : public handle<dnnl_brgemm_t> {
     ///     post-op or scales were set.
     void execute(const void *A, const void *B,
             const std::vector<std::pair<memory::dim, memory::dim>> &A_B_offsets,
-            void *C, void *D, void *scratchpad,
+            const void *C, void *D, void *scratchpad,
             const attr_params &params = default_attr_params()) const {
         // TODO: export batch_element to C API later for user to fill it and
         // pass directly to the call.
