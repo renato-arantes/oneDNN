@@ -120,6 +120,16 @@ endif()
 if(MSVC)
     set(USERCONFIG_PLATFORM "x64")
     append_if(DNNL_WERROR CMAKE_CCXX_FLAGS "/WX")
+
+    # Generating frame pointers for easier performance profiling
+    if(DNNL_TARGET_ARCH STREQUAL "X64")
+        if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+            append(CMAKE_CCXX_FLAGS "-fno-omit-frame-pointer -mno-omit-leaf-frame-pointer")
+        else()
+            append(CMAKE_CCXX_FLAGS "/Oy-")
+        endif()
+    endif()
+
     if(${CMAKE_CXX_COMPILER_ID} STREQUAL MSVC)
         append(CMAKE_CCXX_FLAGS "/MP")
         # increase number of sections in obj file
@@ -153,7 +163,7 @@ if(MSVC)
         # disable: icpc deprecation notice
         append(CMAKE_CXX_FLAGS_DEBUG "-Qdiag-disable:10441")
     endif()
-    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    if(CMAKE_CXX_COMPILER_ID MATCHES "(Apple)?[Cc]lang")
         append(CMAKE_CCXX_NOEXCEPT_FLAGS "-fno-exceptions")
         # Clang cannot vectorize some loops with #pragma omp simd and gets
         # very upset. Tell it that it's okay and that we love it
@@ -233,11 +243,16 @@ elseif(UNIX OR MINGW)
         append(CMAKE_CCXX_FLAGS "-Wsign-compare")
     endif()
 
+    # Generating frame pointers for easier performance profiling
+    if(DNNL_TARGET_ARCH STREQUAL "X64")
+        append(CMAKE_CCXX_FLAGS "-fno-omit-frame-pointer -mno-omit-leaf-frame-pointer")
+    endif()
+
     platform_unix_and_mingw_common_ccxx_flags(CMAKE_CCXX_FLAGS)
     platform_unix_and_mingw_common_cxx_flags(CMAKE_CXX_FLAGS)
     platform_unix_and_mingw_noexcept_ccxx_flags(CMAKE_CMAKE_CCXX_NOEXCEPT_FLAGS)
     # compiler specific settings
-    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    if(CMAKE_CXX_COMPILER_ID MATCHES "(Apple)?[Cc]lang")
         if(DNNL_TARGET_ARCH STREQUAL "AARCH64")
              if (NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
                  set(DEF_ARCH_OPT_FLAGS "-O3")
@@ -280,8 +295,11 @@ elseif(UNIX OR MINGW)
             if(DNNL_USE_CLANG_SANITIZER STREQUAL "MemoryWithOrigin")
                 append(CMAKE_CCXX_SANITIZER_FLAGS
                     "-fsanitize-memory-track-origins=2")
-                append(CMAKE_CCXX_SANITIZER_FLAGS
-                    "-fno-omit-frame-pointer")
+                # Already enabled for x64
+                if(NOT DNNL_TARGET_ARCH STREQUAL "X64")
+                    append(CMAKE_CCXX_SANITIZER_FLAGS
+                        "-fno-omit-frame-pointer")
+                endif()
             endif()
             set(DNNL_ENABLED_CLANG_SANITIZER "${DNNL_USE_CLANG_SANITIZER}")
         elseif(DNNL_USE_CLANG_SANITIZER STREQUAL "Undefined")
@@ -306,16 +324,19 @@ elseif(UNIX OR MINGW)
             message(STATUS
                 "Using Clang ${DNNL_ENABLED_CLANG_SANITIZER} "
                 "sanitizer (experimental!)")
-            append(CMAKE_CCXX_SANITIZER_FLAGS "-g -fno-omit-frame-pointer")
+            append(CMAKE_CCXX_SANITIZER_FLAGS "-g")
+            # Already enabled for x64
+            if(NOT DNNL_TARGET_ARCH STREQUAL "X64")
+                append(CMAKE_CCXX_SANITIZER_FLAGS "-fno-omit-frame-pointer")
+            endif()
+
             # Blacklist to ignore false-positive cases. Each case may be
             # assigned to a specific sanitizer. See online doc for help.
             append(CMAKE_CCXX_SANITIZER_FLAGS
                    "-fsanitize-blacklist=${PROJECT_SOURCE_DIR}/.clang-ignorelist")
         endif()
 
-        if (DNNL_USE_CLANG_TIDY MATCHES "(CHECK|FIX)" AND ${CMAKE_VERSION} VERSION_LESS "3.6.0")
-            message(FATAL_ERROR "Using clang-tidy requires CMake 3.6.0 or newer")
-        elseif(DNNL_USE_CLANG_TIDY MATCHES "(CHECK|FIX)")
+        if(DNNL_USE_CLANG_TIDY MATCHES "(CHECK|FIX)")
             find_program(CLANG_TIDY NAMES clang-tidy)
             if(NOT CLANG_TIDY)
                 message(FATAL_ERROR "Clang-tidy not found")
@@ -439,9 +460,9 @@ if (DNNL_TARGET_ARCH STREQUAL "RV64")
     # Check if the RVV Intrinsics can be compiled with the current toolchain and flags
     include(CheckCXXSourceCompiles)
     check_cxx_source_compiles("#include <riscv_vector.h>
-                               int main() { 
+                               int main() {
                                 size_t size = 64;
-                                return vsetvl_e32m2(size); 
+                                return vsetvl_e32m2(size);
                                };"
                                CAN_COMPILE_RVV_INTRINSICS
     )
@@ -462,7 +483,7 @@ if (DNNL_TARGET_ARCH STREQUAL "RV64")
 endif()
 
 # Old compiler versions do not support warnings available on newer compilers.
-if(CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 8.0.0)
+if(CMAKE_CXX_COMPILER_ID MATCHES "(Apple)?[Cc]lang" AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 8.0.0)
     append(CMAKE_CCXX_FLAGS "-Wno-unknown-warning-option")
 endif()
 
